@@ -1,0 +1,14 @@
+node_modules/
+.next/
+.env
+.env.local
+*.log
+.DS_Store
+.agents/
+.claude/
+.droid/
+.factory/
+skills-lock.json
+test-results/
+playwright-report/
+blob-report/
