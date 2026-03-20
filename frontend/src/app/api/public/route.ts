@@ -82,9 +82,9 @@ export async function POST(request: NextRequest) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${PAYMENT_API_KEY}`,
+          'X-Payment-Key': PAYMENT_API_KEY,
         },
-        body: JSON.stringify(sanitized),
+        body: JSON.stringify({ input: sanitized }),
       },
       15_000,
     );

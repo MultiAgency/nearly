@@ -12,6 +12,7 @@ skills-lock.json
 test-results/
 playwright-report/
 blob-report/
+target/
 wasm/target/
 vendor/outlayer/target/
 vendor/outlayer/Cargo.lock
