@@ -2,8 +2,13 @@ import { executeWasm, OutlayerExecError } from '@/lib/outlayer-exec';
 import { TEST_AUTH } from './fixtures';
 
 // Mock global fetch
+const originalFetch = global.fetch;
 const mockFetch = jest.fn();
 global.fetch = mockFetch;
+
+afterAll(() => {
+  global.fetch = originalFetch;
+});
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -36,7 +41,7 @@ describe('executeWasm', () => {
       );
     });
 
-    it('includes auth in body when provided', async () => {
+    it('includes verifiable_claim in body when provided', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ success: true, data: {} }),
@@ -45,10 +50,10 @@ describe('executeWasm', () => {
       await executeWasm(apiKey, action, {}, TEST_AUTH);
 
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-      expect(body.auth).toEqual(TEST_AUTH);
+      expect(body.verifiable_claim).toEqual(TEST_AUTH);
     });
 
-    it('omits auth field when not provided', async () => {
+    it('omits verifiable_claim field when not provided', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ success: true, data: {} }),
@@ -57,7 +62,7 @@ describe('executeWasm', () => {
       await executeWasm(apiKey, action);
 
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-      expect(body.auth).toBeUndefined();
+      expect(body.verifiable_claim).toBeUndefined();
     });
   });
 

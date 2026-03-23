@@ -1,12 +1,10 @@
 'use client';
 
-import { useRouter } from 'next/navigation';
-import { useCallback, useState } from 'react';
+import { useState } from 'react';
 import { api } from '@/lib/api';
 import { APP_DOMAIN } from '@/lib/constants';
 import { registerOutlayer, signMessage } from '@/lib/outlayer';
 import { friendlyError, isValidHandle } from '@/lib/utils';
-import { useAuthStore } from '@/store';
 import type { Nep413Auth, OnboardingContext } from '@/types';
 import { RegistrationForm } from './RegistrationForm';
 import { RegistrationSuccess } from './RegistrationSuccess';
@@ -14,8 +12,6 @@ import { RegistrationSuccess } from './RegistrationSuccess';
 export type Step = 'form' | 'wallet' | 'signing' | 'registering' | 'success';
 
 export default function RegisterPage() {
-  const router = useRouter();
-  const login = useAuthStore((s) => s.login);
   const [step, setStep] = useState<Step>('form');
   const [handle, setHandle] = useState('');
   const [description, setDescription] = useState('');
@@ -23,7 +19,6 @@ export default function RegisterPage() {
   const [apiKey, setApiKey] = useState('');
   const [nearAccountId, setNearAccountId] = useState('');
   const [onboarding, setOnboarding] = useState<OnboardingContext | null>(null);
-  const [registerTxHash, setRegisterTxHash] = useState<string | undefined>();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -68,18 +63,15 @@ export default function RegisterPage() {
         message,
       };
 
-      // Step 3: Register on the market via WASM
+      // Step 3: Register via WASM
       setStep('registering');
       api.setApiKey(outlayerKey);
       api.setAuth(auth);
-      const response = await api.register(
-        {
-          handle,
-          description: description || undefined,
-          verifiable_claim: auth,
-        },
-        (txHash) => setRegisterTxHash(txHash),
-      );
+      const response = await api.register({
+        handle,
+        description: description || undefined,
+        verifiable_claim: auth,
+      });
 
       if (response.onboarding) setOnboarding(response.onboarding);
       setStep('success');
@@ -89,23 +81,12 @@ export default function RegisterPage() {
     }
   };
 
-  const handleLogin = useCallback(async () => {
-    try {
-      await login(apiKey, api.getAuth()!);
-      router.push('/');
-    } catch {
-      // If auto-login fails, user can still copy the key and login manually
-    }
-  }, [apiKey, login, router]);
-
   if (step === 'success' && apiKey) {
     return (
       <RegistrationSuccess
         apiKey={apiKey}
         nearAccountId={nearAccountId}
-        registerTxHash={registerTxHash}
         onboarding={onboarding}
-        onLogin={handleLogin}
       />
     );
   }

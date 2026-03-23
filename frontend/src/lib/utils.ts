@@ -1,13 +1,12 @@
 import { type ClassValue, clsx } from 'clsx';
 import { format, parseISO } from 'date-fns';
 import { twMerge } from 'tailwind-merge';
+import { LIMITS } from './constants';
 
-// Class name utility
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-// Format score (e.g., 1.2K, 3.5M)
 export function formatScore(score: number): string {
   const abs = Math.abs(score);
   const sign = score < 0 ? '-' : '';
@@ -18,47 +17,40 @@ export function formatScore(score: number): string {
   return score.toString();
 }
 
-/** Normalise a numeric timestamp to milliseconds (handles both seconds and ms). */
+/** Normalize timestamp to milliseconds (handles seconds or ms). */
 function toMs(ts: number): number {
   // Timestamps above 1e12 are already milliseconds; below that, treat as seconds
   return ts > 1e12 ? ts : ts * 1000;
 }
 
-/** Coerce a string, number, or Date into a Date object. */
+/** Convert string/number/Date to Date. */
 function normalizeDate(date: string | Date | number): Date {
   if (typeof date === 'number') return new Date(toMs(date));
   if (typeof date === 'string') return parseISO(date);
   return date;
 }
 
-// Format absolute date
-export function formatDate(date: string | Date | number): string {
+function formatDate(date: string | Date | number): string {
   return format(normalizeDate(date), 'MMM d, yyyy');
 }
 
-// Validate handle
 export function isValidHandle(handle: string): boolean {
-  return /^[a-z0-9_]{2,32}$/.test(handle);
+  // Must match handleSchema regex and length bounds from constants.ts
+  const { AGENT_HANDLE_MIN, AGENT_HANDLE_MAX } = LIMITS;
+  return (
+    handle.length >= AGENT_HANDLE_MIN &&
+    handle.length <= AGENT_HANDLE_MAX &&
+    /^[a-z0-9_]+$/.test(handle)
+  );
 }
 
-// Generate initials from name
-export function getInitials(name: string): string {
-  return name
-    .split(/[\s_]+/)
-    .map((part) => part[0]?.toUpperCase())
-    .filter(Boolean)
-    .slice(0, 2)
-    .join('');
-}
-
-// Truncate a NEAR account ID for display (e.g., "abcd1234...wxyz5678")
+// Truncate NEAR account ID for display (abcd1234...wxyz5678)
 export function truncateAccountId(accountId: string, maxLength = 20): string {
   if (accountId.length <= maxLength) return accountId;
   const side = Math.max(Math.floor((maxLength - 3) / 2), 4);
   return `${accountId.slice(0, side)}...${accountId.slice(-side)}`;
 }
 
-// Format relative time
 export function formatRelativeTime(date: string | Date | number): string {
   const d = normalizeDate(date);
   const now = new Date();
@@ -77,12 +69,12 @@ export function formatRelativeTime(date: string | Date | number): string {
   return formatDate(date);
 }
 
-// Sanitize a handle input (lowercase, alphanumeric + underscore only)
+// Sanitize handle input (lowercase, alphanumeric + underscore)
 export function sanitizeHandle(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9_]/g, '');
 }
 
-/** Safely extract an error message from an unknown thrown value. */
+/** Extract error message from unknown thrown value. */
 export function toErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
@@ -99,6 +91,7 @@ const ERROR_PATTERNS = [
   ],
   [/expired|timestamp/i, 'Your signature has expired. Please sign again.'],
   [/unauthorized|401/i, 'Authentication failed. Please restart the flow.'],
+  [/rate.?limit|429|too many/i, 'Too many requests. Please wait a moment.'],
 ] as const;
 
 export function friendlyError(err: unknown): string {

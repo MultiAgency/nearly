@@ -1,36 +1,25 @@
 use crate::keys;
 use crate::types::*;
-use crate::wstore::*;
+use crate::store::*;
 
 // ─── Agent CRUD ───────────────────────────────────────────────────────────
 
 pub(crate) fn agent_handle_for_account(account_id: &str) -> Option<String> {
-    w_get_string(&keys::near_account(account_id))
+    get_string(&keys::near_account(account_id))
 }
 
 pub(crate) fn load_agent(handle: &str) -> Option<AgentRecord> {
-    w_get_json::<AgentRecord>(&keys::agent(handle))
+    get_json::<AgentRecord>(&keys::pub_agent(handle))
 }
 
-pub(crate) fn save_agent(agent: &AgentRecord) -> Result<(), String> {
-    save_agent_with_old(agent, None)
-}
-
-pub(crate) fn save_agent_with_old(agent: &AgentRecord, old: Option<&AgentRecord>) -> Result<(), String> {
+pub(crate) fn save_agent(agent: &AgentRecord, before: &AgentRecord) -> Result<(), String> {
     use crate::registry::{write_sorted_indices, remove_sorted_indices};
 
-    // Remove old indices before saving (scores/timestamps may have changed)
-    let loaded;
-    let old_ref = match old {
-        Some(o) => Some(o),
-        None => { loaded = load_agent(&agent.handle); loaded.as_ref() }
-    };
-    if let Some(old) = old_ref {
-        if trust_score(old) != trust_score(agent) || old.last_active != agent.last_active {
-            remove_sorted_indices(old);
-        }
+    if trust_score(before) != trust_score(agent) || before.last_active != agent.last_active {
+        remove_sorted_indices(before);
     }
-    w_set_json(&keys::agent(&agent.handle), agent)?;
+    let bytes = serde_json::to_vec(agent).map_err(|e| e.to_string())?;
+    set_public(&keys::pub_agent(&agent.handle), &bytes)?;
     write_sorted_indices(agent)
 }
 
@@ -43,18 +32,18 @@ pub(crate) fn trust_score(agent: &AgentRecord) -> i64 {
 pub(crate) fn format_agent(agent: &AgentRecord) -> serde_json::Value {
     serde_json::json!({
         "handle": agent.handle,
-        "displayName": agent.display_name,
+        "display_name": agent.display_name,
         "description": agent.description,
-        "avatarUrl": agent.avatar_url,
+        "avatar_url": agent.avatar_url,
         "tags": agent.tags,
         "capabilities": agent.capabilities,
-        "nearAccountId": agent.near_account_id,
-        "followerCount": agent.follower_count,
-        "unfollowCount": agent.unfollow_count,
-        "trustScore": trust_score(agent),
-        "followingCount": agent.following_count,
-        "createdAt": agent.created_at,
-        "lastActive": agent.last_active,
+        "near_account_id": agent.near_account_id,
+        "follower_count": agent.follower_count,
+        "unfollow_count": agent.unfollow_count,
+        "trust_score": trust_score(agent),
+        "following_count": agent.following_count,
+        "created_at": agent.created_at,
+        "last_active": agent.last_active,
     })
 }
 
@@ -80,18 +69,15 @@ pub(crate) fn profile_completeness(agent: &AgentRecord) -> u32 {
 
 /// Retry-once helper for agent count updates after follow/unfollow.
 /// Applies `mutate` to the agent, saves, and retries once on conflict.
-pub(crate) fn retry_agent_update(handle: &str, mutate: impl Fn(&mut AgentRecord), context: &str) {
-    if let Some(old) = load_agent(handle) {
-        let mut agent = old.clone();
+pub(crate) fn retry_agent_update(handle: &str, mutate: impl Fn(&mut AgentRecord)) {
+    if let Some(before) = load_agent(handle) {
+        let mut agent = before.clone();
         mutate(&mut agent);
-        if let Err(e) = save_agent_with_old(&agent, Some(&old)) {
-            eprintln!("Warning: {context} failed, retrying: {e}");
-            if let Some(old2) = load_agent(handle) {
-                let mut agent2 = old2.clone();
+        if save_agent(&agent, &before).is_err() {
+            if let Some(before2) = load_agent(handle) {
+                let mut agent2 = before2.clone();
                 mutate(&mut agent2);
-                if let Err(e) = save_agent_with_old(&agent2, Some(&old2)) {
-                    eprintln!("Warning: {context} failed after retry: {e}");
-                }
+                let _ = save_agent(&agent2, &before2);
             }
         }
     }

@@ -11,12 +11,12 @@ test.describe('Agent Directory', () => {
   });
 
   test('search input has accessible label', async ({ page }) => {
-    const input = page.locator('#agent-search');
+    const input = page.getByRole('searchbox').or(page.getByPlaceholder(/search/i));
     await expect(input).toBeVisible();
   });
 
   test('sort dropdown changes sort order', async ({ page }) => {
-    const sort = page.locator('select');
+    const sort = page.getByRole('combobox');
     await expect(sort).toBeVisible();
     await expect(sort).toHaveValue('followers');
 
@@ -34,8 +34,8 @@ test.describe('Agent Directory', () => {
 
     // Clicking table toggles the view (table only renders if agents exist)
     await tableBtn.click();
-    // Verify toggle state changed visually
-    await expect(tableBtn).toHaveClass(/text-emerald/);
+    // Verify toggle state changed
+    await expect(tableBtn).toHaveAttribute('aria-pressed', 'true');
   });
 
   test('table headers have scope attributes when in table view', async ({ page }) => {
@@ -59,6 +59,6 @@ test.describe('Agent Directory', () => {
     // The heading should always be visible even with no agents
     await expect(page.getByText('Agent Directory')).toBeVisible();
     // Search should still be functional
-    await expect(page.locator('#agent-search')).toBeVisible();
+    await expect(page.getByRole('searchbox').or(page.getByPlaceholder(/search/i))).toBeVisible();
   });
 });

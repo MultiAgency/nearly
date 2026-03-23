@@ -1,4 +1,4 @@
-import { useAuthStore, useNotificationStore } from '@/store';
+import { useAuthStore } from '@/store';
 
 /** NEP-413 auth object for agency.near — reuse across tests that need auth. */
 export const TEST_AUTH = {
@@ -9,7 +9,7 @@ export const TEST_AUTH = {
   message: 'hello',
 } as const;
 
-/** Reset auth and notification stores to initial state. */
+/** Reset auth store to initial state. */
 export function resetStores() {
   useAuthStore.setState({
     agent: null,
@@ -17,10 +17,5 @@ export function resetStores() {
     auth: null,
     isLoading: false,
     error: null,
-  });
-  useNotificationStore.setState({
-    notifications: [],
-    unreadCount: 0,
-    isLoading: false,
   });
 }

@@ -62,9 +62,9 @@ We think that's wrong. An agent's NEAR account IS its identity. Registration sho
 
 - The message preview (action, domain, version, timestamp)
 - The real signature and public key in the response
-- Expand the JSON viewer — show that the response shape IS the verifiable_claim
+- Expand the JSON viewer — show that the response shape IS the `verifiable_claim`
 
-**Key line:** "This response — account_id, public_key, signature, nonce — maps directly to the `verifiable_claim` field we're proposing. No transformation needed."
+**Key line:** "This response — account_id, public_key, signature, nonce — maps directly to the `verifiable_claim` we're proposing. No transformation needed."
 
 ### Step 3 — Register on Market
 
@@ -99,7 +99,7 @@ We think that's wrong. An agent's NEAR account IS its identity. Registration sho
 
 **Open `README.md`** and scroll to "Proposed Market API Extension"
 
-**Say:** "This section is the actual proposal — the spec you'd hand to the Market team. It defines the `verifiable_claim` field, the NEP-413 message format, the verification steps for the backend, and why OutLayer makes it trivially implementable for any agent."
+**Say:** "This section is the actual proposal — the spec you'd hand to the Market team. It defines the `verifiable_claim`, the NEP-413 message format, the verification steps for the backend, and why OutLayer makes it trivially implementable for any agent."
 
 **Point out:**
 
@@ -134,9 +134,6 @@ A: OutLayer's trial wallets create implicit NEAR accounts (derived from the publ
 
 **Q: Why does this matter? What's wrong with the current flow?**
 A: Every agent that registers on Market today gets a throwaway identity. If that agent already has tokens, reputation, or on-chain history on NEAR, all of that is orphaned. This proposal fixes that with zero breaking changes — it's an optional field on an existing endpoint.
-
-**Q: How much work is this for the Market team to implement?**
-A: Three steps: validate the signed message, verify the ed25519 signature, register. The signature verification is the only crypto — standard ed25519 over a sha256'd Borsh payload. The endpoint shape doesn't change — you're adding one optional field.
 
 ---
 

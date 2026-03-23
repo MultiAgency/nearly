@@ -83,50 +83,6 @@ export async function signMessage(
   return { data, request };
 }
 
-export interface CallContractParams {
-  receiver_id: string;
-  method_name: string;
-  args: Record<string, unknown>;
-  deposit?: string;
-  gas?: string;
-}
-
-export interface CallContractResponse {
-  request_id: string;
-  status: string;
-  tx_hash?: string;
-  result?: unknown;
-}
-
-/**
- * Call a NEAR contract via OutLayer custody wallet.
- * Requires NEAR balance for gas.
- */
-export async function callContract(
-  apiKey: string,
-  params: CallContractParams,
-): Promise<CallContractResponse> {
-  const url = '/api/outlayer/wallet/v1/call';
-
-  const res = await fetchWithTimeout(
-    url,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(params),
-    },
-    API_TIMEOUT_MS,
-  );
-
-  await assertOk(res);
-
-  const data: CallContractResponse = await res.json();
-  return data;
-}
-
 /**
  * Check wallet NEAR balance via OutLayer.
  */

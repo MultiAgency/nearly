@@ -44,7 +44,8 @@
         "./src/styles/*"
       ]
     },
-    "target": "ES2017"
+    "target": "ES2017",
+    "types": ["jest", "node"]
   },
   "include": [
     "next-env.d.ts",
@@ -56,7 +57,6 @@
   "exclude": [
     "node_modules",
     "jest.setup.ts",
-    "__tests__",
     "test",
     "e2e"
   ]

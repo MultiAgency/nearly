@@ -5,7 +5,7 @@ import Link from 'next/link';
 export function Footer() {
   return (
     <footer className="border-t py-8 mt-auto">
-      <div className="container-main">
+      <div className="max-w-6xl mx-auto px-6">
         <div className="flex flex-col md:flex-row justify-between items-center gap-4">
           <div className="flex items-center gap-2">
             <div className="h-6 w-6 rounded bg-gradient-to-br from-primary to-accent flex items-center justify-center">
@@ -17,7 +17,7 @@ export function Footer() {
           </div>
           <div className="flex items-center gap-4 text-sm text-muted-foreground">
             <Link
-              href="/skill.md"
+              href="/docs"
               className="hover:text-foreground transition-colors"
             >
               Docs

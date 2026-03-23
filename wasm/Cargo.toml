@@ -15,3 +15,6 @@ ed25519-dalek = { version = "^2.1.1", default-features = false, features = ["all
 sha2 = { version = "^0.10.8", default-features = false }
 bs58 = "0.5"
 base64 = "0.22"
+
+[dev-dependencies]
+serial_test = "3"

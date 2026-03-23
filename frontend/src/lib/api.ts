@@ -3,7 +3,6 @@
 import type {
   Agent,
   AgentCapabilities,
-  ChainCommitPayload,
   Nep413Auth,
   Notification,
   RegisterAgentForm,
@@ -12,8 +11,11 @@ import type {
 } from '@/types';
 import { API_TIMEOUT_MS } from './constants';
 import { fetchWithTimeout, httpErrorText } from './fetch';
-import { callContract } from './outlayer';
-import { decodeOutlayerResponse, executeWasm, OutlayerExecError } from './outlayer-exec';
+import {
+  decodeOutlayerResponse,
+  executeWasm,
+  OutlayerExecError,
+} from './outlayer-exec';
 
 class ApiError extends Error {
   constructor(
@@ -35,16 +37,8 @@ class ApiClient {
     this.apiKey = key;
   }
 
-  getApiKey(): string | null {
-    return this.apiKey;
-  }
-
   setAuth(auth: Nep413Auth | null) {
     this.auth = auth;
-  }
-
-  getAuth(): Nep413Auth | null {
-    return this.auth;
   }
 
   clearCredentials() {
@@ -52,20 +46,14 @@ class ApiClient {
     this.auth = null;
   }
 
-  /** Route public reads through server-side /api/public (payment key never leaves the server). */
+  /** Route public reads through /api/v1 REST endpoints (payment key stays on server). */
   private async publicRequest<T>(
     action: string,
     args: Record<string, unknown>,
   ): Promise<T> {
-    const response = await fetchWithTimeout(
-      '/api/public',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, ...args }),
-      },
-      API_TIMEOUT_MS,
-    );
+    const url = this.buildPublicUrl(action, args);
+
+    const response = await fetchWithTimeout(url, undefined, API_TIMEOUT_MS);
 
     if (!response.ok) {
       const text = await httpErrorText(response);
@@ -88,12 +76,44 @@ class ApiClient {
     return parsed.data as T;
   }
 
+  /** Map WASM action + args to v1 REST URL. */
+  private buildPublicUrl(
+    action: string,
+    args: Record<string, unknown>,
+  ): string {
+    const handle = args.handle as string | undefined;
+    const q = (params: Record<string, unknown>) => {
+      const s = new URLSearchParams();
+      for (const [k, v] of Object.entries(params)) {
+        if (v != null) s.set(k, String(v));
+      }
+      const qs = s.toString();
+      return qs ? `?${qs}` : '';
+    };
+
+    switch (action) {
+      case 'list_agents':
+        return `/api/v1/agents${q({ limit: args.limit, sort: args.sort })}`;
+      case 'get_profile':
+        return `/api/v1/agents/${handle}`;
+      case 'get_edges':
+        return `/api/v1/agents/${handle}/edges${q({ direction: args.direction, include_history: args.include_history, limit: args.limit, cursor: args.cursor })}`;
+      case 'get_followers':
+        return `/api/v1/agents/${handle}/followers${q({ limit: args.limit, cursor: args.cursor })}`;
+      case 'get_following':
+        return `/api/v1/agents/${handle}/following${q({ limit: args.limit, cursor: args.cursor })}`;
+      case 'list_tags':
+        return '/api/v1/tags';
+      default:
+        return `/api/v1/agents${q({ ...args, action })}`;
+    }
+  }
+
   private async request<T>(
     action: string,
     args: Record<string, unknown> = {},
     requiresAuth = true,
   ): Promise<T> {
-    // Public reads go through server-side /api/public route (payment key stays on server)
     if (!requiresAuth && !this.apiKey) {
       return this.publicRequest<T>(action, args);
     }
@@ -111,7 +131,8 @@ class ApiClient {
       if (err instanceof OutlayerExecError) {
         const code = err.code?.toLowerCase();
         let statusCode = 400;
-        if (code === 'unauthorized' || code === 'auth_required') statusCode = 401;
+        if (code === 'unauthorized' || code === 'auth_required')
+          statusCode = 401;
         else if (code === 'forbidden') statusCode = 403;
         else if (code === 'not_found') statusCode = 404;
         throw new ApiError(statusCode, err.message, err.code);
@@ -120,70 +141,13 @@ class ApiClient {
     }
   }
 
-  private onChainCommitError: ((err: Error) => void) | null = null;
-
-  /** Register a callback for chain commit failures (e.g., to show a toast). */
-  setChainCommitErrorHandler(handler: ((err: Error) => void) | null) {
-    this.onChainCommitError = handler;
-  }
-
-  /** Non-blocking chain commit with one retry. Calls onTxHash when tx is confirmed. */
-  private submitChainCommit(
-    chainCommit?: ChainCommitPayload,
-    onTxHash?: (hash: string) => void,
-  ) {
-    if (!chainCommit || !this.apiKey) return;
-    const key = this.apiKey;
-
-    const attempt = (retries: number) => {
-      callContract(key, chainCommit)
-        .then((res) => {
-          if (res.tx_hash) onTxHash?.(res.tx_hash);
-        })
-        .catch((err) => {
-          if (retries > 0) {
-            console.warn('[fastgraph] chain commit failed, retrying in 2s:', err);
-            setTimeout(() => attempt(retries - 1), 2000);
-            return;
-          }
-          console.warn('[fastgraph] chain commit failed after retry:', err);
-          this.onChainCommitError?.(
-            err instanceof Error ? err : new Error(String(err)),
-          );
-        });
-    };
-
-    attempt(1);
-  }
-
-  /** Request + fire-and-forget chain commit. Strips chainCommit from result. */
-  private async requestWithCommit<
-    T extends { chainCommit?: ChainCommitPayload },
-  >(
-    action: string,
-    args: Record<string, unknown>,
-    onTxHash?: (hash: string) => void,
-    requiresAuth = true,
-  ): Promise<Omit<T, 'chainCommit'>> {
-    const { chainCommit, ...result } = await this.request<T>(
-      action,
-      args,
-      requiresAuth,
-    );
-    this.submitChainCommit(chainCommit, onTxHash);
-    return result;
-  }
-
   // ─── Public API methods ────────────────────────────────────────────
 
-  async register(data: RegisterAgentForm, onTxHash?: (hash: string) => void) {
-    return this.requestWithCommit<
-      RegistrationResponse & { chainCommit?: ChainCommitPayload }
-    >(
-      'register',
-      { handle: data.handle, description: data.description },
-      onTxHash,
-    );
+  async register(data: RegisterAgentForm) {
+    return this.request<RegistrationResponse>('register', {
+      handle: data.handle,
+      description: data.description,
+    });
   }
 
   async getSuggestedFollows(limit = 10) {
@@ -199,73 +163,53 @@ class ApiClient {
     return result.agent;
   }
 
-  async updateMe(
-    data: {
-      displayName?: string;
-      description?: string;
-      tags?: string[];
-      capabilities?: AgentCapabilities;
-    },
-    onTxHash?: (hash: string) => void,
-  ) {
-    const result = await this.requestWithCommit<{
-      agent: Agent;
-      chainCommit?: ChainCommitPayload;
-    }>(
-      'update_me',
-      {
-        display_name: data.displayName,
-        description: data.description,
-        tags: data.tags,
-        capabilities: data.capabilities,
-      },
-      onTxHash,
-    );
+  async updateMe(data: {
+    display_name?: string;
+    description?: string;
+    tags?: string[];
+    capabilities?: AgentCapabilities;
+  }) {
+    const result = await this.request<{ agent: Agent }>('update_me', {
+      display_name: data.display_name,
+      description: data.description,
+      tags: data.tags,
+      capabilities: data.capabilities,
+    });
     return result.agent;
   }
 
   async getAgent(handle: string) {
-    return this.request<{ agent: Agent; isFollowing: boolean }>(
+    return this.request<{ agent: Agent; is_following: boolean }>(
       'get_profile',
       { handle },
       false,
     );
   }
 
-  async followAgent(
-    handle: string,
-    reason?: string,
-    onTxHash?: (hash: string) => void,
-  ) {
-    return this.requestWithCommit<{
+  async followAgent(handle: string, reason?: string) {
+    return this.request<{
       action: 'followed' | 'already_following';
       followed?: Agent;
-      yourNetwork?: { followingCount: number; followerCount: number };
-      nextSuggestion?: Agent & { reason?: string; followUrl?: string };
-      chainCommit?: ChainCommitPayload;
-    }>('follow', { handle, reason }, onTxHash);
+      your_network?: { following_count: number; follower_count: number };
+      next_suggestion?: Agent & { reason?: string; follow_url?: string };
+    }>('follow', { handle, reason });
   }
 
-  async unfollowAgent(
-    handle: string,
-    reason?: string,
-    onTxHash?: (hash: string) => void,
-  ) {
-    return this.requestWithCommit<{
+  async unfollowAgent(handle: string, reason?: string) {
+    return this.request<{
       action: 'unfollowed' | 'not_following';
-      chainCommit?: ChainCommitPayload;
-    }>('unfollow', { handle, reason }, onTxHash);
+    }>('unfollow', { handle, reason });
   }
 
   async getNotifications(since?: string, limit = 50) {
-    return this.request<{ notifications: Notification[]; unreadCount: number }>(
-      'get_notifications',
-      { since, limit },
-    );
+    return this.request<{
+      notifications: Notification[];
+      unread_count: number;
+    }>('get_notifications', { since, limit });
   }
 
   async readNotifications() {
-    return this.request<{ readAt: number }>('read_notifications', {});
+    return this.request<{ read_at: number }>('read_notifications', {});
   }
 
   async getEdges(
@@ -281,14 +225,14 @@ class ApiClient {
       handle: string;
       edges: (Agent & {
         direction: string;
-        followReason?: string;
-        followedAt?: number;
+        follow_reason?: string;
+        followed_at?: number;
       })[];
-      edgeCount: number;
+      edge_count: number;
       history:
         | { handle: string; direction: string; reason?: string; ts?: number }[]
         | null;
-      pagination: { limit: number; nextCursor?: string };
+      pagination: { limit: number; next_cursor?: string };
     }>(
       'get_edges',
       {
@@ -302,24 +246,27 @@ class ApiClient {
     );
   }
 
-  async listVerified(limit = 50) {
-    // WASM list_verified uses paginate_json — data is a raw array, not { agents: [...] }
-    const agents = await this.request<Agent[]>('list_verified', { limit }, false);
+  async listAgents(limit = 50, sort?: string) {
+    const agents = await this.request<Agent[]>(
+      'list_agents',
+      { limit, sort },
+      false,
+    );
     return { agents: Array.isArray(agents) ? agents : [] };
   }
 
   async heartbeat() {
-    // Response shape is complex (agent + delta + suggestedAction); we only care that it succeeds.
+    // Response shape is complex (agent + delta + suggested_action); we only care that it succeeds.
     await this.request<unknown>('heartbeat', {});
   }
 
   async getNetwork() {
     return this.request<{
-      followerCount: number;
-      followingCount: number;
-      mutualCount: number;
-      lastActive: number;
-      memberSince: number;
+      follower_count: number;
+      following_count: number;
+      mutual_count: number;
+      last_active: number;
+      member_since: number;
     }>('get_network', {});
   }
 
@@ -340,6 +287,13 @@ class ApiClient {
       false,
     );
     return Array.isArray(agents) ? agents : [];
+  }
+
+  async listTags() {
+    const result = await this.request<{
+      tags: { tag: string; count: number }[];
+    }>('list_tags', {}, false);
+    return result.tags;
   }
 }
 

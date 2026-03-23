@@ -1,8 +1,6 @@
 import {
   registerOutlayer,
   signMessage,
-  callContract,
-  getBalance,
 } from '@/lib/outlayer';
 
 // Mock fetch utilities
@@ -110,95 +108,3 @@ describe('signMessage', () => {
   });
 });
 
-describe('callContract', () => {
-  const params = {
-    receiver_id: 'fastgraph.near',
-    method_name: 'commit',
-    args: { mutations: [], reasoning: 'test', phase: 'test' },
-  };
-
-  it('calls contract and returns tx_hash', async () => {
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
-          request_id: 'r1',
-          status: 'ok',
-          tx_hash: '0xabc',
-        }),
-    } as Response);
-
-    const result = await callContract('wk_key', params);
-
-    expect(result.tx_hash).toBe('0xabc');
-    expect(result.status).toBe('ok');
-  });
-
-  it('throws on non-ok response', async () => {
-    mockFetch.mockResolvedValue({
-      ok: false,
-      status: 400,
-      text: () => Promise.resolve('Bad request'),
-    } as Response);
-
-    await expect(callContract('wk_key', params)).rejects.toThrow(
-      'Bad request',
-    );
-  });
-
-  it('handles unreadable error response', async () => {
-    mockFetch.mockResolvedValue({
-      ok: false,
-      status: 500,
-      text: () => Promise.reject(new Error('read failed')),
-    } as Response);
-
-    await expect(callContract('wk_key', params)).rejects.toThrow(
-      'HTTP 500',
-    );
-  });
-});
-
-describe('getBalance', () => {
-  it('returns balance string', async () => {
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ balance: '1000000000000000000000000' }),
-    } as Response);
-
-    const balance = await getBalance('wk_key');
-    expect(balance).toBe('1000000000000000000000000');
-  });
-
-  it('returns "0" when balance is missing', async () => {
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({}),
-    } as Response);
-
-    const balance = await getBalance('wk_key');
-    expect(balance).toBe('0');
-  });
-
-  it('throws on non-ok response', async () => {
-    mockFetch.mockResolvedValue({
-      ok: false,
-      status: 401,
-    } as Response);
-
-    await expect(getBalance('wk_bad')).rejects.toThrow(
-      'Balance check failed: HTTP 401',
-    );
-  });
-
-  it('throws on non-json response', async () => {
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () => Promise.reject(new Error('not json')),
-    } as Response);
-
-    await expect(getBalance('wk_key')).rejects.toThrow(
-      'Balance check failed: unexpected response',
-    );
-  });
-});

@@ -26,6 +26,17 @@ pub(crate) fn build_nep413_payload(message: &[u8], nonce: &[u8], recipient: &[u8
 
 /// Verify that the given public key is an access key on the claimed NEAR account.
 /// Uses the NEAR RPC `view-access-key` endpoint.
+/// In test mode, skip the RPC call to verify key ownership (host function unavailable).
+/// SECURITY NOTE: This means integration tests do NOT verify that the public key belongs
+/// to the claimed NEAR account. Public key ownership is only tested in production via the
+/// OutLayer RPC host function. If this bypass is ever accidentally enabled in production,
+/// any ed25519 key could authenticate as any NEAR account.
+#[cfg(test)]
+pub fn verify_public_key_ownership(_account_id: &str, _public_key: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
 pub fn verify_public_key_ownership(account_id: &str, public_key: &str) -> Result<(), String> {
     // Validate account_id format: alphanumeric, dots, dashes, underscores; 2-64 chars
     if account_id.len() < 2
@@ -42,6 +53,18 @@ pub fn verify_public_key_ownership(account_id: &str, public_key: &str) -> Result
     }
     if result.is_empty() {
         return Err("Public key not found on the specified account".to_string());
+    }
+    // Reject function-call-only keys — require FullAccess for account ownership proof.
+    // The RPC result contains a "permission" field: "FullAccess" or {"FunctionCall": {...}}.
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+        let perm = parsed.get("permission");
+        let is_full_access = perm
+            .and_then(|p| p.as_str())
+            .map(|s| s == "FullAccess")
+            .unwrap_or(false);
+        if !is_full_access {
+            return Err("Only FullAccess keys can prove account ownership".to_string());
+        }
     }
     Ok(())
 }

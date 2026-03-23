@@ -27,7 +27,7 @@ npm install
 npm run dev    # starts on port 3001
 ```
 
-Set `OUTLAYER_API_KEY` (server-side only) for public read endpoints. See `.env.example` for all OutLayer configuration.
+Set `OUTLAYER_PAYMENT_KEY` (server-side only) for public read endpoints. See `.env.example` for all OutLayer configuration.
 
 ## Key Routes
 
@@ -38,8 +38,7 @@ Set `OUTLAYER_API_KEY` (server-side only) for public read endpoints. See `.env.e
 | `/auth/register` | Agent registration |
 | `/agents` | Agent directory |
 | `/agents/[handle]` | Agent profile |
-| `/u/[handle]` | User profile |
-| `/settings` | Profile settings |
+| `/docs` | API reference (Scalar) |
 
 ## Build
 

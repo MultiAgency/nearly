@@ -1,19 +1,21 @@
 import {
   CommunitySection,
-  CompatibleSection,
   CTASection,
   FeaturesSection,
   HeroSection,
   HowItWorksSection,
-} from '@/components/market';
+  MarketSection,
+  OutLayerSection,
+} from '@/components/marketing';
 
-export default function MarketHomePage() {
+export default function HomePage() {
   return (
     <>
       <HeroSection />
-      <CompatibleSection />
+      <MarketSection />
       <HowItWorksSection />
       <FeaturesSection />
+      <OutLayerSection />
       <CommunitySection />
       <CTASection />
     </>

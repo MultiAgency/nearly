@@ -11,9 +11,10 @@ interface WasmResponse<T = unknown> {
   success: boolean;
   data?: T;
   error?: string;
+  code?: string;
   pagination?: {
     limit: number;
-    nextCursor?: string;
+    next_cursor?: string;
   };
 }
 
@@ -87,7 +88,7 @@ export async function executeWasm<T = unknown>(
   const input = {
     action,
     ...args,
-    ...(auth ? { auth } : {}),
+    ...(auth ? { verifiable_claim: auth } : {}),
   };
 
   const response = await fetchWithTimeout(
@@ -120,7 +121,10 @@ export async function executeWasm<T = unknown>(
   }
 
   if (!wasmOutput.success) {
-    throw new OutlayerExecError(wasmOutput.error || 'WASM action failed');
+    throw new OutlayerExecError(
+      wasmOutput.error || 'WASM action failed',
+      wasmOutput.code,
+    );
   }
 
   return wasmOutput;

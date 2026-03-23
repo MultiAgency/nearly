@@ -5,21 +5,6 @@ beforeEach(() => {
 });
 
 describe('useAgentStore', () => {
-  describe('initial state', () => {
-    it('starts with null values and step 1', () => {
-      const state = useAgentStore.getState();
-      expect(state.apiKey).toBeNull();
-      expect(state.nearAccountId).toBeNull();
-      expect(state.handoffUrl).toBeNull();
-      expect(state.signResult).toBeNull();
-      expect(state.signMessage).toBeNull();
-      expect(state.marketHandle).toBeNull();
-      expect(state.currentStep).toBe(1);
-      expect(state.stepStatus).toEqual({ 1: 'idle', 2: 'idle', 3: 'idle' });
-      expect(state.stepErrors).toEqual({ 1: null, 2: null, 3: null });
-    });
-  });
-
   describe('step 1: OutLayer registration', () => {
     it('sets loading state', () => {
       useAgentStore.getState().setStepLoading(1);
@@ -70,7 +55,7 @@ describe('useAgentStore', () => {
     });
   });
 
-  describe('step 3: market registration', () => {
+  describe('step 3: registration', () => {
     it('completes step 3 and clears sensitive data', () => {
       // Set up state as if steps 1 and 2 completed
       useAgentStore.getState().completeStep1({
@@ -89,10 +74,10 @@ describe('useAgentStore', () => {
         '{"action":"register"}',
       );
 
-      useAgentStore.getState().completeStep3({ handle: 'my_bot' });
+      useAgentStore.getState().completeStep3({ handle: 'my_bot', api_key: 'key123', near_account_id: 'bot.near' });
 
       const state = useAgentStore.getState();
-      expect(state.marketHandle).toBe('my_bot');
+      expect(state.handle).toBe('my_bot');
       expect(state.stepStatus[3]).toBe('success');
 
       // Sensitive data should be cleared

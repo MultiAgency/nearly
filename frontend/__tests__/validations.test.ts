@@ -36,6 +36,13 @@ describe('Validation Schemas', () => {
     it('rejects empty string', () => {
       expect(handleSchema.safeParse('').success).toBe(false);
     });
+
+    it('rejects reserved handles', () => {
+      expect(handleSchema.safeParse('admin').success).toBe(false);
+      expect(handleSchema.safeParse('system').success).toBe(false);
+      expect(handleSchema.safeParse('api').success).toBe(false);
+      expect(handleSchema.safeParse('register').success).toBe(false);
+    });
   });
 
   describe('registerAgentSchema', () => {
@@ -68,7 +75,7 @@ describe('Validation Schemas', () => {
   describe('updateAgentSchema', () => {
     it('accepts valid update', () => {
       expect(
-        updateAgentSchema.safeParse({ displayName: 'Bot', description: 'hi' }).success,
+        updateAgentSchema.safeParse({ display_name: 'Bot', description: 'hi' }).success,
       ).toBe(true);
     });
 
@@ -78,7 +85,7 @@ describe('Validation Schemas', () => {
 
     it('rejects display name over 64 chars', () => {
       expect(
-        updateAgentSchema.safeParse({ displayName: 'x'.repeat(65) }).success,
+        updateAgentSchema.safeParse({ display_name: 'x'.repeat(65) }).success,
       ).toBe(false);
     });
 
@@ -103,6 +110,41 @@ describe('Validation Schemas', () => {
       expect(updateAgentSchema.safeParse({ tags: ['UPPERCASE'] }).success).toBe(false);
       expect(updateAgentSchema.safeParse({ tags: ['has spaces'] }).success).toBe(false);
       expect(updateAgentSchema.safeParse({ tags: ['under_score'] }).success).toBe(false);
+    });
+
+    it('accepts valid https avatar URL', () => {
+      expect(
+        updateAgentSchema.safeParse({ avatar_url: 'https://example.com/pic.png' }).success,
+      ).toBe(true);
+    });
+
+    it('rejects http avatar URL', () => {
+      expect(
+        updateAgentSchema.safeParse({ avatar_url: 'http://example.com/pic.png' }).success,
+      ).toBe(false);
+    });
+
+    it('rejects avatar URL over 512 chars', () => {
+      expect(
+        updateAgentSchema.safeParse({ avatar_url: 'https://example.com/' + 'a'.repeat(500) }).success,
+      ).toBe(false);
+    });
+
+    it('rejects avatar URL with control characters', () => {
+      expect(
+        updateAgentSchema.safeParse({ avatar_url: 'https://example.com/\x00pic.png' }).success,
+      ).toBe(false);
+    });
+
+    it('accepts valid capabilities object', () => {
+      expect(
+        updateAgentSchema.safeParse({ capabilities: { skills: ['chat', 'search'] } }).success,
+      ).toBe(true);
+    });
+
+    it('rejects capabilities over 4096 bytes', () => {
+      const big = { data: 'x'.repeat(4096) };
+      expect(updateAgentSchema.safeParse({ capabilities: big }).success).toBe(false);
     });
   });
 

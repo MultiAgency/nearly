@@ -1,27 +1,27 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { fetchWithTimeout } from '@/lib/fetch';
-import { isRateLimited, getClientIp } from '@/lib/rate-limit';
-import { decodeOutlayerResponse } from '@/lib/outlayer-exec';
-
-const PAYMENT_API_KEY = process.env.OUTLAYER_API_KEY || '';
-const OUTLAYER_API_URL =
-  process.env.NEXT_PUBLIC_OUTLAYER_API_URL || 'https://api.outlayer.fastnear.com';
-const PROJECT_OWNER = process.env.NEXT_PUBLIC_OUTLAYER_PROJECT_OWNER || '';
-const PROJECT_NAME = process.env.NEXT_PUBLIC_OUTLAYER_PROJECT_NAME || 'nearly';
-
-const PUBLIC_ACTIONS = new Set([
-  'list_agents', 'list_verified', 'get_profile',
-  'get_followers', 'get_following', 'get_edges', 'health',
-]);
-
-// Only forward known safe fields on public reads
-const PUBLIC_FIELDS = new Set([
-  'action', 'handle', 'limit', 'cursor', 'direction',
-  'include_history', 'since', 'sort',
-]);
+import { type NextRequest, NextResponse } from 'next/server';
+import { PUBLIC_ACTIONS } from '@/lib/api-constants';
+import { getCached, makeCacheKey, setCache } from '@/lib/cache';
+import {
+  callOutlayer,
+  OUTLAYER_PAYMENT_KEY,
+  sanitizePublic,
+} from '@/lib/outlayer-route';
+import {
+  checkRateLimit,
+  getClientIp,
+  RATE_LIMIT,
+  type RateLimitResult,
+} from '@/lib/rate-limit';
 
 // Fields that should be parsed as integers from query strings
 const INT_FIELDS = new Set(['limit', 'since']);
+
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Payment-Key',
+  'Access-Control-Max-Age': '86400',
+};
 
 // ─── Route resolution ──────────────────────────────────────────────────────
 
@@ -38,6 +38,10 @@ function resolveRoute(method: string, segments: string[]): Route | null {
     return { action: 'health', pathParams: {} };
   }
 
+  if (len === 1 && s[0] === 'tags' && method === 'GET') {
+    return { action: 'list_tags', pathParams: {} };
+  }
+
   if (len < 1 || s[0] !== 'agents') return null;
 
   if (len === 1 && method === 'GET') {
@@ -46,14 +50,6 @@ function resolveRoute(method: string, segments: string[]): Route | null {
 
   if (len === 2 && s[1] === 'register' && method === 'POST') {
     return { action: 'register', pathParams: {} };
-  }
-
-  if (len === 2 && s[1] === 'verified' && method === 'GET') {
-    return { action: 'list_verified', pathParams: {} };
-  }
-
-  if (len === 2 && s[1] === 'profile' && method === 'GET') {
-    return { action: 'get_profile', pathParams: {} };
   }
 
   if (len === 2 && s[1] === 'suggested' && method === 'GET') {
@@ -76,14 +72,27 @@ function resolveRoute(method: string, segments: string[]): Route | null {
       return { action: 'get_notifications', pathParams: {} };
   }
 
-  if (len === 4 && s[1] === 'me' && s[2] === 'notifications' && s[3] === 'read' && method === 'POST') {
+  if (
+    len === 4 &&
+    s[1] === 'me' &&
+    s[2] === 'notifications' &&
+    s[3] === 'read' &&
+    method === 'POST'
+  ) {
     return { action: 'read_notifications', pathParams: {} };
+  }
+
+  // /agents/{handle} — profile (after reserved words: register, suggested, me)
+  if (len === 2 && method === 'GET') {
+    return { action: 'get_profile', pathParams: { handle: s[1] } };
   }
 
   // /agents/{handle}/follow, /agents/{handle}/followers, /agents/{handle}/following, /agents/{handle}/edges
   if (len === 3 && s[2] === 'follow') {
-    if (method === 'POST') return { action: 'follow', pathParams: { handle: s[1] } };
-    if (method === 'DELETE') return { action: 'unfollow', pathParams: { handle: s[1] } };
+    if (method === 'POST')
+      return { action: 'follow', pathParams: { handle: s[1] } };
+    if (method === 'DELETE')
+      return { action: 'unfollow', pathParams: { handle: s[1] } };
   }
 
   if (len === 3 && s[2] === 'followers' && method === 'GET') {
@@ -108,7 +117,7 @@ function extractQueryParams(url: URL): Record<string, unknown> {
   for (const [key, value] of url.searchParams) {
     if (INT_FIELDS.has(key)) {
       const n = parseInt(value, 10);
-      if (!isNaN(n)) params[key] = n;
+      if (!Number.isNaN(n)) params[key] = n;
     } else if (key === 'include_history') {
       params[key] = value === 'true';
     } else {
@@ -118,67 +127,19 @@ function extractQueryParams(url: URL): Record<string, unknown> {
   return params;
 }
 
-// ─── Sanitize for public reads ─────────────────────────────────────────────
+// ─── Response headers ─────────────────────────────────────────────────────
 
-function sanitizePublic(body: Record<string, unknown>): Record<string, unknown> {
-  const clean: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(body)) {
-    if (!PUBLIC_FIELDS.has(key)) continue;
-    const t = typeof value;
-    if (t === 'string' || t === 'number' || t === 'boolean') {
-      clean[key] = value;
-    }
+function applyHeaders(
+  response: NextResponse,
+  rl: RateLimitResult,
+): NextResponse {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) {
+    response.headers.set(k, v);
   }
-  return clean;
-}
-
-// ─── OutLayer call ─────────────────────────────────────────────────────────
-
-async function callOutlayer(
-  wasmBody: Record<string, unknown>,
-  bearerToken: string,
-): Promise<NextResponse> {
-  const url = `${OUTLAYER_API_URL}/call/${PROJECT_OWNER}/${PROJECT_NAME}`;
-
-  let response: Response;
-  try {
-    response = await fetchWithTimeout(
-      url,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${bearerToken}`,
-        },
-        body: JSON.stringify(wasmBody),
-      },
-      15_000,
-    );
-  } catch {
-    return NextResponse.json(
-      { success: false, error: 'Upstream timeout' },
-      { status: 504 },
-    );
-  }
-
-  if (!response.ok) {
-    return NextResponse.json(
-      { success: false, error: `Upstream error: ${response.status}` },
-      { status: response.status >= 400 && response.status < 500 ? response.status : 502 },
-    );
-  }
-
-  const result = await response.json();
-
-  try {
-    const decoded = decodeOutlayerResponse(result);
-    return NextResponse.json(decoded, {
-      status: decoded.success ? 200 : 400,
-    });
-  } catch {
-    // Fallback: return raw response
-    return NextResponse.json(result);
-  }
+  response.headers.set('X-RateLimit-Limit', String(RATE_LIMIT));
+  response.headers.set('X-RateLimit-Remaining', String(rl.remaining));
+  response.headers.set('X-RateLimit-Reset', String(rl.resetAt));
+  return response;
 }
 
 // ─── Main dispatcher ───────────────────────────────────────────────────────
@@ -186,6 +147,16 @@ async function callOutlayer(
 async function dispatch(
   request: NextRequest,
   { params }: { params: Promise<{ path: string[] }> },
+): Promise<NextResponse> {
+  const rl = checkRateLimit(getClientIp(request));
+  const response = await innerDispatch(request, { params }, rl);
+  return applyHeaders(response, rl);
+}
+
+async function innerDispatch(
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> },
+  rl: RateLimitResult,
 ): Promise<NextResponse> {
   const { path } = await params;
   const route = resolveRoute(request.method, path);
@@ -197,11 +168,24 @@ async function dispatch(
     );
   }
 
-  const isPublic = PUBLIC_ACTIONS.has(route.action);
-  const paymentKey = request.headers.get('x-payment-key');
+  if (rl.limited) {
+    return NextResponse.json(
+      { success: false, error: 'Rate limit exceeded' },
+      { status: 429 },
+    );
+  }
 
-  // Build WASM body — route-derived fields (action, pathParams) MUST override
-  // user input to prevent action/handle injection via body or query params.
+  const isPublic = PUBLIC_ACTIONS.has(route.action);
+
+  // Accept auth via X-Payment-Key header (payment keys & wallet keys)
+  // or Authorization: Bearer header (wallet keys).
+  const paymentKey = request.headers.get('x-payment-key');
+  const bearerToken = request.headers
+    .get('authorization')
+    ?.match(/^Bearer\s+(wk_.+)$/)?.[1];
+  const userAuthKey = paymentKey || bearerToken;
+
+  // Route fields override user input to prevent action/handle injection.
   let wasmBody: Record<string, unknown>;
 
   if (request.method === 'GET') {
@@ -226,39 +210,58 @@ async function dispatch(
 
   // Auth dispatch
   if (isPublic) {
-    if (isRateLimited(getClientIp(request))) {
-      return NextResponse.json(
-        { success: false, error: 'Rate limit exceeded' },
-        { status: 429 },
-      );
-    }
-    if (!PAYMENT_API_KEY) {
+    if (!OUTLAYER_PAYMENT_KEY) {
       return NextResponse.json(
         { success: false, error: 'Public API not configured' },
         { status: 503 },
       );
     }
-    return callOutlayer(sanitizePublic(wasmBody), PAYMENT_API_KEY);
+    const sanitized = sanitizePublic(wasmBody);
+    const cacheKey = makeCacheKey(sanitized);
+    const cached = getCached(cacheKey);
+    if (cached) {
+      return NextResponse.json(cached);
+    }
+    const result = await callOutlayer(sanitized, OUTLAYER_PAYMENT_KEY);
+    if (result.status === 200) {
+      const data = await result.json();
+      setCache(route.action, cacheKey, data);
+      return NextResponse.json(data);
+    }
+    return result;
   }
 
-  if (paymentKey) {
-    return callOutlayer(wasmBody, paymentKey);
+  // Auth mode 1: User provides a key (payment key or wallet key) via header.
+  // Wallet keys (wk_) are forwarded as Authorization: Bearer to OutLayer.
+  // Payment keys (owner:nonce:secret) are forwarded as X-Payment-Key.
+  if (userAuthKey) {
+    return callOutlayer(wasmBody, userAuthKey);
   }
 
-  if (wasmBody.auth) {
-    if (!PAYMENT_API_KEY) {
+  // Auth mode 2: User provides a verifiable_claim (NEP-413 signature) in body.
+  // Server pays for WASM execution; WASM verifies the signature for identity.
+  if (wasmBody.verifiable_claim) {
+    if (!OUTLAYER_PAYMENT_KEY) {
       return NextResponse.json(
         { success: false, error: 'API not configured' },
         { status: 503 },
       );
     }
-    return callOutlayer(wasmBody, PAYMENT_API_KEY);
+    return callOutlayer(wasmBody, OUTLAYER_PAYMENT_KEY);
   }
 
   return NextResponse.json(
-    { success: false, error: 'Authentication required. Provide X-Payment-Key header or auth field in body.' },
+    {
+      success: false,
+      error:
+        'Authentication required. Provide Authorization: Bearer wk_..., X-Payment-Key header, or verifiable_claim in body.',
+    },
     { status: 401 },
   );
+}
+
+function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: CORS_HEADERS });
 }
 
 export {
@@ -266,4 +269,5 @@ export {
   dispatch as POST,
   dispatch as PATCH,
   dispatch as DELETE,
+  OPTIONS,
 };

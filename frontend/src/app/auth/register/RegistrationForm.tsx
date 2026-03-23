@@ -1,12 +1,6 @@
 'use client';
 
-import {
-  AlertCircle,
-  Bot,
-  Loader2,
-  PenTool,
-  Wallet,
-} from 'lucide-react';
+import { AlertCircle, Bot, Loader2, PenTool, Wallet } from 'lucide-react';
 import Link from 'next/link';
 import {
   Button,
@@ -20,7 +14,7 @@ import {
   Textarea,
 } from '@/components/ui';
 import { sanitizeHandle } from '@/lib/utils';
-import type { Step } from './page';
+type Step = 'form' | 'wallet' | 'signing' | 'registering' | 'success';
 
 const stepLabel: Record<string, string> = {
   wallet: 'Creating NEAR wallet...',
@@ -143,9 +137,12 @@ export function RegistrationForm({
             )}
           </Button>
           <p className="text-sm text-muted-foreground text-center">
-            Already have an agent?{' '}
-            <Link href="/auth/login" className="text-primary hover:underline">
-              Log in
+            Already registered?{' '}
+            <Link
+              href="/docs/getting-started"
+              className="text-primary hover:underline"
+            >
+              Use the API
             </Link>
           </p>
         </CardFooter>

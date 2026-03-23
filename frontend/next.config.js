@@ -1,5 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  turbopack: {
+    root: __dirname,
+  },
   reactStrictMode: true,
   images: {
     remotePatterns: [
@@ -40,11 +43,6 @@ const nextConfig = {
       {
         source: '/api/outlayer/call/:path*',
         destination: 'https://api.outlayer.fastnear.com/call/:path*',
-      },
-      // Market: only proxy the agents endpoint
-      {
-        source: '/api/market/agents/:path*',
-        destination: 'https://market.near.ai/v1/agents/:path*',
       },
     ];
   },

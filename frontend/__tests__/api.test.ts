@@ -1,31 +1,16 @@
 import { api, ApiError } from '@/lib/api';
 import { executeWasm, OutlayerExecError } from '@/lib/outlayer-exec';
-import { callContract } from '@/lib/outlayer';
 import { TEST_AUTH } from './fixtures';
 
 jest.mock('@/lib/outlayer-exec', () => {
   const actual = jest.requireActual('@/lib/outlayer-exec');
-  class OutlayerExecError extends Error {
-    code?: string;
-    constructor(message: string, code?: string) {
-      super(message);
-      this.name = 'OutlayerExecError';
-      this.code = code;
-    }
-  }
   return {
     ...actual,
     executeWasm: jest.fn(),
-    OutlayerExecError,
   };
 });
 
-jest.mock('@/lib/outlayer', () => ({
-  callContract: jest.fn(),
-}));
-
 const mockExecuteWasm = executeWasm as jest.MockedFunction<typeof executeWasm>;
-const mockCallContract = callContract as jest.MockedFunction<typeof callContract>;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -34,27 +19,15 @@ beforeEach(() => {
 
 describe('ApiClient', () => {
   describe('credentials management', () => {
-    it('starts with null apiKey and auth', () => {
-      expect(api.getApiKey()).toBeNull();
-      expect(api.getAuth()).toBeNull();
+    it('throws 401 when no API key is set for authenticated calls', async () => {
+      await expect(api.getMe()).rejects.toMatchObject({ statusCode: 401 });
     });
 
-    it('sets and gets API key', () => {
-      api.setApiKey('wk_test123');
-      expect(api.getApiKey()).toBe('wk_test123');
-    });
-
-    it('sets and gets auth', () => {
-      api.setAuth(TEST_AUTH);
-      expect(api.getAuth()).toEqual(TEST_AUTH);
-    });
-
-    it('clears credentials', () => {
+    it('clears credentials so authenticated calls fail', async () => {
       api.setApiKey('wk_test');
       api.setAuth(TEST_AUTH);
       api.clearCredentials();
-      expect(api.getApiKey()).toBeNull();
-      expect(api.getAuth()).toBeNull();
+      await expect(api.getMe()).rejects.toMatchObject({ statusCode: 401 });
     });
   });
 
@@ -64,23 +37,24 @@ describe('ApiClient', () => {
       await expect(api.getMe()).rejects.toMatchObject({ statusCode: 401 });
     });
 
-    it('routes public reads through /api/public when no API key is set', async () => {
-      // publicRequest uses fetchWithTimeout, which wraps global fetch
+    it('routes public reads through /api/v1 REST endpoints when no API key is set', async () => {
       const originalFetch = global.fetch;
-      global.fetch = jest.fn().mockResolvedValue({
-        ok: true,
-        json: () =>
-          Promise.resolve({ output: { success: true, data: { agents: [] } } }),
-      });
+      try {
+        global.fetch = jest.fn().mockResolvedValue({
+          ok: true,
+          json: () =>
+            Promise.resolve({ output: { success: true, data: [] } }),
+        });
 
-      const result = await api.listVerified(10);
-      expect(result).toEqual({ agents: [] });
+        const result = await api.listAgents(10);
+        expect(result).toEqual({ agents: [] });
 
-      // Verify it hit /api/public, not the OutLayer proxy
-      const callUrl = (global.fetch as jest.Mock).mock.calls[0][0];
-      expect(callUrl).toBe('/api/public');
-
-      global.fetch = originalFetch;
+        // Verify it hit /api/v1 REST endpoint, not the OutLayer proxy
+        const callUrl = (global.fetch as jest.Mock).mock.calls[0][0];
+        expect(callUrl).toBe('/api/v1/agents?limit=10');
+      } finally {
+        global.fetch = originalFetch;
+      }
     });
   });
 
@@ -90,7 +64,7 @@ describe('ApiClient', () => {
     });
 
     it('returns data from executeWasm', async () => {
-      const agent = { handle: 'bot_1', followerCount: 0, followingCount: 0, createdAt: 1 };
+      const agent = { handle: 'bot_1', follower_count: 0, following_count: 0, created_at: 1 };
       mockExecuteWasm.mockResolvedValue({
         success: true,
         data: { agent },
@@ -119,7 +93,7 @@ describe('ApiClient', () => {
 
       try {
         await api.getMe();
-        fail('Should have thrown');
+        throw new Error('Expected getMe to throw');
       } catch (err) {
         expect(err).toBeInstanceOf(ApiError);
         expect((err as ApiError).statusCode).toBe(expectedCode);
@@ -130,8 +104,9 @@ describe('ApiClient', () => {
       const genericError = new TypeError('Network failure');
       mockExecuteWasm.mockRejectedValue(genericError);
 
-      await expect(api.getMe()).rejects.toThrow(genericError);
-      await expect(api.getMe()).rejects.not.toBeInstanceOf(ApiError);
+      const err = await api.getMe().catch((e: unknown) => e);
+      expect(err).toBe(genericError);
+      expect(err).not.toBeInstanceOf(ApiError);
     });
   });
 
@@ -139,7 +114,6 @@ describe('ApiClient', () => {
     beforeEach(() => {
       api.setApiKey('wk_test');
       mockExecuteWasm.mockResolvedValue({ success: true, data: {} });
-      mockCallContract.mockResolvedValue({ request_id: 'r1', status: 'ok' });
     });
 
     it('passes auth when set on client', async () => {
@@ -162,10 +136,10 @@ describe('ApiClient', () => {
         success: true,
         data: { agents: [] },
       });
-      await api.listVerified(10);
+      await api.listAgents(10);
       expect(mockExecuteWasm).toHaveBeenCalledWith(
         'wk_test',
-        'list_verified',
+        'list_agents',
         { limit: 10 },
         undefined,
       );
@@ -173,91 +147,4 @@ describe('ApiClient', () => {
 
   });
 
-  describe('chain commit', () => {
-    beforeEach(() => {
-      api.setApiKey('wk_test');
-      mockCallContract.mockResolvedValue({
-        request_id: 'r1',
-        status: 'ok',
-        tx_hash: '0xabc',
-      });
-    });
-
-    it('fires chain commit on register', async () => {
-      const chainCommit = {
-        receiver_id: 'fastgraph.near',
-        method_name: 'commit',
-        args: { mutations: [], reasoning: 'register', phase: 'register' },
-      };
-      mockExecuteWasm.mockResolvedValue({
-        success: true,
-        data: { agent: { handle: 'new_bot' }, chainCommit },
-      });
-
-      await api.register({ handle: 'new_bot' });
-
-      // callContract is fire-and-forget, wait for microtask
-      await new Promise((r) => setTimeout(r, 0));
-      expect(mockCallContract).toHaveBeenCalledWith('wk_test', chainCommit);
-    });
-
-    it('fires chain commit on followAgent', async () => {
-      const chainCommit = {
-        receiver_id: 'fastgraph.near',
-        method_name: 'commit',
-        args: { mutations: [], reasoning: 'follow', phase: 'follow' },
-      };
-      mockExecuteWasm.mockResolvedValue({
-        success: true,
-        data: { action: 'followed', chainCommit },
-      });
-
-      await api.followAgent('friend');
-      await new Promise((r) => setTimeout(r, 0));
-      expect(mockCallContract).toHaveBeenCalledWith('wk_test', chainCommit);
-    });
-
-    it('fires chain commit on unfollowAgent', async () => {
-      const chainCommit = {
-        receiver_id: 'fastgraph.near',
-        method_name: 'commit',
-        args: { mutations: [], reasoning: 'unfollow', phase: 'unfollow' },
-      };
-      mockExecuteWasm.mockResolvedValue({
-        success: true,
-        data: { action: 'unfollowed', chainCommit },
-      });
-
-      await api.unfollowAgent('ex_friend');
-      await new Promise((r) => setTimeout(r, 0));
-      expect(mockCallContract).toHaveBeenCalledWith('wk_test', chainCommit);
-    });
-
-    it('fires chain commit on updateMe', async () => {
-      const chainCommit = {
-        receiver_id: 'fastgraph.near',
-        method_name: 'commit',
-        args: { mutations: [], reasoning: 'update', phase: 'update' },
-      };
-      mockExecuteWasm.mockResolvedValue({
-        success: true,
-        data: { agent: { handle: 'me' }, chainCommit },
-      });
-
-      await api.updateMe({ displayName: 'Updated' });
-      await new Promise((r) => setTimeout(r, 0));
-      expect(mockCallContract).toHaveBeenCalledWith('wk_test', chainCommit);
-    });
-
-    it('does not fire chain commit when none is returned', async () => {
-      mockExecuteWasm.mockResolvedValue({
-        success: true,
-        data: { agent: { handle: 'me' } },
-      });
-
-      await api.updateMe({ displayName: 'Updated' });
-      await new Promise((r) => setTimeout(r, 0));
-      expect(mockCallContract).not.toHaveBeenCalled();
-    });
-  });
 });

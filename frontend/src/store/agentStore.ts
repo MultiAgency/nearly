@@ -1,10 +1,10 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import type { MarketRegisterResponse } from '@/lib/market';
 import type {
   OutlayerRegisterResponse,
   SignMessageResponse,
 } from '@/lib/outlayer';
+import type { RegisterResponse } from '@/lib/register';
 
 type StepNumber = 1 | 2 | 3;
 type StepStatus = 'idle' | 'loading' | 'success' | 'error';
@@ -20,7 +20,7 @@ interface AgentStore {
   signMessage: string | null;
 
   // Step 3
-  marketHandle: string | null;
+  handle: string | null;
 
   // Step state
   currentStep: StepNumber;
@@ -33,7 +33,7 @@ interface AgentStore {
   setStepError: (step: StepNumber, error: string) => void;
   completeStep1: (data: OutlayerRegisterResponse) => void;
   completeStep2: (data: SignMessageResponse, message: string) => void;
-  completeStep3: (data: MarketRegisterResponse) => void;
+  completeStep3: (data: RegisterResponse) => void;
   reset: () => void;
 }
 
@@ -43,16 +43,26 @@ const initialState = {
   handoffUrl: null as string | null,
   signResult: null as SignMessageResponse | null,
   signMessage: null as string | null,
-  marketHandle: null as string | null,
+  handle: null as string | null,
   currentStep: 1 as StepNumber,
-  stepStatus: { 1: 'idle', 2: 'idle', 3: 'idle' } as Record<StepNumber, StepStatus>,
-  stepErrors: { 1: null, 2: null, 3: null } as Record<StepNumber, string | null>,
+  stepStatus: { 1: 'idle', 2: 'idle', 3: 'idle' } as Record<
+    StepNumber,
+    StepStatus
+  >,
+  stepErrors: { 1: null, 2: null, 3: null } as Record<
+    StepNumber,
+    string | null
+  >,
 };
 
 export const useAgentStore = create<AgentStore>()(
   persist(
     (set) => {
-      const updateStep = (step: StepNumber, status: StepStatus, error: string | null = null) =>
+      const updateStep = (
+        step: StepNumber,
+        status: StepStatus,
+        error: string | null = null,
+      ) =>
         set((s) => ({
           stepStatus: { ...s.stepStatus, [step]: status },
           stepErrors: { ...s.stepErrors, [step]: error },
@@ -84,10 +94,9 @@ export const useAgentStore = create<AgentStore>()(
 
         completeStep3: (data) => {
           updateStep(3, 'success');
-          // Clear secrets now that registration is complete — only keep
-          // non-sensitive display fields in sessionStorage.
+          // Clear secrets; keep only non-sensitive fields in sessionStorage.
           set({
-            marketHandle: data.handle,
+            handle: data.handle,
             apiKey: null,
             signResult: null,
             signMessage: null,
@@ -106,12 +115,10 @@ export const useAgentStore = create<AgentStore>()(
         stepStatus: state.stepStatus,
         stepErrors: state.stepErrors,
         nearAccountId: state.nearAccountId,
-        marketHandle: state.marketHandle,
+        handle: state.handle,
       }),
       onRehydrateStorage: () => (state) => {
-        // If secrets were lost (page refresh mid-flow), reset to step 1
-        // since apiKey is intentionally excluded from persistence.
-        // Skip reset when registration is already complete (step 3 success).
+        // Reset to step 1 if secrets lost (refresh mid-flow), unless already registered.
         if (
           state &&
           state.currentStep > 1 &&

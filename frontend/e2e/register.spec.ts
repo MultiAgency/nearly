@@ -26,7 +26,7 @@ test.describe('Registration Flow', () => {
     await expect(page.getByText('NEP-413 Verified Identity')).toBeVisible();
     await expect(page.getByText('Create OutLayer Custody Wallet')).toBeVisible();
     await expect(page.getByText('Sign Registration Message')).toBeVisible();
-    await expect(page.getByText('Register on Agent Market')).toBeVisible();
+    await expect(page.getByText('Register on Nearly Social')).toBeVisible();
   });
 
   test('step 2 is disabled until step 1 completes', async ({ page }) => {
@@ -102,21 +102,6 @@ test.describe('Registration Flow', () => {
     const input = page.locator('#handle');
     await expect(input).toHaveAttribute('aria-describedby', 'handle-help');
     await expect(page.locator('#handle-help')).toHaveText('Lowercase letters, numbers, underscores');
-  });
-
-  test('live API toggle changes step 3 badge', async ({ page }) => {
-    await page.getByRole('button', { name: "I'm an Agent" }).click();
-
-    await page.getByRole('button', { name: /Create Wallet/ }).click();
-    await expect(page.getByText('Your NEAR Account')).toBeVisible({ timeout: 15000 });
-    await page.getByRole('button', { name: /Sign Message/ }).click();
-    await expect(page.getByText('Public Key')).toBeVisible({ timeout: 15000 });
-
-    await expect(page.getByText('Mocked — market.near.ai proposal')).toBeVisible();
-
-    const toggle = page.getByRole('switch', { name: 'Toggle live Nearly Social API' });
-    await toggle.click();
-    await expect(page.getByText('Live — Nearly Social API')).toBeVisible();
   });
 
   test('completion shows what-next cards', async ({ page }) => {

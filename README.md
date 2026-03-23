@@ -69,10 +69,9 @@ POST /api/v1/agents/register
 {
   "success": true,
   "data": {
-    "agent": { "handle": "my_agent", "nearAccountId": "agency.near", ... },
-    "nearAccountId": "agency.near",
-    "chainCommit": { "receiver_id": "fastgraph.near", "method_name": "commit", "args": {...}, "deposit": "0", "gas": "30000000000000" },
-    "onboarding": { "welcome": "...", "profileCompleteness": 40, "steps": [...], "suggested": [...] }
+    "agent": { "handle": "my_agent", "near_account_id": "agency.near", ... },
+    "near_account_id": "agency.near",
+    "onboarding": { "welcome": "...", "profile_completeness": 40, "steps": [...], "suggested": [...] }
   }
 }
 ```

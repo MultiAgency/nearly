@@ -1,63 +1,61 @@
-use outlayer::{env, storage};
-use std::collections::{HashMap, HashSet};
+use outlayer::env;
 
 mod agent;
 mod auth;
-mod fastgraph;
 mod follow;
+mod handlers;
 mod nep413;
 mod notifications;
 mod registry;
 mod social_graph;
 mod suggest;
 mod types;
-mod wstore;
+mod store;
 
 // Re-export at crate level so existing modules (social_graph, notifications,
 // suggest, nep413) can continue using `crate::` paths.
 pub(crate) use agent::*;
 pub(crate) use types::*;
-pub(crate) use wstore::*;
+pub(crate) use store::*;
 
-use auth::get_caller_from;
-use follow::{handle_follow, handle_unfollow, suggestion_reason};
-use notifications::{load_notifications_since, notif_index_key};
-use registry::{add_to_registry, load_agents_sorted, registry_count};
-use social_graph::{
-    format_edge, load_unfollow_history_by, load_unfollow_history_for, new_followers_since,
-    new_following_count_since, new_following_since, paginate_json, paginate_json_raw,
-};
+use follow::{handle_follow, handle_unfollow};
+use handlers::*;
+use registry::{list_tags, registry_count};
 
 // ─── Auth / extraction macros ─────────────────────────────────────────────
 
 /// Extract the authenticated caller, returning an error Response on failure.
+#[macro_export]
 macro_rules! require_caller {
     ($req:expr) => {
-        match get_caller_from($req) { Ok(c) => c, Err(e) => return e }
+        match crate::auth::get_caller_from($req) { Ok(c) => c, Err(e) => return e }
     };
 }
 
 /// Extract an agent handle for the caller's account, returning an error Response if unregistered.
+#[macro_export]
 macro_rules! require_handle {
     ($account:expr) => {
         match agent_handle_for_account($account) {
             Some(h) => h,
-            None => return err_response("No agent registered for this account"),
+            None => return err_coded("NOT_REGISTERED", "No agent registered for this account"),
         }
     };
 }
 
 /// Load an agent record by handle, returning an error Response if not found.
+#[macro_export]
 macro_rules! require_agent {
     ($handle:expr) => {
         match load_agent($handle) {
             Some(a) => a,
-            None => return err_response("Agent not found"),
+            None => return err_coded("NOT_FOUND", "Agent not found"),
         }
     };
 }
 
 /// Require an optional field from the request, returning an error Response with message if None.
+#[macro_export]
 macro_rules! require_field {
     ($opt:expr, $msg:expr) => {
         match $opt {
@@ -65,548 +63,6 @@ macro_rules! require_field {
             None => return err_response($msg),
         }
     };
-}
-
-// ─── Register ──────────────────────────────────────────────────────────────
-
-fn handle_register(req: &Request) -> Response {
-    let caller = require_caller!(req);
-
-    if agent_handle_for_account(&caller).is_some() {
-        return err_response("NEAR account already registered");
-    }
-
-    let raw_handle = require_field!(req.handle.as_deref(), "Handle is required");
-    let handle = match validate_handle(raw_handle) { Ok(h) => h, Err(e) => return err_response(&e) };
-    // SAFETY: OutLayer serializes WASM calls, so no TOCTOU race between this check and save_agent below.
-    if load_agent(&handle).is_some() {
-        return err_response("Handle already taken");
-    }
-
-    let tags = match req.tags.as_deref() {
-        Some(t) => match validate_tags(t) { Ok(t) => t, Err(e) => return err_response(&e) },
-        None => Vec::new(),
-    };
-
-    if let Some(desc) = &req.description {
-        if let Err(e) = validate_description(desc) { return err_response(&e); }
-    }
-    if let Some(dn) = &req.display_name {
-        if let Err(e) = validate_display_name(dn) { return err_response(&e); }
-    }
-
-    let ts = now_secs();
-    let agent = AgentRecord {
-        handle: handle.clone(),
-        display_name: req.display_name.clone().unwrap_or_else(|| handle.clone()),
-        description: req.description.clone().unwrap_or_default(),
-        avatar_url: match &req.avatar_url {
-            Some(url) => { if let Err(e) = validate_avatar_url(url) { return err_response(&e); } Some(url.clone()) },
-            None => None,
-        },
-        tags,
-        capabilities: match &req.capabilities {
-            Some(caps) => { if let Err(e) = validate_capabilities(caps) { return err_response(&e); } caps.clone() },
-            None => serde_json::json!({}),
-        },
-        near_account_id: caller.clone(),
-        follower_count: 0,
-        unfollow_count: 0,
-        following_count: 0,
-        created_at: ts,
-        last_active: ts,
-    };
-
-    if let Err(e) = save_agent(&agent) { return err_response(&format!("Failed to save agent: {e}")); }
-    if let Err(e) = w_set_string(&keys::near_account(&caller), &handle) { return err_response(&format!("Failed to save mapping: {e}")); }
-    if let Err(e) = add_to_registry() { return err_response(&format!("Failed to update registry: {e}")); }
-
-    // Use sorted index for onboarding suggestions instead of loading full registry
-    let preview = match load_agents_sorted("followers", 3, &None, |a| a.handle != handle) {
-        Ok((agents, _)) => agents,
-        Err(_) => Vec::new(),
-    };
-    let suggested: Vec<serde_json::Value> = preview.into_iter().take(3).map(|a| {
-        let mut entry = format_agent(&a);
-        entry["followUrl"] = serde_json::json!(format!("/v1/agents/{}/follow", a.handle));
-        entry
-    }).collect();
-
-    let agent_json = format_agent(&agent);
-    let chain_commit = fastgraph::chain_commit(
-        vec![fastgraph::create_agent_node(&handle, &agent_json)],
-        &format!("Agent {} registered on Nearly Social", handle),
-        "register",
-    );
-
-    ok_response(serde_json::json!({
-        "agent": agent_json,
-        "nearAccountId": caller,
-        "chainCommit": chain_commit,
-        "onboarding": {
-            "welcome": format!("Welcome to Nearly Social, {}.", handle),
-            "profileCompleteness": profile_completeness(&agent),
-            "steps": [
-                { "action": "complete_profile", "method": "PATCH", "path": "/v1/agents/me",
-                  "hint": "Add tags and a description so agents with similar interests can find you." },
-                { "action": "get_suggestions", "method": "GET", "path": "/v1/agents/suggested",
-                  "hint": "After updating your profile, fetch agents matched by shared tags." },
-                { "action": "read_skill_file", "url": "/skill.md", "hint": "Full API reference and onboarding guide." },
-                { "action": "heartbeat", "hint": "Call the heartbeat action every 30 minutes to stay active and get follow suggestions." }
-            ],
-            "suggested": suggested,
-        }
-    }))
-}
-
-// ─── Profile ───────────────────────────────────────────────────────────────
-
-fn handle_get_me(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let handle = require_handle!(&caller);
-    match load_agent(&handle) {
-        Some(agent) => {
-            let has_tags = !agent.tags.is_empty();
-            ok_response(serde_json::json!({
-                "agent": format_agent(&agent),
-                "profileCompleteness": profile_completeness(&agent),
-                "suggestions": {
-                    "quality": if has_tags { "personalized" } else { "generic" },
-                    "hint": if has_tags { "Your tags enable interest-based matching with other agents." }
-                            else { "Add tags to unlock personalized follow suggestions based on shared interests." },
-                }
-            }))
-        }
-        None => err_response("Agent data not found"),
-    }
-}
-
-fn handle_update_me(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let handle = require_handle!(&caller);
-    let mut agent = require_agent!(&handle);
-
-    let mut changed = false;
-    if let Some(desc) = &req.description {
-        if let Err(e) = validate_description(desc) { return err_response(&e); }
-        agent.description = desc.clone(); changed = true;
-    }
-    if let Some(dn) = &req.display_name {
-        if let Err(e) = validate_display_name(dn) { return err_response(&e); }
-        agent.display_name = dn.clone(); changed = true;
-    }
-    if let Some(url) = &req.avatar_url {
-        if let Err(e) = validate_avatar_url(url) { return err_response(&e); }
-        agent.avatar_url = Some(url.clone()); changed = true;
-    }
-    if let Some(tags) = &req.tags {
-        match validate_tags(tags) { Ok(t) => { agent.tags = t; changed = true; } Err(e) => return err_response(&e) }
-    }
-    if let Some(caps) = &req.capabilities {
-        if let Err(e) = validate_capabilities(caps) { return err_response(&e); }
-        agent.capabilities = caps.clone(); changed = true;
-    }
-    if !changed { return err_response("No valid fields to update"); }
-
-    agent.last_active = now_secs();
-    if let Err(e) = save_agent(&agent) { return err_response(&format!("Failed to save: {e}")); }
-
-    let agent_json = format_agent(&agent);
-    let chain_commit = fastgraph::chain_commit(
-        vec![fastgraph::update_agent_node(&handle, &agent_json)],
-        &format!("Profile updated for {}", handle),
-        "update_profile",
-    );
-
-    ok_response(serde_json::json!({ "agent": agent_json, "profileCompleteness": profile_completeness(&agent), "chainCommit": chain_commit }))
-}
-
-fn handle_get_profile(req: &Request) -> Response {
-    let handle = require_field!(req.handle.as_deref(), "Handle is required").to_lowercase();
-    let agent = require_agent!(&handle);
-    let mut data = serde_json::json!({ "agent": format_agent(&agent) });
-    if let Ok(caller) = get_caller_from(req) {
-        data["isFollowing"] = serde_json::json!(w_has(&keys::follow_edge(&caller, &handle)));
-    }
-    ok_response(data)
-}
-
-// ─── Listings ──────────────────────────────────────────────────────────────
-
-fn handle_list_agents(
-    req: &Request,
-    filter: impl Fn(&AgentRecord) -> bool,
-    default_sort: &str,
-    default_limit: u32,
-) -> Response {
-    let sort = req.sort.as_deref().unwrap_or(default_sort);
-    let limit = req.limit.unwrap_or(default_limit).min(MAX_LIMIT) as usize;
-
-    match load_agents_sorted(sort, limit, &req.cursor, filter) {
-        Ok((agents, next_cursor)) => {
-            let data: Vec<serde_json::Value> = agents.iter().map(format_agent).collect();
-            ok_paginated(serde_json::json!(data), limit as u32, next_cursor)
-        }
-        Err(e) => err_response(&e),
-    }
-}
-
-// ─── Suggestions (VRF-seeded random walk) ───────────────────────────────────
-
-fn handle_get_suggested(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let limit = req.limit.unwrap_or(10).min(50) as usize;
-
-    // Seed RNG from VRF or deterministic fallback
-    let vrf_result = outlayer::vrf::random("suggestions").ok();
-    let rng_seed: Vec<u8> = if let Some(ref vr) = vrf_result {
-        let hex = &vr.output_hex;
-        if hex.len() >= 2 && hex.len() % 2 == 0 {
-            let decoded: Result<Vec<u8>, _> = (0..hex.len() / 2)
-                .map(|i| u8::from_str_radix(&hex[i*2..i*2+2], 16))
-                .collect();
-            decoded.unwrap_or_else(|_| {
-                eprintln!("Warning: malformed VRF hex output, falling back to caller seed");
-                caller.as_bytes().to_vec()
-            })
-        } else {
-            eprintln!("Warning: unexpected VRF hex length {}, falling back to caller seed", hex.len());
-            caller.as_bytes().to_vec()
-        }
-    } else {
-        eprintln!("Note: VRF unavailable, using deterministic caller-based seed");
-        caller.as_bytes().to_vec()
-    };
-    let mut rng = suggest::Rng::from_bytes(&rng_seed);
-
-    // Build caller context using prefix scan instead of full registry
-    let following_prefix = keys::following_prefix(&caller);
-    let following_keys = storage::list_keys(&following_prefix).unwrap_or_default();
-    let follows: Vec<String> = following_keys.iter()
-        .filter_map(|key| key.strip_prefix(&following_prefix).map(|s| s.to_string()))
-        .collect();
-    let follow_set: HashSet<String> = follows.iter().cloned().collect();
-    let own_handle = agent_handle_for_account(&caller);
-    let my_tags: Vec<String> = own_handle.as_ref()
-        .and_then(|h| load_agent(h)).map(|a| a.tags).unwrap_or_default();
-
-    // Build outgoing-edge cache for graph walks using prefix scans per agent
-    let mut outgoing_cache: HashMap<String, Vec<String>> = HashMap::new();
-    let mut get_outgoing = |handle: &str| -> Vec<String> {
-        if let Some(cached) = outgoing_cache.get(handle) { return cached.clone(); }
-        let neighbors = load_agent(handle).map(|a| {
-            let prefix = keys::following_prefix(&a.near_account_id);
-            storage::list_keys(&prefix).unwrap_or_default().iter()
-                .filter_map(|k| k.strip_prefix(&prefix).map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        }).unwrap_or_default();
-        outgoing_cache.insert(handle.to_string(), neighbors.clone());
-        neighbors
-    };
-
-    // Random walks + scoring
-    let visits = suggest::random_walk_visits(
-        &mut rng, &follows, &follow_set, own_handle.as_deref(), &mut get_outgoing,
-    );
-
-    // Load candidate agents (not already followed, not self).
-    let candidate_limit = (limit * 5).max(50);
-    let candidates: Vec<AgentRecord> = match load_agents_sorted(
-        "followers",
-        candidate_limit,
-        &None,
-        |a| !follow_set.contains(&a.handle) && own_handle.as_deref() != Some(a.handle.as_str()),
-    ) {
-        Ok((agents, _)) => agents,
-        Err(_) => Vec::new(),
-    };
-
-    if candidates.is_empty() {
-        return ok_response(serde_json::json!({ "agents": [], "vrf": null }));
-    }
-
-    let ranked = suggest::rank_candidates(&mut rng, candidates, &visits, &my_tags, limit);
-
-    // Format results with suggestion reasons
-    let ts = now_secs();
-    let mut warnings: Vec<String> = Vec::new();
-    let mut results: Vec<serde_json::Value> = Vec::with_capacity(limit);
-    for s in ranked.into_iter().take(limit) {
-        let v = visits.get(&s.agent.handle).copied().unwrap_or(0);
-        let mut e = format_agent(&s.agent);
-        e["isFollowing"] = serde_json::json!(false);
-        e["reason"] = suggestion_reason(v, &s.shared_tags);
-
-        if let Err(e) = w_set_string(
-            &keys::suggested(&caller, &s.agent.handle, ts),
-            &format!("{v}"),
-        ) { warnings.push(format!("suggestion audit: {e}")); }
-
-        results.push(e);
-    }
-
-    let vrf_json = vrf_result.as_ref().map(|vr| serde_json::json!({
-        "output": vr.output_hex, "proof": vr.signature_hex, "alpha": vr.alpha
-    }));
-
-    let mut resp = serde_json::json!({ "agents": results, "vrf": vrf_json });
-    if !warnings.is_empty() { resp["warnings"] = serde_json::json!(warnings); }
-    ok_response(resp)
-}
-
-// ─── Social Graph Queries ──────────────────────────────────────────────────
-
-fn handle_get_followers(req: &Request) -> Response {
-    let th = require_field!(req.handle.as_deref(), "Handle is required").to_lowercase();
-    let _ = require_agent!(&th);
-    let limit = req.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-
-    let prefix = keys::follower_prefix(&th);
-    let follower_keys = storage::list_keys(&prefix).unwrap_or_default();
-
-    let results: Vec<serde_json::Value> = follower_keys.iter()
-        .filter_map(|key| {
-            let follower_account = key.strip_prefix(&prefix)?;
-            let follower_handle = agent_handle_for_account(follower_account)?;
-            let agent = load_agent(&follower_handle)?;
-            let edge_key = keys::follow_edge(follower_account, &th);
-            Some(format_edge(&agent, &edge_key, "incoming"))
-        })
-        .collect();
-
-    paginate_json(&results, limit, &req.cursor)
-}
-
-fn handle_get_following(req: &Request) -> Response {
-    let sh = require_field!(req.handle.as_deref(), "Handle is required").to_lowercase();
-    let source = require_agent!(&sh);
-    let limit = req.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-
-    let prefix = keys::following_prefix(&source.near_account_id);
-    let following_keys = storage::list_keys(&prefix).unwrap_or_default();
-
-    let results: Vec<serde_json::Value> = following_keys.iter()
-        .filter_map(|key| {
-            let target_handle = key.strip_prefix(&prefix)?;
-            let edge_key = keys::follow_edge(&source.near_account_id, target_handle);
-            let agent = load_agent(target_handle)?;
-            Some(format_edge(&agent, &edge_key, "outgoing"))
-        })
-        .collect();
-
-    paginate_json(&results, limit, &req.cursor)
-}
-
-/// Full neighborhood query: incoming, outgoing, or both — with optional unfollow history.
-fn handle_get_edges(req: &Request) -> Response {
-    let handle = require_field!(req.handle.as_deref(), "Handle is required").to_lowercase();
-    let agent = require_agent!(&handle);
-    let direction = req.direction.as_deref().unwrap_or("both");
-    if !["incoming", "outgoing", "both"].contains(&direction) {
-        return err_response("Invalid direction: use incoming, outgoing, or both");
-    }
-    let include_history = req.include_history.unwrap_or(false);
-    let limit = req.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-
-    let mut edges: Vec<serde_json::Value> = Vec::new();
-
-    if direction == "incoming" || direction == "both" {
-        let prefix = keys::follower_prefix(&handle);
-        edges.extend(storage::list_keys(&prefix).unwrap_or_default().iter().filter_map(|key| {
-            let follower_account = key.strip_prefix(&prefix)?;
-            let follower_handle = agent_handle_for_account(follower_account)?;
-            let follower = load_agent(&follower_handle)?;
-            Some(format_edge(&follower, &keys::follow_edge(follower_account, &handle), "incoming"))
-        }));
-    }
-
-    if direction == "outgoing" || direction == "both" {
-        let prefix = keys::following_prefix(&agent.near_account_id);
-        edges.extend(storage::list_keys(&prefix).unwrap_or_default().iter().filter_map(|key| {
-            let target_handle = key.strip_prefix(&prefix)?;
-            let target = load_agent(target_handle)?;
-            Some(format_edge(&target, &keys::follow_edge(&agent.near_account_id, target_handle), "outgoing"))
-        }));
-    }
-
-    let total_edges = edges.len();
-    let mut history: Vec<serde_json::Value> = Vec::new();
-    if include_history {
-        if direction == "incoming" || direction == "both" {
-            history.extend(load_unfollow_history_for(&handle));
-        }
-        if direction == "outgoing" || direction == "both" {
-            history.extend(load_unfollow_history_by(&agent.near_account_id));
-        }
-    }
-
-    let (page, next) = paginate_json_raw(&edges, limit, &req.cursor);
-
-    ok_response(serde_json::json!({
-        "handle": handle,
-        "edges": page,
-        "edgeCount": total_edges,
-        "history": if include_history { serde_json::json!(history) } else { serde_json::json!(null) },
-        "pagination": { "limit": limit, "nextCursor": next },
-    }))
-}
-
-// ─── Heartbeat ─────────────────────────────────────────────────────────────
-
-fn handle_heartbeat(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let handle = require_handle!(&caller);
-    let mut agent = require_agent!(&handle);
-
-    let previous_active = agent.last_active;
-    agent.last_active = now_secs();
-    if let Err(e) = save_agent(&agent) { return err_response(&format!("Failed to save: {e}")); }
-
-    let new_followers = new_followers_since(&handle, previous_active);
-    let new_followers_count = new_followers.len();
-    let new_following_count = new_following_count_since(&caller, previous_active);
-    let notifications = load_notifications_since(&handle, previous_active);
-
-    // Clean up notifications older than 7 days
-    let mut warnings: Vec<String> = Vec::new();
-    let cutoff = agent.last_active.saturating_sub(7 * 24 * 60 * 60);
-    if let Err(e) = prune_index(&notif_index_key(&handle), cutoff, |key| {
-        key.splitn(5, ':').nth(2)?.parse().ok()
-    }) { warnings.push(e); }
-
-    // Prune unfollow indices older than 30 days
-    let unfollow_cutoff = agent.last_active.saturating_sub(30 * 24 * 60 * 60);
-    if let Err(e) = prune_index(&keys::unfollow_idx(&handle), unfollow_cutoff, |key| {
-        key.rsplit(':').next()?.parse().ok()
-    }) { warnings.push(e); }
-
-    // Garbage-collect expired nonces
-    let nonce_cutoff = now_secs().saturating_sub(NONCE_TTL_SECS);
-    if let Ok(nonce_keys) = storage::list_keys("nonce:") {
-        for key in nonce_keys {
-            if let Some(ts_str) = w_get_string(&key) {
-                match ts_str.parse::<u64>() {
-                    Ok(ts) if ts < nonce_cutoff => { let _ = w_delete(&key); }
-                    Err(_) => { let _ = w_delete(&key); }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let mut resp = serde_json::json!({
-        "agent": format_agent(&agent),
-        "delta": {
-            "since": previous_active,
-            "newFollowers": new_followers,
-            "newFollowersCount": new_followers_count,
-            "newFollowingCount": new_following_count,
-            "profileCompleteness": profile_completeness(&agent),
-            "notifications": notifications,
-        },
-        "suggestedAction": { "action": "get_suggested", "hint": "Call get_suggested for VRF-fair recommendations." },
-    });
-    if !warnings.is_empty() { resp["warnings"] = serde_json::json!(warnings); }
-    ok_response(resp)
-}
-
-// ─── Activity & Network ─────────────────────────────────────────────────────
-
-fn handle_get_activity(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let handle = require_handle!(&caller);
-
-    let since = req.since.as_ref()
-        .or(req.cursor.as_ref())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| now_secs().saturating_sub(86400));
-
-    let new_followers = new_followers_since(&handle, since);
-    let new_following = new_following_since(&caller, since);
-
-    ok_response(serde_json::json!({
-        "since": since,
-        "newFollowers": new_followers,
-        "newFollowing": new_following,
-    }))
-}
-
-fn handle_get_network(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let handle = require_handle!(&caller);
-    let agent = require_agent!(&handle);
-
-    let following_prefix = keys::following_prefix(&caller);
-    let following_keys = storage::list_keys(&following_prefix).unwrap_or_default();
-    let mutual_count = following_keys.iter()
-        .filter_map(|key| {
-            let target_handle = key.strip_prefix(&following_prefix)?;
-            if target_handle == handle { return None; }
-            let target = load_agent(target_handle)?;
-            if w_has(&keys::follow_edge(&target.near_account_id, &handle)) {
-                Some(())
-            } else {
-                None
-            }
-        })
-        .count();
-
-    ok_response(serde_json::json!({
-        "followerCount": agent.follower_count,
-        "followingCount": agent.following_count,
-        "mutualCount": mutual_count,
-        "lastActive": agent.last_active,
-        "memberSince": agent.created_at,
-    }))
-}
-
-// ─── Notifications ──────────────────────────────────────────────────────────
-
-fn handle_get_notifications(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let handle = require_handle!(&caller);
-    let limit = req.limit.unwrap_or(50).min(MAX_LIMIT) as usize;
-
-    let since = req.since.as_ref()
-        .or(req.cursor.as_ref())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let read_ts: u64 = w_get_string(&keys::notif_read(&handle))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    let mut notifs = load_notifications_since(&handle, since);
-    notifs.sort_by(|a, b| {
-        let ta = a.get("at").and_then(|v| v.as_u64()).unwrap_or(0);
-        let tb = b.get("at").and_then(|v| v.as_u64()).unwrap_or(0);
-        tb.cmp(&ta)
-    });
-
-    let results: Vec<serde_json::Value> = notifs.into_iter().take(limit).map(|mut n| {
-        let at = n.get("at").and_then(|v| v.as_u64()).unwrap_or(0);
-        n["read"] = serde_json::json!(at <= read_ts);
-        n
-    }).collect();
-
-    let unread = results.iter().filter(|n| n.get("read") == Some(&serde_json::json!(false))).count();
-
-    ok_response(serde_json::json!({
-        "notifications": results,
-        "unreadCount": unread,
-    }))
-}
-
-fn handle_read_notifications(req: &Request) -> Response {
-    let caller = require_caller!(req);
-    let handle = require_handle!(&caller);
-
-    let ts = now_secs();
-    if let Err(e) = w_set_string(&keys::notif_read(&handle), &ts.to_string()) {
-        return err_response(&format!("Failed to mark notifications read: {e}"));
-    }
-
-    ok_response(serde_json::json!({ "readAt": ts }))
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -619,11 +75,6 @@ fn main() {
             Action::UpdateMe => handle_update_me(&req),
             Action::GetProfile => handle_get_profile(&req),
             Action::ListAgents => handle_list_agents(&req, |_| true, "followers", DEFAULT_LIMIT),
-            // All registered agents have a near_account_id (set during NEP-413 registration),
-            // so this filter is currently equivalent to ListAgents. It exists as a distinct
-            // action so the public API can evolve (e.g., filtering by on-chain verification
-            // timestamp or multi-sig attestation) without breaking clients.
-            Action::ListVerified => handle_list_agents(&req, |a| !a.near_account_id.is_empty(), "newest", 50),
             Action::GetSuggested => handle_get_suggested(&req),
             Action::Follow => handle_follow(&req),
             Action::Unfollow => handle_unfollow(&req),
@@ -635,9 +86,15 @@ fn main() {
             Action::GetNetwork => handle_get_network(&req),
             Action::GetNotifications => handle_get_notifications(&req),
             Action::ReadNotifications => handle_read_notifications(&req),
+            Action::ListTags => {
+                let tags: Vec<serde_json::Value> = list_tags().into_iter()
+                    .map(|(tag, count)| serde_json::json!({ "tag": tag, "count": count }))
+                    .collect();
+                ok_response(serde_json::json!({ "tags": tags }))
+            }
             Action::Health => ok_response(serde_json::json!({
                 "status": "ok",
-                "agentCount": registry_count(),
+                "agent_count": registry_count(),
             })),
         },
         Ok(None) => err_response("No input provided"),
@@ -651,6 +108,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn make_agent(handle: &str) -> AgentRecord {
         AgentRecord {
@@ -796,10 +254,10 @@ mod tests {
         let obj = json.as_object().expect("format_agent must return an object");
 
         let required_fields = [
-            "handle", "displayName", "description", "avatarUrl",
-            "tags", "capabilities", "nearAccountId",
-            "followerCount", "unfollowCount", "trustScore",
-            "followingCount", "createdAt", "lastActive",
+            "handle", "display_name", "description", "avatar_url",
+            "tags", "capabilities", "near_account_id",
+            "follower_count", "unfollow_count", "trust_score",
+            "following_count", "created_at", "last_active",
         ];
         for field in &required_fields {
             assert!(obj.contains_key(*field), "Missing field: {field}");
@@ -810,9 +268,9 @@ mod tests {
         }
 
         assert!(json["handle"].is_string());
-        assert!(json["followerCount"].is_number());
-        assert!(json["trustScore"].is_number());
-        assert!(json["createdAt"].is_number());
+        assert!(json["follower_count"].is_number());
+        assert!(json["trust_score"].is_number());
+        assert!(json["created_at"].is_number());
         assert!(json["tags"].is_array());
     }
 
@@ -890,77 +348,26 @@ mod tests {
         assert_eq!(ranked[0].agent.handle, "popular");
     }
 
-    // ── Fastgraph payloads ───────────────────────────────────────────────
-
     #[test]
-    fn chain_commit_structure() {
-        let commit = fastgraph::chain_commit(vec![], "test reason", "test_phase");
-        assert_eq!(commit["receiver_id"], "fastgraph.near");
-        assert_eq!(commit["method_name"], "commit");
-        assert_eq!(commit["args"]["reasoning"], "test reason");
-        assert_eq!(commit["args"]["phase"], "test_phase");
-        assert_eq!(commit["deposit"], "0");
-    }
+    fn different_seeds_produce_different_rankings() {
+        let candidates: Vec<AgentRecord> = (0..5).map(|i| {
+            let mut a = make_agent(&format!("ent_{i}"));
+            a.tags = vec!["ai".into()];
+            a.follower_count = 1;
+            a
+        }).collect();
+        let visits: std::collections::HashMap<String, u32> = candidates.iter()
+            .map(|a| (a.handle.clone(), 3)).collect();
 
-    #[test]
-    fn create_agent_node_structure() {
-        let agent = serde_json::json!({
-            "handle": "alice",
-            "nearAccountId": "alice.near",
-            "displayName": "Alice",
-            "description": "An agent",
-            "tags": ["ai"],
-            "capabilities": {},
-        });
-        let node = fastgraph::create_agent_node("alice", &agent);
-        assert_eq!(node["op"], "create_node");
-        assert_eq!(node["namespace"], "social");
-        assert_eq!(node["node_id"], "alice");
-        assert_eq!(node["node_type"], "agent");
-        assert_eq!(node["data"]["handle"], "alice");
-    }
+        let mut rng_a = suggest::Rng::from_bytes(b"seed_alpha");
+        let ranked_a = suggest::rank_candidates(&mut rng_a, candidates.clone(), &visits, &["ai".into()], 5);
 
-    #[test]
-    fn update_agent_node_structure() {
-        let agent = serde_json::json!({ "handle": "bob", "displayName": "Bob" });
-        let node = fastgraph::update_agent_node("bob", &agent);
-        assert_eq!(node["op"], "update_node");
-        assert_eq!(node["node_id"], "bob");
-    }
+        let mut rng_b = suggest::Rng::from_bytes(b"seed_bravo");
+        let ranked_b = suggest::rank_candidates(&mut rng_b, candidates, &visits, &["ai".into()], 5);
 
-    #[test]
-    fn create_follow_edge_structure() {
-        let edge = fastgraph::create_follow_edge("alice", "bob", Some("interesting"), true);
-        assert_eq!(edge["op"], "create_edge");
-        assert_eq!(edge["namespace"], "social");
-        assert_eq!(edge["edge"]["source"], "alice");
-        assert_eq!(edge["edge"]["target"], "bob");
-        assert_eq!(edge["edge"]["label"], "follows");
-        assert_eq!(edge["data"]["reason"], "interesting");
-        assert_eq!(edge["data"]["mutual"], true);
-    }
-
-    #[test]
-    fn delete_follow_edge_structure() {
-        let edge = fastgraph::delete_follow_edge("alice", "bob", None);
-        assert_eq!(edge["op"], "delete_edge");
-        assert_eq!(edge["edge"]["source"], "alice");
-        assert_eq!(edge["edge"]["target"], "bob");
-        assert!(edge["data"]["reason"].is_null());
-    }
-
-    #[test]
-    fn agent_data_omits_image_when_null() {
-        let agent = serde_json::json!({ "handle": "alice", "avatarUrl": null });
-        let data = fastgraph::agent_data(&agent);
-        assert!(!data.as_object().unwrap().contains_key("image"));
-    }
-
-    #[test]
-    fn agent_data_includes_image_when_set() {
-        let agent = serde_json::json!({ "handle": "alice", "avatarUrl": "https://img.png" });
-        let data = fastgraph::agent_data(&agent);
-        assert_eq!(data["image"]["url"], "https://img.png");
+        let order_a: Vec<&str> = ranked_a.iter().map(|s| s.agent.handle.as_str()).collect();
+        let order_b: Vec<&str> = ranked_b.iter().map(|s| s.agent.handle.as_str()).collect();
+        assert_ne!(order_a, order_b, "different seeds should produce different orderings");
     }
 
     // ── Reserved handles ─────────────────────────────────────────────────
@@ -972,43 +379,16 @@ mod tests {
         }
     }
 
-    // ── Pagination ───────────────────────────────────────────────────────
-
-    #[test]
-    fn paginate_json_raw_no_cursor() {
-        let items: Vec<serde_json::Value> = (0..5).map(|i| serde_json::json!({"handle": format!("a{i}")})).collect();
-        let (page, next) = paginate_json_raw(&items, 3, &None);
-        assert_eq!(page.len(), 3);
-        assert_eq!(next, Some("a2".to_string()));
-    }
-
-    #[test]
-    fn paginate_json_raw_with_cursor() {
-        let items: Vec<serde_json::Value> = (0..5).map(|i| serde_json::json!({"handle": format!("a{i}")})).collect();
-        let (page, next) = paginate_json_raw(&items, 3, &Some("a1".to_string()));
-        assert_eq!(page.len(), 3);
-        assert_eq!(page[0]["handle"], "a2");
-        assert!(next.is_none());
-    }
-
-    #[test]
-    fn paginate_json_raw_exact_fit() {
-        let items: Vec<serde_json::Value> = (0..3).map(|i| serde_json::json!({"handle": format!("a{i}")})).collect();
-        let (page, next) = paginate_json_raw(&items, 3, &None);
-        assert_eq!(page.len(), 3);
-        assert!(next.is_none());
-    }
-
     // ── Action dispatch coverage ─────────────────────────────────────────
 
     #[test]
     fn all_action_variants_deserialize_from_snake_case() {
         let actions = [
             "register", "get_me", "update_me", "get_profile",
-            "list_agents", "list_verified", "get_suggested",
+            "list_agents", "get_suggested",
             "follow", "unfollow", "get_followers", "get_following",
             "get_edges", "heartbeat", "get_activity", "get_network",
-            "get_notifications", "read_notifications", "health",
+            "get_notifications", "read_notifications", "list_tags", "health",
         ];
         for action_str in &actions {
             let json = format!(r#""{action_str}""#);
@@ -1016,16 +396,6 @@ mod tests {
             assert!(result.is_ok(), "Failed to deserialize action: {action_str}");
         }
         assert_eq!(actions.len(), 18, "Action count mismatch — did you add a new action?");
-    }
-
-    // ── Reserved handle attack vectors ───────────────────────────────────
-
-    #[test]
-    fn common_attack_handles_are_reserved() {
-        let attack_handles = ["admin", "system", "api", "near", "nearly", "registry"];
-        for h in &attack_handles {
-            assert!(validate_handle(h).is_err(), "{h} should be rejected");
-        }
     }
 
     // ── Tag deduplication behavior ───────────────────────────────────────
@@ -1042,17 +412,6 @@ mod tests {
         assert_eq!(result, vec!["rust"]);
     }
 
-    // ── Pagination edge case ─────────────────────────────────────────────
-
-    #[test]
-    fn paginate_json_raw_cursor_not_found_returns_first_page() {
-        let items: Vec<serde_json::Value> = (0..5).map(|i| serde_json::json!({"handle": format!("a{i}")})).collect();
-        let (page, next) = paginate_json_raw(&items, 3, &Some("nonexistent".to_string()));
-        assert_eq!(page.len(), 3);
-        assert_eq!(page[0]["handle"], "a0");
-        assert_eq!(next, Some("a2".to_string()));
-    }
-
     // ── Profile completeness boundary ────────────────────────────────────
 
     #[test]
@@ -1065,6 +424,56 @@ mod tests {
         agent.description = "eleven_char".to_string();
         assert_eq!(agent.description.len(), 11);
         assert_eq!(profile_completeness(&agent), 60);
+    }
+
+    // ── Profile completeness variations ─────────────────────────────────
+
+    #[test]
+    fn profile_completeness_tags_add_score() {
+        let mut agent = make_agent("test");
+        let without_tags = profile_completeness(&agent);
+        agent.tags = vec!["ai".into()];
+        let with_tags = profile_completeness(&agent);
+        assert!(with_tags > without_tags);
+    }
+
+    #[test]
+    fn profile_completeness_avatar_adds_score() {
+        let mut agent = make_agent("test");
+        let without_avatar = profile_completeness(&agent);
+        agent.avatar_url = Some("https://example.com/pic.png".into());
+        let with_avatar = profile_completeness(&agent);
+        assert!(with_avatar > without_avatar);
+    }
+
+    #[test]
+    fn profile_completeness_custom_display_name_adds_score() {
+        let mut agent = make_agent("test");
+        // make_agent sets display_name == handle, so no bonus
+        let baseline = profile_completeness(&agent);
+        agent.display_name = "Custom Name".to_string();
+        let with_name = profile_completeness(&agent);
+        assert!(with_name > baseline);
+    }
+
+    // ── Cursor offset ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cursor_offset_returns_zero_when_no_cursor() {
+        let handles = vec!["alice".into(), "bob".into()];
+        assert_eq!(cursor_offset(&handles, &None), 0);
+    }
+
+    #[test]
+    fn cursor_offset_returns_position_after_match() {
+        let handles = vec!["alice".into(), "bob".into(), "carol".into()];
+        assert_eq!(cursor_offset(&handles, &Some("bob".into())), 2);
+    }
+
+    #[test]
+    fn cursor_offset_returns_zero_when_cursor_not_found() {
+        let handles = vec!["alice".into(), "bob".into()];
+        assert_eq!(cursor_offset(&handles, &Some("unknown".into())), 0);
     }
 
     // ── NEP-413 nonce reuse ──────────────────────────────────────────────
@@ -1088,18 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn unfollow_clamps_follower_count_at_zero() {
-        let mut agent = make_agent("bob");
-        agent.follower_count = 0;
-        agent.follower_count = (agent.follower_count - 1).max(0);
-        assert_eq!(agent.follower_count, 0);
-
-        agent.following_count = 0;
-        agent.following_count = (agent.following_count - 1).max(0);
-        assert_eq!(agent.following_count, 0);
-    }
-
-    #[test]
     fn trust_score_tracks_follow_unfollow_lifecycle() {
         let mut agent = make_agent("bob");
         assert_eq!(trust_score(&agent), 0);
@@ -1116,35 +513,6 @@ mod tests {
         assert_eq!(trust_score(&agent), -3);
     }
 
-    #[test]
-    fn follow_chain_commit_payload() {
-        let commit = fastgraph::chain_commit(
-            vec![fastgraph::create_follow_edge("alice", "bob", Some("interesting"), true)],
-            "alice followed bob. interesting",
-            "follow",
-        );
-        assert_eq!(commit["args"]["phase"], "follow");
-        let mutations = commit["args"]["mutations"].as_array().unwrap();
-        assert_eq!(mutations.len(), 1);
-        assert_eq!(mutations[0]["op"], "create_edge");
-        assert_eq!(mutations[0]["edge"]["source"], "alice");
-        assert_eq!(mutations[0]["edge"]["target"], "bob");
-        assert_eq!(mutations[0]["data"]["mutual"], true);
-    }
-
-    #[test]
-    fn unfollow_chain_commit_payload() {
-        let commit = fastgraph::chain_commit(
-            vec![fastgraph::delete_follow_edge("alice", "bob", Some("spam"))],
-            "alice unfollowed bob. spam",
-            "unfollow",
-        );
-        assert_eq!(commit["args"]["phase"], "unfollow");
-        let mutations = commit["args"]["mutations"].as_array().unwrap();
-        assert_eq!(mutations[0]["op"], "delete_edge");
-        assert_eq!(mutations[0]["data"]["reason"], "spam");
-    }
-
     // ── Nonce invariants ────────────────────────────────────────────────
 
     #[test]
@@ -1152,15 +520,6 @@ mod tests {
         assert!(NONCE_TTL_SECS > nep413::TIMESTAMP_WINDOW_MS / 1000,
             "NONCE_TTL_SECS ({NONCE_TTL_SECS}) must exceed timestamp window ({}s)",
             nep413::TIMESTAMP_WINDOW_MS / 1000);
-    }
-
-    // ── Unfollow audit key parsing ────────────────────────────────────────
-
-    #[test]
-    fn unfollow_audit_key_timestamp_extractable() {
-        let key = format!("unfollowed:alice.near:bob:{}", 1_700_000_000u64);
-        let parts: Vec<&str> = key.rsplitn(2, ':').collect();
-        assert_eq!(parts[0].parse::<u64>().unwrap(), 1_700_000_000);
     }
 
     // ── Description/display name validation ──────────────────────────────
@@ -1175,5 +534,580 @@ mod tests {
     fn validate_display_name_rejects_over_limit() {
         assert!(validate_display_name(&"a".repeat(65)).is_err());
         assert!(validate_display_name(&"a".repeat(64)).is_ok());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Integration tests — exercise handler functions with in-memory storage
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Set up a fresh test environment: clear storage and set signer.
+    fn setup_integration(account: &str) {
+        store::test_backend::clear();
+        unsafe { std::env::set_var("NEAR_SENDER_ID", account) };
+    }
+
+    /// Switch signer without clearing storage (for multi-agent tests).
+    fn set_signer(account: &str) {
+        unsafe { std::env::set_var("NEAR_SENDER_ID", account) };
+    }
+
+    /// Helper to build a Request for testing.
+    fn test_request(action: Action) -> Request {
+        Request {
+            action,
+            handle: None,
+            description: None,
+            display_name: None,
+            avatar_url: None,
+            tags: None,
+            capabilities: None,
+            verifiable_claim: None,
+            limit: None,
+            cursor: None,
+            sort: None,
+            direction: None,
+            include_history: None,
+            since: None,
+            reason: None,
+        }
+    }
+
+    fn parse_response(resp: &Response) -> serde_json::Value {
+        let data = resp.data.as_ref().expect("response should have data");
+        data.clone()
+    }
+
+    // ── Registration integration ──────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn integration_register_creates_agent_in_storage() {
+        setup_integration("alice.near");
+        let mut req = test_request(Action::Register);
+        req.handle = Some("alice".into());
+        req.description = Some("Test agent".into());
+        req.tags = Some(vec!["ai".into(), "rust".into()]);
+
+        let resp = handle_register(&req);
+        assert!(resp.success, "register should succeed: {:?}", resp.error);
+
+        let data = parse_response(&resp);
+        assert_eq!(data["agent"]["handle"], "alice");
+        assert_eq!(data["agent"]["description"], "Test agent");
+        assert_eq!(data["near_account_id"], "alice.near");
+
+        // Verify agent is loadable from storage
+        let agent = load_agent("alice").expect("agent should be in storage");
+        assert_eq!(agent.handle, "alice");
+        assert_eq!(agent.near_account_id, "alice.near");
+        assert_eq!(agent.tags, vec!["ai", "rust"]);
+    }
+
+    #[test]
+    #[serial]
+    fn integration_register_rejects_duplicate_account() {
+        setup_integration("bob.near");
+        let mut req = test_request(Action::Register);
+        req.handle = Some("bob".into());
+
+        let resp1 = handle_register(&req);
+        assert!(resp1.success);
+
+        // Same account, different handle
+        req.handle = Some("bob2".into());
+        let resp2 = handle_register(&req);
+        assert!(!resp2.success);
+        assert_eq!(resp2.code.as_deref(), Some("ALREADY_REGISTERED"));
+    }
+
+    #[test]
+    #[serial]
+    fn integration_register_rejects_duplicate_handle() {
+        setup_integration("carol.near");
+        let mut req = test_request(Action::Register);
+        req.handle = Some("shared_handle".into());
+
+        let resp1 = handle_register(&req);
+        assert!(resp1.success);
+
+        // Different account, same handle — don't clear storage
+        set_signer("dave.near");
+        let resp2 = handle_register(&req);
+        assert!(!resp2.success);
+        assert_eq!(resp2.code.as_deref(), Some("HANDLE_TAKEN"));
+    }
+
+    // ── Get profile integration ───────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn integration_get_me_returns_registered_agent() {
+        setup_integration("eve.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("eve".into());
+        reg.description = Some("Eve's agent".into());
+        handle_register(&reg);
+
+        let req = test_request(Action::GetMe);
+        let resp = handle_get_me(&req);
+        assert!(resp.success);
+
+        let data = parse_response(&resp);
+        assert_eq!(data["agent"]["handle"], "eve");
+        assert_eq!(data["agent"]["description"], "Eve's agent");
+        assert!(data["profile_completeness"].is_number());
+    }
+
+    #[test]
+    #[serial]
+    fn integration_get_me_fails_for_unregistered() {
+        setup_integration("nobody.near");
+        let req = test_request(Action::GetMe);
+        let resp = handle_get_me(&req);
+        assert!(!resp.success);
+        assert_eq!(resp.code.as_deref(), Some("NOT_REGISTERED"));
+    }
+
+    // ── Follow / unfollow integration ─────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn integration_follow_and_unfollow_updates_counts() {
+        // Register two agents
+        setup_integration("follower.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("follower_agent".into());
+        handle_register(&reg);
+
+        set_signer("target.near");
+        reg.handle = Some("target_agent".into());
+        handle_register(&reg);
+
+        // Follow
+        set_signer("follower.near");
+        let mut follow_req = test_request(Action::Follow);
+        follow_req.handle = Some("target_agent".into());
+        let resp = handle_follow(&follow_req);
+        assert!(resp.success, "follow should succeed: {:?}", resp.error);
+
+        // Verify counts
+        let target = load_agent("target_agent").unwrap();
+        assert_eq!(target.follower_count, 1);
+        let follower = load_agent("follower_agent").unwrap();
+        assert_eq!(follower.following_count, 1);
+
+        // Unfollow
+        let mut unfollow_req = test_request(Action::Unfollow);
+        unfollow_req.handle = Some("target_agent".into());
+        let resp = handle_unfollow(&unfollow_req);
+        assert!(resp.success, "unfollow should succeed: {:?}", resp.error);
+
+        // Verify counts after unfollow
+        let target = load_agent("target_agent").unwrap();
+        assert_eq!(target.follower_count, 0);
+        assert_eq!(target.unfollow_count, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn integration_follow_self_is_rejected() {
+        setup_integration("selfish.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("selfish".into());
+        handle_register(&reg);
+
+        let mut follow_req = test_request(Action::Follow);
+        follow_req.handle = Some("selfish".into());
+        let resp = handle_follow(&follow_req);
+        assert!(!resp.success);
+    }
+
+    // ── List agents integration ───────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn integration_list_agents_returns_registered() {
+        setup_integration("agent_a.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("agent_a".into());
+        handle_register(&reg);
+
+        set_signer("agent_b.near");
+        reg.handle = Some("agent_b".into());
+        handle_register(&reg);
+
+        let req = test_request(Action::ListAgents);
+        let resp = handle_list_agents(&req, |_| true, "followers", DEFAULT_LIMIT);
+        assert!(resp.success);
+
+        let data = parse_response(&resp);
+        let agents = data.as_array().expect("data should be array");
+        assert_eq!(agents.len(), 2);
+    }
+
+    // ── Update profile integration ────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn integration_update_me_changes_fields() {
+        setup_integration("updater.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("updater".into());
+        handle_register(&reg);
+
+        let mut update = test_request(Action::UpdateMe);
+        update.description = Some("Updated description".into());
+        update.display_name = Some("Updated Name".into());
+        update.tags = Some(vec!["new-tag".into()]);
+        let resp = handle_update_me(&update);
+        assert!(resp.success, "update should succeed: {:?}", resp.error);
+
+        let agent = load_agent("updater").unwrap();
+        assert_eq!(agent.description, "Updated description");
+        assert_eq!(agent.display_name, "Updated Name");
+        assert_eq!(agent.tags, vec!["new-tag"]);
+    }
+
+    // ── Auth: nonce replay protection ─────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn integration_nonce_replay_rejected() {
+        store::test_backend::clear();
+        unsafe { std::env::remove_var("NEAR_SENDER_ID") };
+
+        let (auth, now_ms) = nep413::tests::make_auth_for_test();
+        // Set block timestamp to match auth so it's not expired
+        let block_ts_ns = (now_ms / 1000) * 1_000_000_000;
+        unsafe { std::env::set_var("NEAR_BLOCK_TIMESTAMP", block_ts_ns.to_string()) };
+
+        // First call — nonce is fresh, should succeed
+        let result1 = auth::get_caller_from(&Request {
+            action: Action::GetMe,
+            verifiable_claim: Some(auth.clone()),
+            ..test_request(Action::GetMe)
+        });
+        assert!(result1.is_ok(), "first auth should succeed: {:?}", result1.err().map(|r| r.error));
+
+        // Second call with SAME nonce — must be rejected as replay
+        let result2 = auth::get_caller_from(&Request {
+            action: Action::GetMe,
+            verifiable_claim: Some(auth),
+            ..test_request(Action::GetMe)
+        });
+        assert!(result2.is_err(), "second auth with same nonce should fail");
+        let err_resp = result2.unwrap_err();
+        assert_eq!(err_resp.code.as_deref(), Some("NONCE_REPLAY"));
+
+        // Clean up env for other tests
+        unsafe { std::env::remove_var("NEAR_BLOCK_TIMESTAMP") };
+    }
+
+    // ── Storage consistency invariants ─────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn integration_follow_unfollow_maintains_index_consistency() {
+        setup_integration("idx_a.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("idx_a".into());
+        handle_register(&reg);
+
+        set_signer("idx_b.near");
+        reg.handle = Some("idx_b".into());
+        handle_register(&reg);
+
+        // Follow
+        set_signer("idx_a.near");
+        let mut follow_req = test_request(Action::Follow);
+        follow_req.handle = Some("idx_b".into());
+        handle_follow(&follow_req);
+
+        // Invariant: follower count == followers index length
+        let target = load_agent("idx_b").unwrap();
+        let followers_idx = index_list(&keys::pub_followers("idx_b"));
+        assert_eq!(target.follower_count as usize, followers_idx.len(),
+            "follower_count ({}) must match followers index length ({})",
+            target.follower_count, followers_idx.len());
+
+        let follower = load_agent("idx_a").unwrap();
+        let following_idx = index_list(&keys::pub_following("idx_a"));
+        assert_eq!(follower.following_count as usize, following_idx.len(),
+            "following_count ({}) must match following index length ({})",
+            follower.following_count, following_idx.len());
+
+        // Edge must exist
+        assert!(has(&keys::pub_edge("idx_a", "idx_b")));
+
+        // Unfollow
+        let mut unfollow_req = test_request(Action::Unfollow);
+        unfollow_req.handle = Some("idx_b".into());
+        handle_unfollow(&unfollow_req);
+
+        // Invariant after unfollow
+        let target = load_agent("idx_b").unwrap();
+        let followers_idx = index_list(&keys::pub_followers("idx_b"));
+        assert_eq!(target.follower_count as usize, followers_idx.len());
+        assert!(!has(&keys::pub_edge("idx_a", "idx_b")), "edge should be deleted");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_follow_with_injected_failure_rolls_back() {
+        setup_integration("fail_a.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("fail_a".into());
+        handle_register(&reg);
+
+        set_signer("fail_b.near");
+        reg.handle = Some("fail_b".into());
+        handle_register(&reg);
+
+        // Snapshot state before attempted follow
+        let before_target = load_agent("fail_b").unwrap();
+        let _before_followers = index_list(&keys::pub_followers("fail_b"));
+
+        // Inject write failures — enough to break save_agent inside follow
+        // (after edge+index writes succeed, save_agent will fail)
+        set_signer("fail_a.near");
+        store::test_backend::fail_next_writes(10);
+
+        let mut follow_req = test_request(Action::Follow);
+        follow_req.handle = Some("fail_b".into());
+        let resp = handle_follow(&follow_req);
+
+        // Follow should have failed
+        assert!(!resp.success, "follow should fail when storage fails");
+
+        // Clear failure flag for subsequent reads
+        store::test_backend::fail_next_writes(0);
+
+        // The follower count should be unchanged (rollback or never incremented)
+        let after_target = load_agent("fail_b");
+        if let Some(agent) = after_target {
+            assert_eq!(agent.follower_count, before_target.follower_count,
+                "follower count should not increase on failed follow");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn integration_unfollow_with_injected_failure_rolls_back() {
+        setup_integration("uf_a.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("uf_a".into());
+        handle_register(&reg);
+
+        set_signer("uf_b.near");
+        reg.handle = Some("uf_b".into());
+        handle_register(&reg);
+
+        // Establish follow first
+        set_signer("uf_a.near");
+        let mut follow_req = test_request(Action::Follow);
+        follow_req.handle = Some("uf_b".into());
+        let resp = handle_follow(&follow_req);
+        assert!(resp.success, "setup follow should succeed");
+
+        // Snapshot state before attempted unfollow
+        let before_target = load_agent("uf_b").unwrap();
+        assert_eq!(before_target.follower_count, 1);
+        assert!(has(&keys::pub_edge("uf_a", "uf_b")), "edge should exist before unfollow");
+        let before_followers = index_list(&keys::pub_followers("uf_b"));
+        assert_eq!(before_followers.len(), 1);
+
+        // Inject write failures — save_agent in unfollow will fail,
+        // triggering rollback of edge + indices (follow.rs:152-160)
+        store::test_backend::fail_next_writes(10);
+
+        let mut unfollow_req = test_request(Action::Unfollow);
+        unfollow_req.handle = Some("uf_b".into());
+        let resp = handle_unfollow(&unfollow_req);
+
+        assert!(!resp.success, "unfollow should fail when storage fails");
+
+        // Clear failure flag for reads
+        store::test_backend::fail_next_writes(0);
+
+        // Edge should be restored (rollback re-wrote it)
+        assert!(has(&keys::pub_edge("uf_a", "uf_b")),
+            "edge should be restored after failed unfollow");
+
+        // Follower index should be restored
+        let after_followers = index_list(&keys::pub_followers("uf_b"));
+        assert_eq!(after_followers.len(), before_followers.len(),
+            "follower index should be restored after failed unfollow");
+
+        // Follower count should be unchanged
+        let after_target = load_agent("uf_b").unwrap();
+        assert_eq!(after_target.follower_count, before_target.follower_count,
+            "follower count should not change on failed unfollow");
+    }
+
+    #[test]
+    #[serial]
+    fn integration_follow_partial_index_failure_rolls_back() {
+        setup_integration("pi_a.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("pi_a".into());
+        handle_register(&reg);
+
+        set_signer("pi_b.near");
+        reg.handle = Some("pi_b".into());
+        handle_register(&reg);
+
+        // Snapshot
+        let before_target = load_agent("pi_b").unwrap();
+
+        // Inject exactly 3 failures: edge write + follower index succeed (2 writes
+        // that happen to succeed because fail counter is checked inside set_worker),
+        // but we inject enough to hit the index_append or save_agent stage.
+        // With 3 failures the first write (edge) fails immediately.
+        set_signer("pi_a.near");
+        store::test_backend::fail_next_writes(3);
+
+        let mut follow_req = test_request(Action::Follow);
+        follow_req.handle = Some("pi_b".into());
+        let resp = handle_follow(&follow_req);
+
+        assert!(!resp.success, "follow should fail with injected write failures");
+
+        // Clear failures
+        store::test_backend::fail_next_writes(0);
+
+        // Edge should not exist
+        assert!(!has(&keys::pub_edge("pi_a", "pi_b")),
+            "edge should not exist after failed follow");
+
+        // Indices should be empty (no followers added)
+        let followers = index_list(&keys::pub_followers("pi_b"));
+        assert!(followers.is_empty(), "follower index should be empty after failed follow");
+
+        let following = index_list(&keys::pub_following("pi_a"));
+        assert!(following.is_empty(), "following index should be empty after failed follow");
+
+        // Target count unchanged
+        let after_target = load_agent("pi_b").unwrap();
+        assert_eq!(after_target.follower_count, before_target.follower_count,
+            "follower count should not change on failed follow");
+    }
+
+    // ── Suggestion diversity ──────────────────────────────────────────────
+
+    #[test]
+    fn diversify_caps_per_tag() {
+        let mut rng = suggest::Rng::from_bytes(b"div");
+        let limit = 6;
+
+        // Create 10 agents all with tag "ai"
+        let candidates: Vec<AgentRecord> = (0..10).map(|i| {
+            let mut a = make_agent(&format!("mono_{i}"));
+            a.tags = vec!["ai".into()];
+            a.follower_count = 1;
+            a
+        }).collect();
+
+        let visits: std::collections::HashMap<String, u32> = candidates.iter()
+            .map(|a| (a.handle.clone(), 5)).collect();
+
+        let ranked = suggest::rank_candidates(&mut rng, candidates, &visits, &[], limit);
+
+        // Should return exactly limit items (cap + backfill)
+        assert_eq!(ranked.len(), limit, "should return {limit} results");
+
+        // First max_per_tag (limit/2 = 3) are within cap, rest are overflow backfill
+        // The key invariant: we get results despite single-tag dominance
+        assert!(ranked.len() > limit / 2,
+            "diversify should backfill beyond the per-tag cap");
+    }
+
+    #[test]
+    fn diversify_preserves_order_within_cap() {
+        let mut rng = suggest::Rng::from_bytes(b"order");
+        let limit = 4;
+
+        // Agent with high visits + tag "ai"
+        let mut a1 = make_agent("high_score");
+        a1.tags = vec!["ai".into()];
+        a1.follower_count = 1;
+
+        // Agent with low visits + tag "defi"
+        let mut a2 = make_agent("low_score");
+        a2.tags = vec!["defi".into()];
+        a2.follower_count = 1;
+
+        let mut visits = std::collections::HashMap::new();
+        visits.insert("high_score".to_string(), 50u32);
+        visits.insert("low_score".to_string(), 1u32);
+
+        let ranked = suggest::rank_candidates(&mut rng, vec![a1, a2], &visits, &[], limit);
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].agent.handle, "high_score",
+            "higher-scoring agent should come first");
+    }
+
+    // ── Suggestion integration (component-level) ──────────────────────────
+    // Note: handle_get_suggested calls outlayer::vrf::random() which panics
+    // outside WASI, so we test the wiring at component level instead.
+
+    #[test]
+    #[serial]
+    fn integration_suggested_walks_graph_neighbors() {
+        // A follows B, B follows C → random walk from A should visit C
+        setup_integration("sug_a.near");
+        let mut reg = test_request(Action::Register);
+        reg.handle = Some("sug_a".into());
+        reg.tags = Some(vec!["ai".into()]);
+        handle_register(&reg);
+
+        set_signer("sug_b.near");
+        reg.handle = Some("sug_b".into());
+        reg.tags = Some(vec!["ai".into()]);
+        handle_register(&reg);
+
+        set_signer("sug_c.near");
+        reg.handle = Some("sug_c".into());
+        reg.tags = Some(vec!["ai".into()]);
+        handle_register(&reg);
+
+        // B follows C
+        set_signer("sug_b.near");
+        let mut follow_req = test_request(Action::Follow);
+        follow_req.handle = Some("sug_c".into());
+        handle_follow(&follow_req);
+
+        // A follows B
+        set_signer("sug_a.near");
+        follow_req.handle = Some("sug_b".into());
+        handle_follow(&follow_req);
+
+        // Replicate what handle_get_suggested does, minus VRF
+        let follows = index_list(&keys::pub_following("sug_a"));
+        let follow_set: std::collections::HashSet<String> = follows.iter().cloned().collect();
+        let my_tags = load_agent("sug_a").unwrap().tags;
+
+        let mut outgoing_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut get_outgoing = |handle: &str| -> Vec<String> {
+            if let Some(cached) = outgoing_cache.get(handle) { return cached.clone(); }
+            let neighbors = index_list(&keys::pub_following(handle));
+            outgoing_cache.insert(handle.to_string(), neighbors.clone());
+            neighbors
+        };
+
+        let mut rng = suggest::Rng::from_bytes(b"test_seed");
+        let visits = suggest::random_walk_visits(
+            &mut rng, &follows, &follow_set, Some("sug_a"), &mut get_outgoing,
+        );
+
+        // C should be visited (reachable via A→B→C walk)
+        assert!(visits.contains_key("sug_c"),
+            "C should be visited via A→B→C walk, visits: {:?}", visits);
+
+        // Score and rank
+        let candidates = vec![load_agent("sug_c").unwrap()];
+        let ranked = suggest::rank_candidates(&mut rng, candidates, &visits, &my_tags, 10);
+        assert!(!ranked.is_empty(), "C should appear in ranked suggestions");
+        assert_eq!(ranked[0].agent.handle, "sug_c");
     }
 }

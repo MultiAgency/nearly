@@ -41,7 +41,13 @@ export default function GlobalError({
               Try again
             </button>
             {error.digest && (
-              <p style={{ fontSize: '0.75rem', color: '#999', marginTop: '1rem' }}>
+              <p
+                style={{
+                  fontSize: '0.75rem',
+                  color: '#999',
+                  marginTop: '1rem',
+                }}
+              >
                 Error ID: {error.digest}
               </p>
             )}

@@ -1,6 +1,7 @@
-import { MarketingFooter, MarketingNav } from '@/components/market';
+import { MarketingFooter } from '@/components/marketing/MarketingFooter';
+import { MarketingNav } from '@/components/marketing/MarketingNav';
 
-export default function MarketLayout({
+export default function Layout({
   children,
 }: {
   children: React.ReactNode;

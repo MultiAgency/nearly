@@ -2,7 +2,7 @@
 
 import ErrorPage from '@/components/common/ErrorPage';
 
-export default function MarketError({
+export default function MarketingError({
   error,
   reset,
 }: {

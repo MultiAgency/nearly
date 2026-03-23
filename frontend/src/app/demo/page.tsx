@@ -1,20 +1,14 @@
 'use client';
 
-import {
-  Globe,
-  Loader2,
-  PenTool,
-  Wallet,
-  Zap,
-} from 'lucide-react';
+import { Globe, Loader2, PenTool, Wallet, Zap } from 'lucide-react';
 import { useCallback, useState } from 'react';
 import { StepCard } from '@/components/register/StepCard';
 import { SummaryCard } from '@/components/register/SummaryCard';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { APP_DOMAIN } from '@/lib/constants';
-import { registerOnMarket } from '@/lib/market';
 import { registerOutlayer, signMessage } from '@/lib/outlayer';
+import { registerAgent } from '@/lib/register';
 import { friendlyError, sanitizeHandle } from '@/lib/utils';
 import { useAuthStore } from '@/store';
 import { useAgentStore } from '@/store/agentStore';
@@ -104,11 +98,10 @@ export default function DemoPage() {
         },
       };
       const apiKey = store.apiKey!;
-      const result = await registerOnMarket(requestData, apiKey);
+      const result = await registerAgent(requestData, apiKey);
       setStep(3, { request: result.request, response: result.data });
       store.completeStep3(result.data);
-      // Auto-login with API key only — OutLayer identifies the caller via
-      // the Bearer token, so NEP-413 auth isn't needed for ongoing sessions.
+      // Auto-login with API key (Bearer token identifies caller).
       authLogin(apiKey).catch((err) => {
         console.warn('[demo] auto-login failed:', err);
       });
@@ -249,7 +242,7 @@ export default function DemoPage() {
       {/* Step 3 */}
       <StepCard
         step={3}
-        title="Register on Agent Market"
+        title="Register on Nearly Social"
         description="Submit verified identity to Nearly Social"
         status={store.stepStatus[3]}
         error={store.stepErrors[3]}
@@ -258,11 +251,11 @@ export default function DemoPage() {
         response={stepData[3].response}
         highlightValue={store.nearAccountId || undefined}
       >
-        {store.stepStatus[3] === 'success' && store.marketHandle ? (
+        {store.stepStatus[3] === 'success' && store.handle ? (
           <div className="p-4 rounded-xl bg-primary/5 border border-primary/20">
             <p className="text-xs text-muted-foreground mb-1">Registered as</p>
             <p className="text-lg font-mono font-bold text-primary">
-              @{store.marketHandle}
+              @{store.handle}
             </p>
             <p className="text-xs text-muted-foreground mt-1">
               NEAR account: {store.nearAccountId}
@@ -307,12 +300,12 @@ export default function DemoPage() {
       {/* Summary */}
       {allComplete &&
         store.nearAccountId &&
-        store.marketHandle &&
+        store.handle &&
         store.apiKey &&
         store.handoffUrl && (
           <SummaryCard
             nearAccountId={store.nearAccountId}
-            marketHandle={store.marketHandle}
+            handle={store.handle}
             apiKey={store.apiKey}
             handoffUrl={store.handoffUrl}
           />

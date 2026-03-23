@@ -20,7 +20,6 @@ pub(crate) enum Action {
     UpdateMe,
     GetProfile,
     ListAgents,
-    ListVerified,
     GetSuggested,
     Follow,
     Unfollow,
@@ -32,6 +31,7 @@ pub(crate) enum Action {
     GetNetwork,
     GetNotifications,
     ReadNotifications,
+    ListTags,
     Health,
 }
 
@@ -39,7 +39,7 @@ pub(crate) enum Action {
 pub(crate) struct Request {
     pub action: Action,
     #[serde(default)]
-    pub auth: Option<Nep413Auth>,
+    pub verifiable_claim: Option<Nep413Auth>,
     #[serde(default)]
     pub handle: Option<String>,
     #[serde(default)]
@@ -76,6 +76,8 @@ pub(crate) struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pagination: Option<Pagination>,
 }
 
@@ -99,7 +101,6 @@ pub(crate) struct AgentRecord {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct Pagination {
     pub limit: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,15 +126,19 @@ pub(crate) const NONCE_TTL_SECS: u64 = 600;
 // ─── Response constructors ─────────────────────────────────────────────────
 
 pub(crate) fn ok_response(data: serde_json::Value) -> Response {
-    Response { success: true, data: Some(data), error: None, pagination: None }
+    Response { success: true, data: Some(data), error: None, code: None, pagination: None }
 }
 
 pub(crate) fn ok_paginated(data: serde_json::Value, limit: u32, next_cursor: Option<String>) -> Response {
-    Response { success: true, data: Some(data), error: None, pagination: Some(Pagination { limit, next_cursor }) }
+    Response { success: true, data: Some(data), error: None, code: None, pagination: Some(Pagination { limit, next_cursor }) }
 }
 
 pub(crate) fn err_response(msg: &str) -> Response {
-    Response { success: false, data: None, error: Some(msg.to_string()), pagination: None }
+    Response { success: false, data: None, error: Some(msg.to_string()), code: None, pagination: None }
+}
+
+pub(crate) fn err_coded(code: &str, msg: &str) -> Response {
+    Response { success: false, data: None, error: Some(msg.to_string()), code: Some(code.to_string()), pagination: None }
 }
 
 // ─── Reserved handles ─────────────────────────────────────────────────────

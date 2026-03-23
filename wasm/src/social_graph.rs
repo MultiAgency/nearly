@@ -1,8 +1,6 @@
-use outlayer::storage;
-
 use crate::{
-    agent_handle_for_account, edge_timestamp, format_agent, load_agent, ok_paginated, w_get_json,
-    w_get_string, w_set_json, AgentRecord, Response,
+    agent_handle_for_account, edge_timestamp, format_agent, load_agent,
+    get_json, get_string, set_json, index_list, AgentRecord,
 };
 
 pub fn parse_edge(raw: &str) -> serde_json::Value {
@@ -12,63 +10,31 @@ pub fn parse_edge(raw: &str) -> serde_json::Value {
     if let Ok(ts) = raw.parse::<u64>() {
         return serde_json::json!({ "ts": ts });
     }
-    eprintln!("Warning: unparseable edge value: {}", &raw[..raw.len().min(100)]);
     serde_json::json!({ "ts": null })
 }
 
 pub fn format_edge(agent: &AgentRecord, edge_key: &str, direction: &str) -> serde_json::Value {
     let mut entry = format_agent(agent);
     entry["direction"] = serde_json::json!(direction);
-    if let Some(raw) = w_get_string(edge_key) {
+    if let Some(raw) = get_string(edge_key) {
         let edge = parse_edge(&raw);
-        entry["followReason"] = edge
+        entry["follow_reason"] = edge
             .get("reason")
             .cloned()
             .unwrap_or(serde_json::json!(null));
-        entry["followedAt"] = edge.get("ts").cloned().unwrap_or(serde_json::json!(null));
+        entry["followed_at"] = edge.get("ts").cloned().unwrap_or(serde_json::json!(null));
     }
     entry
 }
 
-pub fn paginate_json(
-    items: &[serde_json::Value],
-    limit: usize,
-    cursor: &Option<String>,
-) -> Response {
-    let (page, pagination) = paginate_json_raw(items, limit, cursor);
-    ok_paginated(serde_json::json!(page), limit as u32, pagination)
-}
-
-pub fn paginate_json_raw(
-    items: &[serde_json::Value],
-    limit: usize,
-    cursor: &Option<String>,
-) -> (Vec<serde_json::Value>, Option<String>) {
-    let start = cursor
-        .as_ref()
-        .and_then(|c| {
-            items
-                .iter()
-                .position(|a| a.get("handle").and_then(|v| v.as_str()) == Some(c))
-                .map(|i| i + 1)
-        })
-        .unwrap_or(0);
-    let page: Vec<serde_json::Value> = items.iter().skip(start).take(limit).cloned().collect();
-    let next = if start + limit < items.len() {
-        page.last()
-            .and_then(|a| a.get("handle").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
-    (page, next)
-}
-
 pub fn append_to_index(idx_key: &str, key: &str) -> Result<(), String> {
-    let mut idx: Vec<String> = w_get_json(idx_key).unwrap_or_default();
-    idx.push(key.to_string());
-    w_set_json(idx_key, &idx)
-        .map_err(|e| format!("failed to update index {idx_key}: {e}"))
+    let mut idx: Vec<String> = get_json(idx_key).unwrap_or_default();
+    if !idx.iter().any(|e| e == key) {
+        idx.push(key.to_string());
+        set_json(idx_key, &idx)
+            .map_err(|e| format!("failed to update index {idx_key}: {e}"))?;
+    }
+    Ok(())
 }
 
 pub fn append_unfollow_index(handle: &str, key: &str) -> Result<(), String> {
@@ -83,10 +49,10 @@ pub fn load_unfollow_history(
     idx_key: &str,
     resolve_handle: impl Fn(&[&str]) -> (String, &'static str),
 ) -> Vec<serde_json::Value> {
-    let keys: Vec<String> = w_get_json(idx_key).unwrap_or_default();
+    let keys: Vec<String> = get_json(idx_key).unwrap_or_default();
     keys.iter()
         .filter_map(|key| {
-            let raw = w_get_string(key)?;
+            let raw = get_string(key)?;
             let mut entry = parse_edge(&raw);
             let parts: Vec<&str> = key.splitn(4, ':').collect();
             if parts.len() >= 3 {
@@ -94,7 +60,6 @@ pub fn load_unfollow_history(
                 entry["handle"] = serde_json::json!(handle_val);
                 entry["direction"] = serde_json::json!(direction);
             } else {
-                eprintln!("Warning: skipping malformed unfollow key (expected >=3 colon-separated parts): {key}");
                 return None;
             }
             Some(entry)
@@ -117,46 +82,56 @@ pub fn load_unfollow_history_by(account: &str) -> Vec<serde_json::Value> {
     })
 }
 
+/// Walk an edge list in reverse, counting entries newer than `since`.
+/// `edge_key_fn` maps each handle in the list to its edge storage key.
+fn count_edges_since(
+    handles: &[String],
+    since: u64,
+    edge_key_fn: impl Fn(&str) -> String,
+) -> usize {
+    let mut count = 0;
+    for h in handles.iter().rev() {
+        let val = match get_string(&edge_key_fn(h)) { Some(v) => v, None => continue };
+        let ts = match edge_timestamp(&val) { Some(t) => t, None => continue };
+        if ts <= since { break; }
+        count += 1;
+    }
+    count
+}
+
+/// Walk an edge list in reverse, collecting agent summaries newer than `since`.
+/// `edge_key_fn` maps each handle in the list to its edge storage key.
+fn collect_edges_since(
+    handles: &[String],
+    since: u64,
+    edge_key_fn: impl Fn(&str) -> String,
+) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for h in handles.iter().rev() {
+        let val = match get_string(&edge_key_fn(h)) { Some(v) => v, None => continue };
+        let ts = match edge_timestamp(&val) { Some(t) => t, None => continue };
+        if ts <= since { break; }
+        if let Some(a) = load_agent(h) {
+            results.push(serde_json::json!({ "handle": a.handle, "display_name": a.display_name, "description": a.description }));
+        }
+    }
+    results
+}
+
 /// Collect new followers since `since` for a given handle, returned as JSON summaries.
 pub fn new_followers_since(handle: &str, since: u64) -> Vec<serde_json::Value> {
-    let prefix = crate::keys::follower_prefix(handle);
-    let keys = storage::list_keys(&prefix).unwrap_or_default();
-    keys.iter()
-        .filter_map(|key| {
-            let follower_account = key.strip_prefix(&prefix)?;
-            let val = w_get_string(key)?;
-            let ts = edge_timestamp(&val)?;
-            if ts <= since { return None; }
-            let follower_handle = agent_handle_for_account(follower_account)?;
-            let a = load_agent(&follower_handle)?;
-            Some(serde_json::json!({ "handle": a.handle, "displayName": a.display_name, "description": a.description }))
-        })
-        .collect()
+    let followers = index_list(&crate::keys::pub_followers(handle));
+    collect_edges_since(&followers, since, |fh| crate::keys::pub_edge(fh, handle))
 }
 
-/// Count new following edges since `since` for the given caller account.
-pub fn new_following_count_since(caller: &str, since: u64) -> usize {
-    let prefix = crate::keys::following_prefix(caller);
-    let keys = storage::list_keys(&prefix).unwrap_or_default();
-    keys.iter()
-        .filter(|key| w_get_string(key)
-            .and_then(|s| edge_timestamp(&s))
-            .map(|ts| ts > since).unwrap_or(false))
-        .count()
+/// Count new following edges since `since` for the given handle.
+pub fn new_following_count_since(handle: &str, since: u64) -> usize {
+    let following = index_list(&crate::keys::pub_following(handle));
+    count_edges_since(&following, since, |th| crate::keys::pub_edge(handle, th))
 }
 
-/// Collect new following since `since` for the given caller account, returned as JSON summaries.
-pub fn new_following_since(caller: &str, since: u64) -> Vec<serde_json::Value> {
-    let prefix = crate::keys::following_prefix(caller);
-    let keys = storage::list_keys(&prefix).unwrap_or_default();
-    keys.iter()
-        .filter_map(|key| {
-            let target_handle = key.strip_prefix(&prefix)?;
-            let val = w_get_string(key)?;
-            let ts = edge_timestamp(&val)?;
-            if ts <= since { return None; }
-            let a = load_agent(target_handle)?;
-            Some(serde_json::json!({ "handle": a.handle, "displayName": a.display_name, "description": a.description }))
-        })
-        .collect()
+/// Collect new following since `since` for the given handle, returned as JSON summaries.
+pub fn new_following_since(handle: &str, since: u64) -> Vec<serde_json::Value> {
+    let following = index_list(&crate::keys::pub_following(handle));
+    collect_edges_since(&following, since, |th| crate::keys::pub_edge(handle, th))
 }

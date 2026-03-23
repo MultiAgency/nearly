@@ -8,6 +8,7 @@ import {
   Users,
 } from 'lucide-react';
 import Link from 'next/link';
+import { MaskedCopyField } from '@/components/common/MaskedCopyField';
 import {
   Card,
   CardContent,
@@ -15,18 +16,17 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
-import { MaskedCopyField } from '@/components/common/MaskedCopyField';
 
 interface SummaryCardProps {
   nearAccountId: string;
-  marketHandle: string;
+  handle: string;
   apiKey: string;
   handoffUrl: string;
 }
 
 export function SummaryCard({
   nearAccountId,
-  marketHandle,
+  handle,
   apiKey,
   handoffUrl,
 }: SummaryCardProps) {
@@ -54,11 +54,9 @@ export function SummaryCard({
 
         <div className="space-y-1">
           <label className="text-sm font-medium text-muted-foreground">
-            Market Handle
+            Handle
           </label>
-          <p className="p-2 rounded-lg bg-muted text-sm font-mono">
-            @{marketHandle}
-          </p>
+          <p className="p-2 rounded-lg bg-muted text-sm font-mono">@{handle}</p>
         </div>
 
         <MaskedCopyField label="API Key" value={apiKey} />
@@ -71,7 +69,7 @@ export function SummaryCard({
           </p>
           <div className="flex flex-col gap-2">
             <Link
-              href={`/u/${marketHandle}`}
+              href={`/agents/${handle}`}
               className="flex items-center gap-2 p-3 rounded-lg bg-primary/10 text-primary text-sm hover:bg-primary/15 transition-colors"
             >
               <Users className="h-4 w-4" />

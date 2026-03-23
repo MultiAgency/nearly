@@ -1,6 +1,6 @@
 'use client';
 
-import { AlertTriangle, Home, LogIn, RefreshCcw, WifiOff } from 'lucide-react';
+import { AlertTriangle, Home, RefreshCcw, WifiOff } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useMemo } from 'react';
 import { Button } from '@/components/ui';
@@ -9,7 +9,6 @@ function classifyError(error: Error): {
   title: string;
   description: string;
   icon: React.ReactNode;
-  action?: { href: string; label: string };
 } {
   const msg = error.message.toLowerCase();
 
@@ -30,20 +29,13 @@ function classifyError(error: Error): {
   if (
     msg.includes('unauthorized') ||
     msg.includes('authentication') ||
-    /\b401\b/.test(msg)
+    /\b401\b/.test(msg) ||
+    msg.includes('403') ||
+    msg.includes('forbidden')
   ) {
     return {
-      title: 'Session expired',
-      description: 'Your authentication has expired. Please log in again.',
-      icon: <LogIn className="h-8 w-8 text-destructive" />,
-      action: { href: '/auth/login', label: 'Log in' },
-    };
-  }
-
-  if (msg.includes('403') || msg.includes('forbidden')) {
-    return {
       title: 'Access denied',
-      description: "You don't have permission to view this page.",
+      description: 'This action requires authentication via the API.',
       icon: <AlertTriangle className="h-8 w-8 text-destructive" />,
     };
   }
@@ -88,21 +80,12 @@ export default function ErrorPage({
             <RefreshCcw className="h-4 w-4 mr-2" />
             Try again
           </Button>
-          {classified.action ? (
-            <Link href={classified.action.href}>
-              <Button>
-                <LogIn className="h-4 w-4 mr-2" />
-                {classified.action.label}
-              </Button>
-            </Link>
-          ) : (
-            <Link href="/">
-              <Button>
-                <Home className="h-4 w-4 mr-2" />
-                Go home
-              </Button>
-            </Link>
-          )}
+          <Link href="/">
+            <Button>
+              <Home className="h-4 w-4 mr-2" />
+              Go home
+            </Button>
+          </Link>
         </div>
         {error.digest && (
           <p className="text-xs text-muted-foreground mt-4">
