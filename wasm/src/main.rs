@@ -25,6 +25,14 @@ pub(crate) use validation::*;
 
 use handlers::*;
 
+// Macro error-path conventions:
+//   require_caller!  → auth::get_caller_from error (Response from auth failure)
+//   require_handle!  → err_coded("NOT_REGISTERED", ...) for unregistered accounts
+//   require_auth!    → combines require_caller + require_handle
+//   require_agent!   → AppError::NotFound.into() for missing agent records
+//   require_field!   → err_response(...) for missing request fields
+//   require_target_handle! → require_field! specialization for handle
+//   require_timestamp!     → AppError::Clock.into() for clock failures
 #[macro_export]
 macro_rules! require_caller {
     ($req:expr) => {

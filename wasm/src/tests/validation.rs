@@ -77,18 +77,16 @@ fn tags_lowercase() {
 
 #[test]
 fn profile_completeness_empty() {
-    let mut agent = make_agent("test");
-    agent.near_account_id = String::new();
-    assert_eq!(profile_completeness(&agent), 20);
+    let agent = make_agent("test");
+    assert_eq!(profile_completeness(&agent), 0);
 }
 
 #[test]
 fn profile_completeness_full() {
     let mut agent = make_agent("test");
-    agent.display_name = "Test Agent".to_string();
     agent.description = "A test agent for validation".to_string();
     agent.tags = vec!["rust".into()];
-    agent.avatar_url = Some("https://example.com/img.png".to_string());
+    agent.capabilities = serde_json::json!({"skills": ["chat"]});
     assert_eq!(profile_completeness(&agent), 100);
 }
 
@@ -97,11 +95,11 @@ fn profile_completeness_description_boundary() {
     let mut agent = make_agent("test");
     agent.description = "exactly_10".to_string();
     assert_eq!(agent.description.len(), 10);
-    assert_eq!(profile_completeness(&agent), 40);
+    assert_eq!(profile_completeness(&agent), 0); // not > 10
 
     agent.description = "eleven_char".to_string();
     assert_eq!(agent.description.len(), 11);
-    assert_eq!(profile_completeness(&agent), 60);
+    assert_eq!(profile_completeness(&agent), 30);
 }
 
 #[test]
@@ -111,24 +109,6 @@ fn profile_completeness_tags_add_score() {
     agent.tags = vec!["ai".into()];
     let with_tags = profile_completeness(&agent);
     assert!(with_tags > without_tags);
-}
-
-#[test]
-fn profile_completeness_avatar_adds_score() {
-    let mut agent = make_agent("test");
-    let without_avatar = profile_completeness(&agent);
-    agent.avatar_url = Some("https://example.com/pic.png".into());
-    let with_avatar = profile_completeness(&agent);
-    assert!(with_avatar > without_avatar);
-}
-
-#[test]
-fn profile_completeness_custom_display_name_adds_score() {
-    let mut agent = make_agent("test");
-    let baseline = profile_completeness(&agent);
-    agent.display_name = "Custom Name".to_string();
-    let with_name = profile_completeness(&agent);
-    assert!(with_name > baseline);
 }
 
 #[test]
@@ -211,12 +191,6 @@ fn validate_reason_rejects_control_chars() {
 fn validate_description_rejects_over_limit() {
     assert!(validate_description(&"a".repeat(501)).is_err());
     assert!(validate_description(&"a".repeat(500)).is_ok());
-}
-
-#[test]
-fn validate_display_name_rejects_over_limit() {
-    assert!(validate_display_name(&"a".repeat(65)).is_err());
-    assert!(validate_display_name(&"a".repeat(64)).is_ok());
 }
 
 #[test]

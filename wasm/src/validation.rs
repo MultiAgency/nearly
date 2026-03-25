@@ -59,16 +59,6 @@ pub(crate) fn validate_description(desc: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn validate_display_name(name: &str) -> Result<(), AppError> {
-    if name.len() > MAX_DISPLAY_NAME_LEN {
-        return Err(AppError::Validation(format!(
-            "Display name max {MAX_DISPLAY_NAME_LEN} bytes"
-        )));
-    }
-    reject_unsafe_unicode(name, false)?;
-    Ok(())
-}
-
 fn is_ipv6_loopback_or_unspecified(host: &str) -> bool {
     if !host.contains(':') {
         return false;
@@ -178,9 +168,6 @@ pub(crate) fn validate_agent_fields(req: &Request) -> Result<Vec<String>, Respon
     let warnings = Vec::new();
     if let Some(desc) = &req.description {
         validate_description(desc).map_err(Response::from)?;
-    }
-    if let Some(dn) = &req.display_name {
-        validate_display_name(dn).map_err(Response::from)?;
     }
     if let Some(Some(url)) = &req.avatar_url {
         validate_avatar_url(url).map_err(Response::from)?;

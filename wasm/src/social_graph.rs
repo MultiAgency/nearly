@@ -98,10 +98,13 @@ fn handles_since(
 }
 
 fn to_agent_summaries(handles: &[String]) -> Vec<serde_json::Value> {
-    handles.iter().filter_map(|h| {
-        let a = load_agent(h)?;
-        Some(serde_json::json!({ "handle": a.handle, "display_name": a.display_name, "description": a.description }))
-    }).collect()
+    handles
+        .iter()
+        .filter_map(|h| {
+            let a = load_agent(h)?;
+            Some(serde_json::json!({ "handle": a.handle, "description": a.description }))
+        })
+        .collect()
 }
 
 pub(crate) fn new_followers_since(handle: &str, since: u64) -> Vec<serde_json::Value> {

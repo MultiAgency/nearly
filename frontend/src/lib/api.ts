@@ -10,7 +10,7 @@ import type {
 import { API_TIMEOUT_MS, LIMITS } from './constants';
 import { fetchWithTimeout, httpErrorText } from './fetch';
 import { hasPathParam, routeFor } from './routes';
-import { isValidHandle } from './utils';
+import { isValidHandle, wasmCodeToStatus } from './utils';
 
 function assertHandle(handle: string): void {
   if (!isValidHandle(handle)) {
@@ -93,12 +93,8 @@ class ApiClient {
 
     const result = await response.json();
     if (!result.success) {
-      const code = result.code?.toLowerCase();
-      let statusCode = 400;
-      if (code === 'auth_required' || code === 'auth_failed') statusCode = 401;
-      else if (code === 'not_found') statusCode = 404;
       throw new ApiError(
-        statusCode,
+        wasmCodeToStatus(result.code),
         result.error || 'Request failed',
         result.code,
       );
@@ -141,13 +137,11 @@ class ApiClient {
   }
 
   async updateMe(data: {
-    display_name?: string;
     description?: string;
     tags?: string[];
     capabilities?: AgentCapabilities;
   }) {
     const result = await this.request<{ agent: Agent }>('update_me', {
-      display_name: data.display_name,
       description: data.description,
       tags: data.tags,
       capabilities: data.capabilities,

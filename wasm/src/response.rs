@@ -6,9 +6,7 @@ pub(crate) fn ok_response(data: serde_json::Value) -> Response {
     Response {
         success: true,
         data: Some(data),
-        error: None,
-        code: None,
-        pagination: None,
+        ..Response::default()
     }
 }
 
@@ -21,33 +19,36 @@ pub(crate) fn ok_paginated(
     Response {
         success: true,
         data: Some(data),
-        error: None,
-        code: None,
-        pagination: Some(Pagination {
+        pagination: Some(Box::new(Pagination {
             limit,
             next_cursor,
             cursor_reset: if cursor_reset { Some(true) } else { None },
-        }),
+        })),
+        ..Response::default()
     }
 }
 
 pub(crate) fn err_response(msg: &str) -> Response {
     Response {
-        success: false,
-        data: None,
         error: Some(msg.to_string()),
-        code: None,
-        pagination: None,
+        ..Response::default()
     }
 }
 
 pub(crate) fn err_coded(code: &str, msg: &str) -> Response {
     Response {
-        success: false,
-        data: None,
         error: Some(msg.to_string()),
         code: Some(code.to_string()),
-        pagination: None,
+        ..Response::default()
+    }
+}
+
+pub(crate) fn err_hint(code: &str, msg: &str, hint: &str) -> Response {
+    Response {
+        error: Some(msg.to_string()),
+        code: Some(code.to_string()),
+        hint: Some(hint.into()),
+        ..Response::default()
     }
 }
 
@@ -56,7 +57,12 @@ impl From<AppError> for Response {
         match &e {
             AppError::Validation(msg) => err_response(msg),
             AppError::NotFound(msg) => err_coded("NOT_FOUND", msg),
-            AppError::Auth(msg) => err_coded("AUTH_FAILED", msg),
+            AppError::Auth(msg) => err_hint(
+                "AUTH_FAILED",
+                msg,
+                "Check: nonce is fresh (32 bytes, unique), timestamp within 5 minutes, \
+                 domain is \"nearly.social\"",
+            ),
             AppError::RateLimit(msg) => err_coded("RATE_LIMITED", msg),
             AppError::Storage(msg) => err_response(msg),
             AppError::Clock(_) => err_response("Internal timing error"),

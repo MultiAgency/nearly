@@ -42,7 +42,6 @@ pub(crate) fn format_agent(agent: &AgentRecord) -> serde_json::Value {
     let endorsements = agent.endorsements.positive_only();
     serde_json::json!({
         "handle": agent.handle,
-        "display_name": agent.display_name,
         "description": agent.description,
         "avatar_url": agent.avatar_url,
         "tags": agent.tags,
@@ -50,11 +49,9 @@ pub(crate) fn format_agent(agent: &AgentRecord) -> serde_json::Value {
         "endorsements": endorsements,
         "near_account_id": agent.near_account_id,
         "follower_count": agent.follower_count,
-        "unfollow_count": agent.unfollow_count,
         "following_count": agent.following_count,
         "created_at": agent.created_at,
         "last_active": agent.last_active,
-        "schema_version": agent.schema_version,
     })
 }
 
@@ -68,43 +65,30 @@ pub(crate) fn format_suggestion(
     entry
 }
 
-const WEIGHT_HANDLE: u32 = 20;
-const WEIGHT_NEAR_ACCOUNT: u32 = 20;
-const WEIGHT_DESCRIPTION: u32 = 20;
-const WEIGHT_DISPLAY_NAME: u32 = 10;
-const WEIGHT_TAGS: u32 = 20;
-const WEIGHT_AVATAR: u32 = 10;
 const MIN_MEANINGFUL_DESCRIPTION: usize = 10;
+
+fn has_meaningful_capabilities(caps: &serde_json::Value) -> bool {
+    caps.as_object().is_some_and(|o| !o.is_empty())
+}
+
+const WEIGHT_DESCRIPTION: u32 = 30;
+const WEIGHT_TAGS: u32 = 30;
+const WEIGHT_CAPABILITIES: u32 = 40;
 const _: () = assert!(
-    WEIGHT_HANDLE
-        + WEIGHT_NEAR_ACCOUNT
-        + WEIGHT_DESCRIPTION
-        + WEIGHT_DISPLAY_NAME
-        + WEIGHT_TAGS
-        + WEIGHT_AVATAR
-        == 100,
+    WEIGHT_DESCRIPTION + WEIGHT_TAGS + WEIGHT_CAPABILITIES == 100,
     "profile completeness weights must sum to 100"
 );
 
 pub(crate) fn profile_completeness(agent: &AgentRecord) -> u32 {
     let mut score: u32 = 0;
-    if !agent.handle.is_empty() {
-        score += WEIGHT_HANDLE;
-    }
-    if !agent.near_account_id.is_empty() {
-        score += WEIGHT_NEAR_ACCOUNT;
-    }
     if agent.description.len() > MIN_MEANINGFUL_DESCRIPTION {
         score += WEIGHT_DESCRIPTION;
-    }
-    if agent.display_name != agent.handle {
-        score += WEIGHT_DISPLAY_NAME;
     }
     if !agent.tags.is_empty() {
         score += WEIGHT_TAGS;
     }
-    if agent.avatar_url.is_some() {
-        score += WEIGHT_AVATAR;
+    if has_meaningful_capabilities(&agent.capabilities) {
+        score += WEIGHT_CAPABILITIES;
     }
     score
 }

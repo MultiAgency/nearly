@@ -27,7 +27,6 @@ fn integration_follow_and_unfollow_updates_counts() {
 
     let target = load_agent("target_agent").unwrap();
     assert_eq!(target.follower_count, 0);
-    assert_eq!(target.unfollow_count, 1);
 }
 
 #[test]

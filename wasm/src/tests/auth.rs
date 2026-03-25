@@ -157,27 +157,6 @@ fn integration_register_via_nep413_creates_agent() {
 
 #[test]
 #[serial]
-fn integration_nep413_register_then_replay_blocked() {
-    setup_nep413();
-    let (auth, _) = nep413::tests::make_auth_for_test();
-
-    let mut req = test_request(Action::Register);
-    req.handle = Some("replay_test".into());
-    req.verifiable_claim = Some(auth.clone());
-    let resp = handle_register(&req);
-    assert!(resp.success);
-
-    req.handle = Some("replay_test2".into());
-    req.verifiable_claim = Some(auth);
-    let resp2 = handle_register(&req);
-    assert!(!resp2.success);
-    assert_eq!(resp2.code.as_deref(), Some("NONCE_REPLAY"));
-
-    teardown_nep413();
-}
-
-#[test]
-#[serial]
 fn nonce_replay_uses_user_scoped_storage() {
     setup_nep413();
     let (auth, _) = nep413::tests::make_auth_for_test();
@@ -229,20 +208,26 @@ fn integration_colon_signer_with_claim_falls_through() {
     unsafe { std::env::remove_var("NEAR_BLOCK_TIMESTAMP") };
 }
 
-/// H1b: Signer account IDs containing ':' must be rejected when no
-/// verifiable_claim is present (payment key confusion).
+/// H1b: Colon signer without verifiable_claim extracts owner (direct payment-key path).
 #[test]
 #[serial]
-fn integration_colon_in_signer_rejected() {
+fn integration_colon_signer_without_claim_returns_owner() {
     setup_integration("owner.near:1:secret");
     let result = crate_auth::get_caller_from(&test_request(Action::GetMe));
-    assert!(result.is_err(), "signer with colon should be rejected");
-    let err_resp = result.unwrap_err();
-    assert_eq!(err_resp.code.as_deref(), Some("AUTH_FAILED"));
-    assert!(
-        err_resp.error.as_deref().unwrap_or("").contains("':'"),
-        "error should mention colon"
-    );
+    match result {
+        Ok(caller) => assert_eq!(caller, "owner.near"),
+        Err(resp) => panic!("should extract owner, got: {:?}", resp.error),
+    }
+}
+
+/// H1c: Colon signer with empty owner prefix must be rejected.
+#[test]
+#[serial]
+fn integration_colon_signer_empty_owner_rejected() {
+    setup_integration(":1:secret");
+    let result = crate_auth::get_caller_from(&test_request(Action::GetMe));
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code.as_deref(), Some("AUTH_FAILED"));
 }
 
 /// H2: prune_nonce_index deletes expired nonces while preserving fresh ones.

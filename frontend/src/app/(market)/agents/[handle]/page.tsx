@@ -11,13 +11,12 @@ import {
 } from 'lucide-react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { GlowCard } from '@/components/marketing';
 import { useApiQuery } from '@/hooks';
 import { api } from '@/lib/api';
 import { EXTERNAL_URLS, NEAR_RPC_URL } from '@/lib/constants';
 import {
-  displayName,
   formatScore,
   isValidHandle,
   toMs,
@@ -73,17 +72,39 @@ export default function AgentProfilePage() {
   const [showList, setShowList] = useState<'followers' | 'following' | null>(
     null,
   );
+  const [listData, setListData] = useState<Agent[]>([]);
+  const [listCursor, setListCursor] = useState<string | undefined>();
+  const [listError, setListError] = useState<string | null>(null);
+  const [listLoading, setListLoading] = useState(false);
 
-  const fetchList = useCallback(async () => {
-    if (!showList || !handleIsValid) return [];
-    const result =
-      showList === 'followers'
-        ? await api.getFollowers(handle, 25)
-        : await api.getFollowing(handle, 25);
-    return result.agents;
-  }, [showList, handle, handleIsValid]);
+  const loadList = useCallback(
+    async (relation: 'followers' | 'following', cursor?: string) => {
+      if (!handleIsValid) return;
+      setListLoading(true);
+      setListError(null);
+      try {
+        const result =
+          relation === 'followers'
+            ? await api.getFollowers(handle, 25, cursor)
+            : await api.getFollowing(handle, 25, cursor);
+        setListData((prev) =>
+          cursor ? [...prev, ...result.agents] : result.agents,
+        );
+        setListCursor(result.next_cursor);
+      } catch (err) {
+        setListError(err instanceof Error ? err.message : 'Failed to load');
+      } finally {
+        setListLoading(false);
+      }
+    },
+    [handle, handleIsValid],
+  );
 
-  const { data: listData, error: listError } = useApiQuery<Agent[]>(fetchList);
+  useEffect(() => {
+    setListData([]);
+    setListCursor(undefined);
+    if (showList) loadList(showList);
+  }, [showList, loadList]);
 
   if (loading) {
     return (
@@ -109,6 +130,8 @@ export default function AgentProfilePage() {
     );
   }
 
+  const endorsementTotal = totalEndorsements(agent);
+
   return (
     <div className="max-w-4xl mx-auto px-6 pt-24 pb-16">
       <Link
@@ -118,7 +141,7 @@ export default function AgentProfilePage() {
         <ArrowLeft className="h-3.5 w-3.5" /> Back to directory
       </Link>
 
-      <GlowCard className="p-8 mb-6">
+      <GlowCard className="p-5 sm:p-8 mb-6">
         <div className="flex items-start justify-between gap-4 mb-4">
           <div>
             <div className="flex items-center gap-2 mb-1">
@@ -171,18 +194,15 @@ export default function AgentProfilePage() {
               className={`h-3 w-3 text-muted-foreground transition-transform ${showList === 'following' ? 'rotate-180' : ''}`}
             />
           </button>
-          {(() => {
-            const total = totalEndorsements(agent);
-            return total > 0 ? (
-              <span className="flex items-center gap-1">
-                <ThumbsUp className="h-3.5 w-3.5 text-muted-foreground" />
-                <span className="font-medium text-foreground">
-                  {formatScore(total)}
-                </span>
-                <span className="text-muted-foreground">endorsements</span>
+          {endorsementTotal > 0 && (
+            <span className="flex items-center gap-1">
+              <ThumbsUp className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="font-medium text-foreground">
+                {formatScore(endorsementTotal)}
               </span>
-            ) : null;
-          })()}
+              <span className="text-muted-foreground">endorsements</span>
+            </span>
+          )}
         </div>
 
         {showList && (
@@ -190,10 +210,10 @@ export default function AgentProfilePage() {
             <h3 className="text-sm font-medium text-foreground mb-2 capitalize">
               {showList}
             </h3>
-            <div className="space-y-1.5 max-h-48 overflow-y-auto">
+            <div className="space-y-1.5 max-h-64 overflow-y-auto">
               {listError ? (
                 <p className="text-xs text-destructive">{listError}</p>
-              ) : !listData?.length ? (
+              ) : !listData?.length && !listLoading ? (
                 <p className="text-xs text-muted-foreground">None yet</p>
               ) : (
                 listData.map((a) => (
@@ -204,7 +224,7 @@ export default function AgentProfilePage() {
                   >
                     <AgentAvatar handle={a.handle} size="sm" />
                     <span className="text-sm text-foreground truncate">
-                      {displayName(a)}
+                      {a.handle}
                     </span>
                     <span className="text-xs text-muted-foreground ml-auto shrink-0">
                       {formatScore(a.follower_count ?? 0)} followers
@@ -212,7 +232,21 @@ export default function AgentProfilePage() {
                   </Link>
                 ))
               )}
+              {listLoading && (
+                <div className="flex justify-center py-2">
+                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                </div>
+              )}
             </div>
+            {listCursor && !listLoading && (
+              <button
+                type="button"
+                onClick={() => showList && loadList(showList, listCursor)}
+                className="mt-2 text-xs text-primary hover:underline"
+              >
+                Load more
+              </button>
+            )}
           </div>
         )}
 
@@ -244,6 +278,31 @@ export default function AgentProfilePage() {
             })}
           </div>
         )}
+
+        {agent.capabilities &&
+          typeof agent.capabilities === 'object' &&
+          Object.keys(agent.capabilities).length > 0 && (
+            <div className="mb-4">
+              <h3 className="text-xs font-medium text-muted-foreground mb-1.5">
+                Capabilities
+              </h3>
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(agent.capabilities).map(([key, val]) => (
+                  <span
+                    key={key}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full bg-muted text-muted-foreground"
+                  >
+                    {key}
+                    {Array.isArray(val) && val.length > 0 && (
+                      <span className="text-muted-foreground/60">
+                        {val.length}
+                      </span>
+                    )}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
 
         <p className="text-xs text-muted-foreground">
           Registered {new Date(toMs(agent.created_at)).toLocaleDateString()}

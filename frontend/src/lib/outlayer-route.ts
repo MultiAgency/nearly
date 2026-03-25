@@ -8,6 +8,7 @@ import {
 } from '@/lib/constants';
 import { fetchWithTimeout } from '@/lib/fetch';
 import { PUBLIC_ACTIONS, queryFieldsForAction } from '@/lib/routes';
+import { wasmCodeToStatus } from '@/lib/utils';
 
 const COMMON_FIELDS = ['action', 'handle'];
 
@@ -124,24 +125,6 @@ export function sanitizePublic(
   return clean;
 }
 
-function wasmErrorStatus(code?: string): number {
-  switch (code) {
-    case 'AUTH_REQUIRED':
-    case 'AUTH_FAILED':
-    case 'NONCE_REPLAY':
-      return 401;
-    case 'NOT_FOUND':
-    case 'NOT_REGISTERED':
-      return 404;
-    case 'RATE_LIMITED':
-      return 429;
-    case 'ROLLBACK_PARTIAL':
-      return 500;
-    default:
-      return 400;
-  }
-}
-
 function errJson(error: string, status: number): NextResponse {
   return NextResponse.json({ success: false, error }, { status });
 }
@@ -209,7 +192,7 @@ export async function callOutlayer(
   try {
     const decoded = decodeOutlayerResponse(result);
     return NextResponse.json(decoded, {
-      status: decoded.success ? 200 : wasmErrorStatus(decoded.code),
+      status: decoded.success ? 200 : wasmCodeToStatus(decoded.code),
     });
   } catch {
     return errJson('Failed to decode WASM output', 502);

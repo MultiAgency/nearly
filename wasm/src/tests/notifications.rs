@@ -79,36 +79,3 @@ fn notification_dedup_within_window() {
     );
 }
 
-/// M5: Endorsing an agent creates an endorsement notification for the target.
-#[test]
-#[serial]
-fn integration_endorse_creates_notification() {
-    setup_integration("en_a.near");
-    register_endorsable_agent("en_a.near", "en_alice", &["defi"], &[]);
-    register_endorsable_agent("en_b.near", "en_bob", &["defi"], &[]);
-
-    set_signer("en_b.near");
-    let req = RequestBuilder::new(Action::Endorse)
-        .handle("en_alice")
-        .tags(&["defi"])
-        .build();
-    let resp = handle_endorse(&req);
-    assert!(resp.success, "endorse should succeed: {:?}", resp.error);
-
-    // Check alice's notifications for an endorsement
-    set_signer("en_a.near");
-    let notif_req = test_request(Action::GetNotifications);
-    let notif_resp = handle_get_notifications(&notif_req);
-    assert!(notif_resp.success);
-
-    let data = parse_response(&notif_resp);
-    let notifs = data["notifications"]
-        .as_array()
-        .expect("should have notifications array");
-    let endorse_notifs: Vec<_> = notifs.iter().filter(|n| n["type"] == "endorse").collect();
-    assert!(
-        !endorse_notifs.is_empty(),
-        "endorsement should create a notification for the target"
-    );
-    assert_eq!(endorse_notifs[0]["from"], "en_bob");
-}

@@ -3,7 +3,7 @@
 import { ArrowUpDown, Search, Tag, TrendingUp, Users, X } from 'lucide-react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { LiveGraph } from '@/components/marketing';
 import { Skeleton } from '@/components/ui';
@@ -17,31 +17,58 @@ import { AgentsTable } from './AgentsTable';
 
 const PAGE_SIZE: number = LIMITS.GRID_PAGE_SIZE;
 
-async function fetchAgents(): Promise<Agent[]> {
-  const all: Agent[] = [];
-  let cursor: string | undefined;
-  do {
-    const result = await api.listAgents(
-      LIMITS.MAX_PAGE_SIZE,
-      undefined,
-      cursor,
-    );
-    all.push(...result.agents);
-    cursor = result.next_cursor;
-  } while (cursor);
-  return all;
+/** Fetch all agents, updating state progressively as each page arrives. */
+function useAllAgents() {
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setAgents([]);
+    setLoading(true);
+    setError(null);
+
+    (async () => {
+      let fetched = 0;
+      try {
+        let cursor: string | undefined;
+        do {
+          const result = await api.listAgents(
+            LIMITS.MAX_PAGE_SIZE,
+            undefined,
+            cursor,
+          );
+          if (cancelled) return;
+          fetched += result.agents.length;
+          setAgents((prev) => [...prev, ...result.agents]);
+          setLoading(false);
+          cursor = result.next_cursor;
+        } while (cursor);
+      } catch {
+        if (!cancelled) {
+          // Only surface the error if nothing loaded; otherwise keep partial data.
+          if (fetched === 0) {
+            setError('Could not reach the OutLayer backend.');
+          }
+          setLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return { agents, loading, error };
 }
 
 export default function AgentsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const activeTag = searchParams.get('tag') || '';
-  const {
-    data: agents = [],
-    isLoading: loading,
-    error: swrError,
-  } = useSWR('agents', fetchAgents);
-  const error = swrError ? 'Could not reach the OutLayer backend.' : null;
+  const { agents, loading, error } = useAllAgents();
   const [searchInput, setSearchInput] = useState('');
   const debouncedSearch = useDebounce(searchInput, 250);
   const [sortBy, setSortBy] = useState<SortKey>('followers');

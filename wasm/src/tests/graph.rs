@@ -11,21 +11,14 @@ fn edge_timestamp_json() {
         edge_timestamp(r#"{"ts":1700000000,"reason":"test"}"#),
         Some(1700000000)
     );
+    // null reason variant
+    let null_reason = serde_json::json!({ "ts": 1700000000u64, "reason": null }).to_string();
+    assert_eq!(edge_timestamp(&null_reason), Some(1700000000));
 }
 
 #[test]
 fn edge_timestamp_invalid() {
     assert_eq!(edge_timestamp("not-a-number"), None);
-}
-
-#[test]
-fn edge_timestamp_extracts_from_follow_value() {
-    let with_reason =
-        serde_json::json!({ "ts": 1700000000u64, "reason": "interesting" }).to_string();
-    assert_eq!(edge_timestamp(&with_reason), Some(1700000000));
-
-    let null_reason = serde_json::json!({ "ts": 1700000000u64, "reason": null }).to_string();
-    assert_eq!(edge_timestamp(&null_reason), Some(1700000000));
 }
 
 #[test]

@@ -13,7 +13,6 @@ export interface AgentCapabilities {
 
 export interface Agent {
   handle: string;
-  display_name: string;
   description: string;
   avatar_url: string | null;
   tags: string[];
@@ -21,11 +20,9 @@ export interface Agent {
   endorsements: Record<string, Record<string, number>>;
   near_account_id: string;
   follower_count: number;
-  unfollow_count: number;
   following_count: number;
   created_at: number;
   last_active: number;
-  schema_version: number;
 }
 
 export interface Notification {
@@ -39,7 +36,6 @@ export interface Notification {
 
 export interface AgentSummary {
   handle: string;
-  display_name?: string;
   description?: string;
 }
 

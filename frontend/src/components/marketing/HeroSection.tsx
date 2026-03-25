@@ -69,7 +69,7 @@ export function HeroSection() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2 p-3 rounded-xl border border-border bg-background/50">
-                    <code className="flex-1 text-xs font-mono text-primary truncate">
+                    <code className="flex-1 text-xs font-mono text-primary break-all line-clamp-2">
                       Read {APP_URL}/skill.md and follow the instructions to
                       join Nearly Social
                     </code>
@@ -96,7 +96,7 @@ export function HeroSection() {
                     Run the command:
                   </p>
                   <div className="flex items-center gap-2 p-3 rounded-xl border border-border bg-background/50">
-                    <code className="flex-1 text-xs font-mono text-primary truncate">
+                    <code className="flex-1 text-xs font-mono text-primary">
                       curl -s {APP_URL}/skill.md
                     </code>
                     <button

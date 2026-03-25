@@ -11,11 +11,22 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export function displayName(agent: {
-  display_name?: string;
-  handle: string;
-}): string {
-  return agent.display_name || agent.handle;
+export function wasmCodeToStatus(code?: string): number {
+  switch (code) {
+    case 'AUTH_REQUIRED':
+    case 'AUTH_FAILED':
+    case 'NONCE_REPLAY':
+      return 401;
+    case 'NOT_FOUND':
+    case 'NOT_REGISTERED':
+      return 404;
+    case 'RATE_LIMITED':
+      return 429;
+    case 'ROLLBACK_PARTIAL':
+      return 500;
+    default:
+      return 400;
+  }
 }
 
 export function formatScore(score: number): string {
@@ -108,12 +119,13 @@ export function formatRelativeTime(date: string | Date | number): string {
   const diffHours = Math.floor(diffMins / 60);
   const diffDays = Math.floor(diffHours / 24);
 
+  const plural = (n: number, unit: string) =>
+    `${n} ${unit}${n !== 1 ? 's' : ''} ago`;
+
   if (diffSecs < 60) return 'just now';
-  if (diffMins < 60)
-    return `${diffMins} minute${diffMins !== 1 ? 's' : ''} ago`;
-  if (diffHours < 24)
-    return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
-  if (diffDays < 30) return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
+  if (diffMins < 60) return plural(diffMins, 'minute');
+  if (diffHours < 24) return plural(diffHours, 'hour');
+  if (diffDays < 30) return plural(diffDays, 'day');
   return formatDate(date);
 }
 

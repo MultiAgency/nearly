@@ -17,6 +17,27 @@ fn endorsable_has(set: &HashSet<(String, String)>, ns: &str, val: &str) -> bool 
     set.iter().any(|(n, v)| n == ns && v == val)
 }
 
+/// Shared resolution check: endorsable profile → strict error → storage fallback.
+/// Returns whether this (ns, val) pair should be included in the resolved set.
+fn should_resolve(
+    ns: &str,
+    val: &str,
+    target_handle: &str,
+    caller_handle: &str,
+    endorsable: &HashSet<(String, String)>,
+    strict: bool,
+) -> Result<bool, Response> {
+    if endorsable_has(endorsable, ns, val) {
+        Ok(true)
+    } else if strict {
+        Err(err_response(&format!(
+            "Agent @{target_handle} does not have {ns} '{val}'"
+        )))
+    } else {
+        Ok(has(&keys::endorsement(target_handle, ns, val, caller_handle)))
+    }
+}
+
 pub(crate) fn collect_endorsable(
     tags: Option<&[String]>,
     caps: Option<&serde_json::Value>,
@@ -40,13 +61,7 @@ fn resolve_capabilities(
     resolved: &mut Vec<(String, String)>,
 ) -> Result<(), Response> {
     for (ns, val) in extract_capability_pairs(caps) {
-        if endorsable_has(endorsable, &ns, &val) {
-            resolved.push((ns, val));
-        } else if strict {
-            return Err(err_response(&format!(
-                "Agent @{target_handle} does not have {ns} '{val}'"
-            )));
-        } else if has(&keys::endorsement(target_handle, &ns, &val, caller_handle)) {
+        if should_resolve(&ns, &val, target_handle, caller_handle, endorsable, strict)? {
             resolved.push((ns, val));
         }
     }
@@ -62,13 +77,7 @@ fn resolve_tag(
     resolved: &mut Vec<(String, String)>,
 ) -> Result<(), Response> {
     if let Some((ns, v)) = val.split_once(':') {
-        if endorsable_has(endorsable, ns, v) {
-            resolved.push((ns.to_string(), v.to_string()));
-        } else if strict {
-            return Err(err_response(&format!(
-                "Agent @{target_handle} does not have {ns} '{v}'"
-            )));
-        } else if has(&keys::endorsement(target_handle, ns, v, caller_handle)) {
+        if should_resolve(ns, v, target_handle, caller_handle, endorsable, strict)? {
             resolved.push((ns.to_string(), v.to_string()));
         }
         return Ok(());
@@ -158,17 +167,12 @@ fn probe_endorsement_ns(
     if has(&keys::endorsement(target, "tags", val, caller)) {
         return Some("tags".to_string());
     }
-    let namespaces: HashSet<&str> = endorsable
+    endorsable
         .iter()
         .map(|(ns, _)| ns.as_str())
         .filter(|ns| *ns != "tags")
-        .collect();
-    for ns in namespaces {
-        if has(&keys::endorsement(target, ns, val, caller)) {
-            return Some(ns.to_string());
-        }
-    }
-    None
+        .find(|ns| has(&keys::endorsement(target, ns, val, caller)))
+        .map(String::from)
 }
 
 pub(crate) struct EndorsementCascade {
@@ -235,6 +239,11 @@ struct EndorsePreamble {
     requested: Vec<(String, String)>,
 }
 
+/// Shared preamble for endorse and unendorse handlers.
+///
+/// `strict`: when true (endorse), requires all requested items exist in the target's
+/// current profile. When false (unendorse), falls back to fuzzy matching against
+/// existing endorsement records so removals succeed even if the target's profile changed.
 fn endorse_preamble(
     req: &Request,
     rate_key: &str,

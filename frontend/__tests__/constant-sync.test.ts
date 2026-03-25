@@ -37,7 +37,6 @@ describe('Frontend ↔ Rust constant sync', () => {
   });
 
   it.each([
-    ['MAX_DISPLAY_NAME_LEN', 64],
     ['MAX_TAGS', 10],
     ['MAX_TAG_LEN', 30],
     ['MAX_REASON_LEN', 280],

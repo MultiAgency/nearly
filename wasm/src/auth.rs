@@ -10,6 +10,12 @@ use outlayer::env;
 /// Nonce GC fires when `nonce_byte % GC_SAMPLE_DIVISOR < 1`, i.e. ~2% of calls.
 const GC_SAMPLE_DIVISOR: u8 = 50;
 
+/// Extract the NEAR account from a payment-key signer.
+/// Payment keys: `owner.near:nonce:secret` → `owner.near`.
+fn extract_owner(signer: &str) -> Option<&str> {
+    signer.split_once(':').map(|(owner, _)| owner).filter(|o| !o.is_empty())
+}
+
 /// Resolve the authenticated caller for this request.
 ///
 /// # Trust model
@@ -30,48 +36,60 @@ const GC_SAMPLE_DIVISOR: u8 = 50;
 ///    to authenticate the user cryptographically while the server pays
 ///    for the OutLayer call.
 ///
+/// Payment-key signers (`owner.near:nonce:secret`) are normalized by
+/// extracting the owner prefix before the first `:`.
+///
 /// When both `NEAR_SENDER_ID` and a `verifiable_claim` are present and
 /// they **match**, we trust the runtime signer (fast path). When they
 /// **differ**, we fall through to full NEP-413 verification.
 pub(crate) fn get_caller_from(req: &Request) -> Result<String, Response> {
     if let Some(signer) = env::signer_account_id().filter(|s| !s.is_empty()) {
-        if signer.contains(':') {
-            if req.verifiable_claim.is_some() {
-                // Server-paid path: payment-key signer contains ':'
-                // (e.g. "owner:seq:secret"). Fall through to NEP-413
-                // so the verifiable_claim proves the real user.
-            } else {
-                return Err(err_coded(
-                    "AUTH_FAILED",
-                    "Invalid signer account ID: contains ':'",
-                ));
-            }
-        } else if let Some(auth) = &req.verifiable_claim {
-            if auth.near_account_id != signer {
-                // Server-paid path: the proxy used the server's payment key,
-                // so NEAR_SENDER_ID is the server account. Fall through to
-                // NEP-413 in-WASM verification to authenticate the user
-                // cryptographically.
-            } else {
-                return Ok(signer);
-            }
+        // Normalize: payment-key signers are `owner.near:nonce:secret`;
+        // extract the NEAR account (before first `:`).
+        let account = if signer.contains(':') {
+            extract_owner(&signer)
+                .ok_or_else(|| {
+                    err_hint(
+                        "AUTH_FAILED",
+                        "Invalid signer account ID: empty owner before ':'",
+                        "Payment key format must be owner:nonce:secret",
+                    )
+                })?
+                .to_string()
         } else {
-            return Ok(signer);
+            signer
+        };
+
+        // If claim is absent or matches the signer, trust the runtime.
+        if req.verifiable_claim.as_ref().is_none_or(|a| a.near_account_id == account) {
+            return Ok(account);
         }
     }
     let auth = req.verifiable_claim.as_ref().ok_or_else(|| {
-        err_coded(
+        err_hint(
             "AUTH_REQUIRED",
-            "Authentication required. Provide verifiable_claim (NEP-413 signature).",
+            "Authentication required.",
+            "verifiable_claim in body required. See https://nearly.social/skill.md#1-registration",
         )
     })?;
 
     let now = now_secs().map_err(Response::from)?;
-    nep413::verify_auth(auth, now * 1000, req.action.as_str())
-        .map_err(|e| err_coded("AUTH_FAILED", &format!("Auth failed: {e}")))?;
+    nep413::verify_auth(auth, now * 1000, req.action.as_str()).map_err(|e| {
+        err_hint(
+            "AUTH_FAILED",
+            &format!("Auth failed: {e}"),
+            "Check: nonce is fresh (32 bytes, unique), timestamp within 5 minutes, \
+             domain is \"nearly.social\"",
+        )
+    })?;
 
-    nep413::verify_public_key_ownership(&auth.near_account_id, &auth.public_key)
-        .map_err(|e| err_coded("AUTH_FAILED", &format!("Auth failed: {e}")))?;
+    nep413::verify_public_key_ownership(&auth.near_account_id, &auth.public_key).map_err(|e| {
+        err_hint(
+            "AUTH_FAILED",
+            &format!("Auth failed: {e}"),
+            "Public key must exist on the claimed NEAR account with FullAccess permission",
+        )
+    })?;
 
     const _: () = assert!(
         NONCE_TTL_SECS > nep413::TIMESTAMP_WINDOW_MS / 1000,
@@ -106,9 +124,10 @@ pub(crate) fn get_caller_from(req: &Request) -> Result<String, Response> {
             }
         }
         Ok(false) => {
-            return Err(err_coded(
+            return Err(err_hint(
                 "NONCE_REPLAY",
                 "This nonce has already been used",
+                "Generate a new 32-byte random nonce and re-sign",
             ))
         }
         Err(_) => return Err(err_response("Internal error")),

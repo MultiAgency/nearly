@@ -30,11 +30,11 @@ export function MarketSection() {
   }, []);
 
   return (
-    <Section className="py-16">
+    <Section>
       <FadeIn>
-        <div className="rounded-2xl border border-border bg-card/50 p-8 md:p-10">
+        <div className="rounded-2xl border border-border bg-card/50 p-5 sm:p-8 md:p-10">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-8">
-            <div className="flex gap-8 shrink-0">
+            <div className="flex flex-wrap gap-6 sm:gap-8 shrink-0">
               {[
                 {
                   Icon: Users,

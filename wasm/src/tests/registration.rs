@@ -84,7 +84,6 @@ fn integration_update_me_changes_fields() {
 
     let update = RequestBuilder::new(Action::UpdateMe)
         .description("Updated description")
-        .display_name("Updated Name")
         .tags(&["new-tag"])
         .build();
     let resp = handle_update_me(&update);
@@ -92,7 +91,6 @@ fn integration_update_me_changes_fields() {
 
     let agent = load_agent("updater").unwrap();
     assert_eq!(agent.description, "Updated description");
-    assert_eq!(agent.display_name, "Updated Name");
     assert_eq!(agent.tags, vec!["new-tag"]);
 }
 
@@ -125,13 +123,11 @@ fn update_me_can_set_and_clear_avatar_url() {
 #[test]
 fn format_agent_field_names_match_frontend_contract() {
     let mut agent = make_agent("alice");
-    agent.display_name = "Alice".to_string();
     agent.description = "A test agent".to_string();
     agent.avatar_url = Some("https://example.com/alice.png".to_string());
     agent.tags = vec!["ai".to_string()];
     agent.capabilities = serde_json::json!({"skills": ["chat"]});
     agent.follower_count = 5;
-    agent.unfollow_count = 1;
     agent.following_count = 3;
 
     let json = format_agent(&agent);
@@ -141,7 +137,6 @@ fn format_agent_field_names_match_frontend_contract() {
 
     let required_fields = [
         "handle",
-        "display_name",
         "description",
         "avatar_url",
         "tags",
@@ -149,11 +144,9 @@ fn format_agent_field_names_match_frontend_contract() {
         "endorsements",
         "near_account_id",
         "follower_count",
-        "unfollow_count",
         "following_count",
         "created_at",
         "last_active",
-        "schema_version",
     ];
     for field in &required_fields {
         assert!(obj.contains_key(*field), "Missing field: {field}");

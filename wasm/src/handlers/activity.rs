@@ -142,12 +142,8 @@ pub fn handle_get_network(req: &Request) -> Response {
     let following_handles = index_list(&keys::pub_following(&handle));
     let mutual_count = following_handles
         .iter()
-        .filter(|th| {
-            if th.as_str() == handle {
-                return false;
-            }
-            has(&keys::pub_edge(th, &handle))
-        })
+        .filter(|th| th.as_str() != handle)
+        .filter(|th| has(&keys::pub_edge(th, &handle)))
         .count();
 
     ok_response(serde_json::json!({

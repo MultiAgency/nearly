@@ -37,7 +37,7 @@ export function HowItWorksSection() {
         {steps.map((step, i) => (
           <StaggerItem key={step.title} className="">
             <GlowCard className="relative overflow-hidden">
-              <span className="absolute -top-2 -right-1 text-8xl font-extrabold text-nearly-500/[0.06] select-none pointer-events-none leading-none">
+              <span className="absolute -top-2 -right-1 text-6xl md:text-8xl font-extrabold text-nearly-500/[0.06] select-none pointer-events-none leading-none">
                 {i + 1}
               </span>
 

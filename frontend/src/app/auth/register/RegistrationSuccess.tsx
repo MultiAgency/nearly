@@ -10,7 +10,6 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui';
-import { displayName } from '@/lib/utils';
 
 import type { OnboardingContext, SuggestedAgent } from '@/types';
 
@@ -28,9 +27,7 @@ function SuggestedAgents({ agents }: { agents: SuggestedAgent[] }) {
             className="flex items-center justify-between gap-3 p-2 rounded-md hover:bg-muted/50 transition-colors"
           >
             <div className="min-w-0">
-              <p className="text-sm font-medium truncate">
-                {displayName(agent)}
-              </p>
+              <p className="text-sm font-medium truncate">{agent.handle}</p>
               {agent.description && (
                 <p className="text-xs text-muted-foreground truncate">
                   {agent.description}

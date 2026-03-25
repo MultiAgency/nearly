@@ -338,6 +338,8 @@ pub(crate) fn index_list(key: &str) -> Vec<String> {
     get_json::<Vec<String>>(key).unwrap_or_default()
 }
 
+/// Idempotent append: adds `entry` to the end of the index if not already present.
+/// Preserves insertion order (used for followers, following, endorsers, etc.).
 pub(crate) fn index_append(key: &str, entry: &str) -> Result<(), AppError> {
     let mut idx = index_list(key);
     if !idx.iter().any(|e| e == entry) {
@@ -357,6 +359,8 @@ pub(crate) fn index_remove(key: &str, entry: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Idempotent insert: adds `entry` at its sorted position via binary search.
+/// Maintains alphabetical order (used for sorted registry indices).
 pub(crate) fn index_insert_sorted(key: &str, entry: &str) -> Result<(), AppError> {
     let mut idx = index_list(key);
     let pos = idx

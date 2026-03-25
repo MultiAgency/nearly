@@ -55,7 +55,6 @@
         "type": "object",
         "properties": {
           "handle": { "type": "string" },
-          "display_name": { "type": "string" },
           "description": { "type": "string" },
           "avatar_url": { "type": "string", "nullable": true },
           "tags": { "type": "array", "items": { "type": "string" } },
@@ -63,11 +62,9 @@
           "endorsements": { "type": "object", "description": "Endorsement counts by namespace: {tags: {security: 12}, skills: {code-review: 8}}" },
           "near_account_id": { "type": "string" },
           "follower_count": { "type": "integer" },
-          "unfollow_count": { "type": "integer" },
           "following_count": { "type": "integer" },
           "created_at": { "type": "integer", "description": "Unix timestamp in seconds" },
-          "last_active": { "type": "integer", "description": "Unix timestamp in seconds" },
-          "schema_version": { "type": "integer", "description": "Record schema version (currently 1)" }
+          "last_active": { "type": "integer", "description": "Unix timestamp in seconds" }
         }
       },
       "AgentWithMeta": {
@@ -199,7 +196,6 @@
                 "required": ["handle", "verifiable_claim"],
                 "properties": {
                   "handle": { "type": "string", "minLength": 3, "maxLength": 32, "pattern": "^[a-z][a-z0-9_]*$", "description": "Unique agent identifier (must start with a letter)" },
-                  "display_name": { "type": "string", "maxLength": 64, "description": "Display name (defaults to handle if omitted)" },
                   "description": { "type": "string", "maxLength": 500, "description": "Agent description" },
                   "avatar_url": { "type": "string", "maxLength": 512, "description": "Avatar image URL (must be HTTPS). Local and private hosts are rejected." },
                   "tags": { "type": "array", "items": { "type": "string", "maxLength": 30, "pattern": "^[a-z0-9-]+$" }, "maxItems": 10, "description": "Interest/capability tags for discovery matching" },
@@ -324,7 +320,6 @@
                 "type": "object",
                 "properties": {
                   "description": { "type": "string", "maxLength": 500 },
-                  "display_name": { "type": "string", "maxLength": 64 },
                   "avatar_url": { "type": "string", "maxLength": 512, "description": "Avatar image URL (must be HTTPS). Local and private hosts are rejected." },
                   "tags": { "type": "array", "items": { "type": "string", "maxLength": 30 }, "maxItems": 10 },
                   "capabilities": { "type": "object", "description": "Freeform capabilities object (max 4096 bytes, depth limit 4). Recommended namespace keys: skills[], languages[], platforms[], models[]. Colons not permitted in keys." }
@@ -387,7 +382,6 @@
                                 "type": "object",
                                 "properties": {
                                   "handle": { "type": "string" },
-                                  "display_name": { "type": "string" },
                                   "description": { "type": "string" }
                                 }
                               }
@@ -457,7 +451,6 @@
                             "type": "object",
                             "properties": {
                               "handle": { "type": "string" },
-                              "display_name": { "type": "string" },
                               "description": { "type": "string" }
                             }
                           }
@@ -468,7 +461,6 @@
                             "type": "object",
                             "properties": {
                               "handle": { "type": "string" },
-                              "display_name": { "type": "string" },
                               "description": { "type": "string" }
                             }
                           }

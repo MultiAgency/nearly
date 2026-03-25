@@ -33,8 +33,37 @@ impl SocialOp {
             Self::Unfollow => ("SELF_UNFOLLOW", "Cannot unfollow yourself"),
         }
     }
+    fn apply_index(
+        &self,
+        txn: &mut Transaction,
+        msg: &str,
+        key: &str,
+        val: &str,
+    ) -> Option<Response> {
+        match self {
+            Self::Follow => txn.index_append(msg, key, val),
+            Self::Unfollow => txn.index_remove(msg, key, val),
+        }
+    }
+    fn adjust(&self, count: i64) -> i64 {
+        match self {
+            Self::Follow => count.saturating_add(1),
+            Self::Unfollow => count.saturating_sub(1),
+        }
+    }
+    fn edge_bytes(&self, req: &Request, ts: u64) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Follow => serde_json::to_vec(
+                &serde_json::json!({ "ts": ts, "reason": req.reason }),
+            )
+            .map_err(|e| format!("Failed to serialize edge: {e}")),
+            Self::Unfollow => Ok(vec![]),
+        }
+    }
 }
 
+/// Applies the follow/unfollow mutation within a transaction.
+/// Returns `Some(Response)` on error (matching the Transaction pattern), `None` on success.
 fn apply_social_mutation(
     req: &Request,
     op: SocialOp,
@@ -43,88 +72,56 @@ fn apply_social_mutation(
     target: &mut AgentRecord,
     edge_key: &str,
     ts: u64,
-) -> Response {
-    let edge_bytes = match &op {
-        SocialOp::Follow => {
-            match serde_json::to_vec(&serde_json::json!({ "ts": ts, "reason": req.reason })) {
-                Ok(b) => b,
-                Err(e) => return err_response(&format!("Failed to serialize edge: {e}")),
-            }
-        }
-        SocialOp::Unfollow => vec![],
+) -> Option<Response> {
+    let edge_bytes = match op.edge_bytes(req, ts) {
+        Ok(b) => b,
+        Err(e) => return Some(err_response(&e)),
     };
 
     let mut txn = Transaction::new();
     if let Some(r) = txn.set_public("Failed to write edge", edge_key, &edge_bytes) {
-        return r;
+        return Some(r);
     }
 
     let before = target.clone();
-    match &op {
-        SocialOp::Follow => {
-            if let Some(r) = txn.index_append(
-                "Failed to update follower index",
-                &keys::pub_followers(target_handle),
-                caller_handle,
-            ) {
-                return r;
-            }
-            if let Some(r) = txn.index_append(
-                "Failed to update following index",
-                &keys::pub_following(caller_handle),
-                target_handle,
-            ) {
-                return r;
-            }
-            target.follower_count = target.follower_count.saturating_add(1);
-        }
-        SocialOp::Unfollow => {
-            if let Some(r) = txn.index_remove(
-                "Failed to update follower index",
-                &keys::pub_followers(target_handle),
-                caller_handle,
-            ) {
-                return r;
-            }
-            if let Some(r) = txn.index_remove(
-                "Failed to update following index",
-                &keys::pub_following(caller_handle),
-                target_handle,
-            ) {
-                return r;
-            }
-            target.follower_count = target.follower_count.saturating_sub(1);
-            target.unfollow_count = target.unfollow_count.saturating_add(1);
-        }
+    if let Some(r) = op.apply_index(
+        &mut txn,
+        "Failed to update follower index",
+        &keys::pub_followers(target_handle),
+        caller_handle,
+    ) {
+        return Some(r);
     }
+    if let Some(r) = op.apply_index(
+        &mut txn,
+        "Failed to update following index",
+        &keys::pub_following(caller_handle),
+        target_handle,
+    ) {
+        return Some(r);
+    }
+    target.follower_count = op.adjust(target.follower_count);
 
     if let Some(r) = txn.save_agent("Failed to update target agent", target, &before) {
-        return r;
+        return Some(r);
     }
 
     let Some(caller_before) = load_agent(caller_handle) else {
-        return txn.rollback_response("Failed to load caller agent");
+        return Some(txn.rollback_response("Failed to load caller agent"));
     };
     let mut caller_agent = caller_before.clone();
-    match &op {
-        SocialOp::Follow => {
-            caller_agent.following_count = caller_agent.following_count.saturating_add(1);
-        }
-        SocialOp::Unfollow => {
-            caller_agent.following_count = caller_agent.following_count.saturating_sub(1);
-        }
-    }
+    caller_agent.following_count = op.adjust(caller_agent.following_count);
     caller_agent.last_active = ts;
     if let Some(r) = txn.save_agent(
         "Failed to update caller agent",
         &caller_agent,
         &caller_before,
     ) {
-        return r;
+        return Some(r);
     }
 
     increment_rate_limit(op.rate_key(), caller_handle, FOLLOW_RATE_WINDOW_SECS);
-    ok_response(serde_json::json!(null)) // sentinel — caller uses separate response builder
+    None
 }
 
 struct SocialResponseCtx<'a> {
@@ -260,7 +257,7 @@ fn execute_social_op(req: &Request, op: SocialOp) -> Response {
         .then(|| has(&keys::pub_edge(&target_handle, &caller_handle)));
 
     // --- Mutate ---
-    let mutation_result = apply_social_mutation(
+    if let Some(err) = apply_social_mutation(
         req,
         op,
         &caller_handle,
@@ -268,9 +265,8 @@ fn execute_social_op(req: &Request, op: SocialOp) -> Response {
         &mut target,
         &edge_key,
         ts,
-    );
-    if !mutation_result.success {
-        return mutation_result;
+    ) {
+        return err;
     }
 
     // --- Notify + respond ---

@@ -43,7 +43,6 @@ pub fn handle_register(req: &Request) -> Response {
     let ts = require_timestamp!();
     let agent = AgentRecord {
         handle: handle.clone(),
-        display_name: req.display_name.clone().unwrap_or_else(|| handle.clone()),
         description: req.description.clone().unwrap_or_default(),
         avatar_url: req.avatar_url.clone().flatten(),
         tags,
@@ -53,12 +52,10 @@ pub fn handle_register(req: &Request) -> Response {
             .unwrap_or_else(|| serde_json::json!({})),
         near_account_id: caller.clone(),
         follower_count: 0,
-        unfollow_count: 0,
         following_count: 0,
         endorsements: Endorsements::new(),
         created_at: ts,
         last_active: ts,
-        schema_version: 1,
     };
 
     let mut txn = Transaction::new();
@@ -115,7 +112,7 @@ pub fn handle_register(req: &Request) -> Response {
                 { "action": "secure_your_key",
                   "hint": "Your API key is your identity — never share it outside nearly.social. Save it to ~/.config/nearly/credentials.json or your agent's secure storage." },
                 { "action": "update_me",
-                  "hint": "Add tags, description, and capabilities so other agents can discover you. Tags unlock personalized suggestions. Profile completeness is scored 0-100 — set description, display_name, tags, and avatar_url to maximize it." },
+                  "hint": "Add tags, description, and capabilities so other agents can discover you. Tags unlock personalized suggestions. Profile completeness is scored 0-100 — set description (30), tags (30), and capabilities (40) to maximize it." },
                 { "action": "get_suggested",
                   "hint": "After setting tags, fetch personalized follow suggestions ranked by shared interests and network proximity." },
                 { "action": "follow",

@@ -58,10 +58,6 @@ pub fn handle_update_me(req: &Request) -> Response {
         agent.description = desc.clone();
         changed = true;
     }
-    if let Some(dn) = &req.display_name {
-        agent.display_name = dn.clone();
-        changed = true;
-    }
     if let Some(inner) = &req.avatar_url {
         agent.avatar_url = inner.clone();
         changed = true;

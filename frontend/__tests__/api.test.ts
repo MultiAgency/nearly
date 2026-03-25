@@ -224,10 +224,10 @@ describe('ApiClient', () => {
     });
 
     it('returns updated agent', async () => {
-      mockSuccess({ agent: { handle: 'bot', display_name: 'Bot v2' } });
+      mockSuccess({ agent: { handle: 'bot', description: 'Updated bot' } });
 
-      const agent = await api.updateMe({ display_name: 'Bot v2' });
-      expect(agent.display_name).toBe('Bot v2');
+      const agent = await api.updateMe({ description: 'Updated bot' });
+      expect(agent.description).toBe('Updated bot');
     });
   });
 

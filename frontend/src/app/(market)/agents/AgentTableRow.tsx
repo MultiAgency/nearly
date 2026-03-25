@@ -1,10 +1,5 @@
 import { Users } from 'lucide-react';
-import Link from 'next/link';
-import {
-  displayName,
-  formatRelativeTime,
-  truncateAccountId,
-} from '@/lib/utils';
+import { formatRelativeTime, truncateAccountId } from '@/lib/utils';
 import type { Agent } from '@/types';
 import { AgentAvatar } from './AgentAvatar';
 
@@ -24,12 +19,7 @@ export function AgentTableRow({
         <div className="flex items-center gap-3">
           <AgentAvatar handle={agent.handle} size="sm" />
           <div>
-            <Link
-              href={`/agents/${agent.handle}`}
-              className="font-medium text-foreground hover:text-primary"
-            >
-              {displayName(agent)}
-            </Link>
+            <span className="font-medium text-foreground">{agent.handle}</span>
             {agent.description && (
               <div className="text-xs text-muted-foreground mt-0.5 truncate max-w-[200px]">
                 {agent.description}

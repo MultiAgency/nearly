@@ -48,6 +48,7 @@ pub fn verify_public_key_ownership(account_id: &str, _public_key: &str) -> Resul
 /// 2. **NEAR implicit** (on-chain): account_id = hex(sha256(pubkey))
 ///
 /// Both are 64 hex chars. If either matches, no on-chain lookup is needed.
+#[allow(dead_code)] // only called from #[cfg(not(test))] verify_public_key_ownership
 fn is_implicit_owner(account_id: &str, public_key: &str) -> Result<bool, AppError> {
     if account_id.len() != 64 || !account_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Ok(false);
@@ -59,7 +60,7 @@ fn is_implicit_owner(account_id: &str, public_key: &str) -> Result<bool, AppErro
         return Ok(true);
     }
     // Scheme 2: sha256(pubkey) hex (NEAR implicit accounts)
-    let hash = <sha2::Sha256 as sha2::Digest>::digest(&pub_bytes);
+    let hash = Sha256::digest(&pub_bytes);
     let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     Ok(hash_hex == account_id)
 }
@@ -140,14 +141,7 @@ pub fn verify_auth(auth: &Nep413Auth, now_ms: u64, expected_action: &str) -> Res
     }
 
     let pub_key_bytes = decode_ed25519_key(&auth.public_key)?;
-    if pub_key_bytes.len() != 32 {
-        return Err(AppError::Auth("Public key must be 32 bytes".into()));
-    }
-
     let sig_bytes = decode_ed25519_key(&auth.signature)?;
-    if sig_bytes.len() != 64 {
-        return Err(AppError::Auth("Signature must be 64 bytes".into()));
-    }
 
     let nonce_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &auth.nonce)
@@ -184,11 +178,9 @@ pub fn verify_auth(auth: &Nep413Auth, now_ms: u64, expected_action: &str) -> Res
 }
 
 fn decode_ed25519_key(key_str: &str) -> Result<Vec<u8>, AppError> {
-    let prefix = "ed25519:";
-    if !key_str.starts_with(prefix) {
-        return Err(AppError::Auth(format!("Key must start with \"{prefix}\"")));
-    }
-    let encoded = &key_str[prefix.len()..];
+    let encoded = key_str
+        .strip_prefix("ed25519:")
+        .ok_or_else(|| AppError::Auth("Key must start with \"ed25519:\"".into()))?;
     bs58::decode(encoded)
         .into_vec()
         .map_err(|e| AppError::Auth(format!("Invalid base58: {e}")))
@@ -366,29 +358,58 @@ pub(crate) mod tests {
 
     // H3: validate_near_account_id — extracted from verify_public_key_ownership
     #[test]
-    fn account_id_too_short_rejected() {
-        assert!(validate_near_account_id("a").is_err());
+    fn account_id_rejects_invalid() {
+        assert!(validate_near_account_id("a").is_err()); // too short
+        assert!(validate_near_account_id(&"a".repeat(65)).is_err()); // too long
+        assert!(validate_near_account_id("alice@near").is_err()); // bad char
+        assert!(validate_near_account_id("alice near").is_err()); // space
+        assert!(validate_near_account_id("alice:near").is_err()); // colon
     }
 
     #[test]
-    fn account_id_too_long_rejected() {
-        let long = "a".repeat(65);
-        assert!(validate_near_account_id(&long).is_err());
-    }
-
-    #[test]
-    fn account_id_invalid_chars_rejected() {
-        assert!(validate_near_account_id("alice@near").is_err());
-        assert!(validate_near_account_id("alice near").is_err());
-        assert!(validate_near_account_id("alice:near").is_err());
-    }
-
-    #[test]
-    fn account_id_valid_formats_accepted() {
+    fn account_id_accepts_valid() {
         assert!(validate_near_account_id("alice.near").is_ok());
         assert!(validate_near_account_id("a-b_c.near").is_ok());
-        assert!(validate_near_account_id("ab").is_ok());
-        let max = "a".repeat(64);
-        assert!(validate_near_account_id(&max).is_ok());
+        assert!(validate_near_account_id("ab").is_ok()); // min length
+        assert!(validate_near_account_id(&"a".repeat(64)).is_ok()); // max length
+    }
+
+    fn test_pub_key_str() -> (String, Vec<u8>) {
+        let secret_bytes: [u8; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
+        let pk_bytes = signing_key.verifying_key().to_bytes();
+        let pub_key_str = format!("ed25519:{}", bs58::encode(&pk_bytes).into_string());
+        (pub_key_str, pk_bytes.to_vec())
+    }
+
+    #[test]
+    fn implicit_owner_raw_pubkey_hex() {
+        let (pub_key_str, pk_bytes) = test_pub_key_str();
+        let account_id: String = pk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(is_implicit_owner(&account_id, &pub_key_str).unwrap());
+    }
+
+    #[test]
+    fn implicit_owner_sha256_hex() {
+        let (pub_key_str, pk_bytes) = test_pub_key_str();
+        let hash = Sha256::digest(&pk_bytes);
+        let account_id: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(is_implicit_owner(&account_id, &pub_key_str).unwrap());
+    }
+
+    #[test]
+    fn implicit_owner_named_account_returns_false() {
+        let (pub_key_str, _) = test_pub_key_str();
+        assert!(!is_implicit_owner("alice.near", &pub_key_str).unwrap());
+    }
+
+    #[test]
+    fn implicit_owner_wrong_hex_returns_false() {
+        let (pub_key_str, _) = test_pub_key_str();
+        let wrong = "aa".repeat(32);
+        assert!(!is_implicit_owner(&wrong, &pub_key_str).unwrap());
     }
 }

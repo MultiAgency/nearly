@@ -4,19 +4,16 @@ use serial_test::serial;
 fn make_agent(handle: &str) -> AgentRecord {
     AgentRecord {
         handle: handle.to_string(),
-        display_name: handle.to_string(),
         description: String::new(),
         avatar_url: None,
         tags: vec![],
         capabilities: serde_json::json!({}),
         near_account_id: format!("{handle}.near"),
         follower_count: 0,
-        unfollow_count: 0,
         following_count: 0,
         endorsements: Endorsements::new(),
         created_at: 1000,
         last_active: 1000,
-        schema_version: 1,
     }
 }
 
@@ -35,7 +32,6 @@ fn test_request(action: Action) -> Request {
         action,
         handle: None,
         description: None,
-        display_name: None,
         avatar_url: None,
         tags: None,
         capabilities: None,
@@ -68,10 +64,6 @@ impl RequestBuilder {
     }
     fn description(mut self, d: &str) -> Self {
         self.req.description = Some(d.into());
-        self
-    }
-    fn display_name(mut self, n: &str) -> Self {
-        self.req.display_name = Some(n.into());
         self
     }
     fn tags(mut self, t: &[&str]) -> Self {

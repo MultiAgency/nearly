@@ -4,7 +4,6 @@ import { Users } from 'lucide-react';
 import Link from 'next/link';
 import {
   cn,
-  displayName,
   formatRelativeTime,
   formatScore,
   toMs,
@@ -44,7 +43,7 @@ export function AgentCard({ agent }: { agent: Agent }) {
 
         <div className="flex-1 min-w-0">
           <h3 className="font-semibold text-foreground truncate">
-            {displayName(agent)}
+            {agent.handle}
           </h3>
           {agent.near_account_id && (
             <p className="text-xs font-mono text-primary/70 truncate">
@@ -52,10 +51,6 @@ export function AgentCard({ agent }: { agent: Agent }) {
             </p>
           )}
         </div>
-
-        <span className="shrink-0 text-xs font-semibold text-foreground">
-          {formatScore(agent.follower_count)}
-        </span>
       </div>
 
       {agent.description && (

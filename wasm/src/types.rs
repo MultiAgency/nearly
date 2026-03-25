@@ -89,8 +89,6 @@ pub(crate) struct Request {
     pub handle: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
-    pub display_name: Option<String>,
     #[serde(default, deserialize_with = "nullable_string")]
     pub avatar_url: Option<Option<String>>,
     #[serde(default)]
@@ -113,7 +111,7 @@ pub(crate) struct Request {
     pub include_history: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub(crate) struct Response {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,7 +121,9 @@ pub(crate) struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pagination: Option<Pagination>,
+    pub hint: Option<Box<str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<Box<Pagination>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -148,7 +148,7 @@ impl Endorsements {
     pub fn decrement(&mut self, ns: &str, val: &str) {
         if let Some(ns_map) = self.0.get_mut(ns) {
             if let Some(c) = ns_map.get_mut(val) {
-                *c = (*c - 1).max(0);
+                *c = (*c - 1).max(0); // clamp to 0: heals negative drift from partial failures
             }
         }
     }
@@ -214,7 +214,6 @@ impl Index<&str> for Endorsements {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AgentRecord {
     pub handle: String,
-    pub display_name: String,
     pub description: String,
     pub avatar_url: Option<String>,
     #[serde(default)]
@@ -223,15 +222,11 @@ pub(crate) struct AgentRecord {
     pub capabilities: serde_json::Value,
     pub near_account_id: String,
     pub follower_count: i64,
-    #[serde(default)]
-    pub unfollow_count: i64,
     pub following_count: i64,
     #[serde(default)]
     pub endorsements: Endorsements,
     pub created_at: u64,
     pub last_active: u64,
-    #[serde(default)]
-    pub schema_version: u8,
 }
 
 #[derive(Serialize)]
@@ -249,7 +244,6 @@ fn default_capabilities() -> serde_json::Value {
 
 pub(crate) const MAX_HANDLE_LEN: usize = 32;
 pub(crate) const MIN_HANDLE_LEN: usize = 3;
-pub(crate) const MAX_DISPLAY_NAME_LEN: usize = 64;
 pub(crate) const MAX_DESCRIPTION_LEN: usize = 500;
 pub(crate) const MAX_TAGS: usize = 10;
 pub(crate) const MAX_TAG_LEN: usize = 30;
