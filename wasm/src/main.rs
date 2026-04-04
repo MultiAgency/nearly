@@ -8,8 +8,8 @@ mod agent;
 mod auth;
 mod handlers;
 mod nep413;
-mod registry;
 mod store;
+mod suggest;
 mod types;
 mod validation;
 
@@ -21,12 +21,6 @@ pub(crate) use types::*;
 pub(crate) use validation::*;
 
 use handlers::*;
-
-// Error-handling conventions (three layers, each with a distinct purpose):
-//
-// 1. require_*! macros    — request-level validation (parse required fields, fail early)
-// 2. ? with AppError      — infrastructure errors (storage, validation, clock)
-// 3. match + Err(Response) — business-logic decisions (rate limits, self-follow, auth)
 
 fn migrating_action(action: Action) -> Response {
     err_coded(
@@ -42,11 +36,7 @@ fn main() {
     let response = match env::input_json::<Request>() {
         Ok(Some(req)) => match req.action {
             Action::Register => handle_register(&req),
-            Action::GetMe => handle_get_me(&req),
-            Action::UpdateMe => handle_update_me(&req),
-            Action::SetPlatforms => handle_set_platforms(&req),
-            Action::GetNotifications => handle_get_notifications(&req),
-            Action::ReadNotifications => handle_read_notifications(&req),
+            Action::GetVrfSeed => suggest::handle_get_vrf_seed(),
             other => migrating_action(other),
         },
         Ok(None) => err_coded("VALIDATION_ERROR", "No input provided"),

@@ -20,10 +20,7 @@ export const ROUTE_TABLE: readonly RouteDef[] = [
   ['POST', 'agents/me/heartbeat', 'heartbeat'],
   ['GET', 'agents/me/activity', 'get_activity', ['since']],
   ['GET', 'agents/me/network', 'get_network'],
-  ['GET', 'agents/me/notifications', 'get_notifications', ['limit', 'cursor']],
-  ['POST', 'agents/me/notifications/read', 'read_notifications'],
   ['DELETE', 'agents/me', 'deregister'],
-  ['POST', 'agents/me/migrate', 'migrate_account'],
   ['POST', 'agents/me/platforms', 'register_platforms'],
   ['GET', 'agents/:handle', 'get_profile'],
   ['POST', 'agents/:handle/follow', 'follow'],
@@ -152,18 +149,4 @@ export const PUBLIC_ACTIONS = new Set([
   'check_handle',
   'health',
 ]);
-/** Mutating actions that invalidate the public response cache. */
-export const CACHE_BUSTING_ACTIONS = new Set([
-  'register',
-  'update_me',
-  'follow',
-  'unfollow',
-  'endorse',
-  'unendorse',
-  'heartbeat',
-  'deregister',
-  'migrate_account',
-  'admin_deregister',
-]);
-
 export type { HttpMethod };

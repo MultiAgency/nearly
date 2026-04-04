@@ -26,7 +26,11 @@ export function setupFetchMock() {
 }
 
 export function mockJsonResponse(data: unknown) {
-  return { ok: true, json: () => Promise.resolve({ success: true, data }) };
+  return {
+    ok: true,
+    status: 200,
+    json: () => Promise.resolve({ success: true, data }),
+  };
 }
 
 export function mockWasmErrorResponse(

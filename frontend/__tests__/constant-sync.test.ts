@@ -78,29 +78,18 @@ const HANDLER_DIR = resolve(__dirname, '../../wasm/src/handlers');
 const OPENAPI_PATH = resolve(__dirname, '../public/openapi.json');
 
 // Maps WASM handler function names to action strings.
-// Read-only handlers moved to FastData KV are omitted — they no longer
-// have RESPONSE comments in the WASM handler files.
+// Only registration lives in WASM — all other mutations use direct FastData
+// writes, and reads go through FastData KV dispatch.
 const HANDLER_TO_ACTION: Record<string, string> = {
   handle_register: 'register',
-  handle_get_me: 'get_me',
-  handle_update_me: 'update_me',
-  handle_get_notifications: 'get_notifications',
-  handle_read_notifications: 'read_notifications',
 };
 
-// Handlers with RESPONSE comments but intentionally excluded from openapi.json
-// (admin-only actions documented in AGENTS.md only).
-const EXCLUDED_HANDLERS = new Set(['handle_set_platforms']);
+// Handlers with RESPONSE comments but intentionally excluded from openapi.json.
+const EXCLUDED_HANDLERS = new Set<string>();
 
 // Maps action strings to OpenAPI paths.
-// Read-only actions served by FastData KV are still in OpenAPI (routes exist)
-// but no longer have WASM handler RESPONSE comments to validate against.
 const ACTION_TO_PATH: Record<string, [string, string]> = {
   register: ['post', '/agents/register'],
-  get_me: ['get', '/agents/me'],
-  update_me: ['patch', '/agents/me'],
-  get_notifications: ['get', '/agents/me/notifications'],
-  read_notifications: ['post', '/agents/me/notifications/read'],
 };
 
 function extractResponseComments(): {

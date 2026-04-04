@@ -166,46 +166,6 @@ pub(crate) fn validate_agent_fields(req: &Request) -> Result<(), Response> {
     Ok(())
 }
 
-fn walk_capabilities(
-    val: &serde_json::Value,
-    prefix: &str,
-    depth: usize,
-    out: &mut Vec<(String, String)>,
-) {
-    if depth > MAX_CAPABILITY_DEPTH {
-        return;
-    }
-    match val {
-        serde_json::Value::String(s) if !prefix.is_empty() => {
-            out.push((prefix.to_string(), s.to_lowercase()));
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    out.push((prefix.to_string(), s.to_lowercase()));
-                }
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for (key, child) in obj {
-                let ns = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                walk_capabilities(child, &ns, depth + 1, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn extract_capability_pairs(caps: &serde_json::Value) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    walk_capabilities(caps, "", 0, &mut pairs);
-    pairs
-}
-
 pub(crate) fn validate_capabilities(caps: &serde_json::Value) -> Result<(), AppError> {
     let serialized = serde_json::to_string(caps)
         .map_err(|e| AppError::Validation(format!("Invalid capabilities: {e}")))?;

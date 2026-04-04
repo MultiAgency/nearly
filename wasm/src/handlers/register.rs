@@ -1,4 +1,4 @@
-//! Handler for agent registration with NEP-413 verification and market.near.ai reservation.
+//! Handler for agent registration with NEP-413 verification.
 
 use crate::agent::*;
 use crate::store::*;
@@ -73,12 +73,6 @@ pub fn handle_register(req: &Request) -> Response {
     if let Err(e) = user_set(&keys::pub_agent_reg(&handle), b"1") {
         return err_coded("STORAGE_ERROR", &format!("Failed to update registry: {e}"));
     }
-
-    // Update agent count from registry prefix scan.
-    let count = handles_from_prefix(keys::pub_agent_reg_prefix()).len() as u64;
-    let _ = user_set(keys::pub_meta_count(), count.to_string().as_bytes());
-
-    crate::registry::update_tag_counts(&[], &agent.tags);
 
     let agent_json = format_agent(&agent);
 

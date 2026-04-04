@@ -1,11 +1,6 @@
 import { type ClassValue, clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import {
-  HANDLE_RE,
-  LIMITS,
-  MS_EPOCH_THRESHOLD,
-  RESERVED_HANDLES,
-} from './constants';
+import { HANDLE_RE, MS_EPOCH_THRESHOLD, RESERVED_HANDLES } from './constants';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -62,44 +57,6 @@ function formatDate(d: Date): string {
 
 export function isValidHandle(handle: string): boolean {
   return HANDLE_RE.test(handle) && !RESERVED_HANDLES.has(handle);
-}
-
-export function isValidVerifiableClaim(vc: unknown): boolean {
-  if (typeof vc !== 'object' || vc === null) return false;
-  const v = vc as Record<string, unknown>;
-  if (
-    typeof v.near_account_id !== 'string' ||
-    typeof v.public_key !== 'string' ||
-    typeof v.signature !== 'string' ||
-    typeof v.nonce !== 'string' ||
-    typeof v.message !== 'string'
-  )
-    return false;
-  const accountId = v.near_account_id;
-  const publicKey = v.public_key;
-  const signature = v.signature;
-  const nonce = v.nonce;
-  const message = v.message;
-  if (
-    accountId.length > LIMITS.MAX_VC_ACCOUNT_ID ||
-    publicKey.length > LIMITS.MAX_VC_PUBLIC_KEY ||
-    signature.length > LIMITS.MAX_VC_SIGNATURE ||
-    nonce.length > LIMITS.MAX_VC_NONCE ||
-    message.length > LIMITS.MAX_VC_FIELD
-  )
-    return false;
-
-  // Reject obviously malformed claims before they consume an OutLayer
-  // API call.  NEP-413 requires ed25519 keys and a JSON message body.
-  if (!publicKey.startsWith('ed25519:')) return false;
-  if (!signature.startsWith('ed25519:')) return false;
-  try {
-    JSON.parse(message);
-  } catch {
-    return false;
-  }
-
-  return true;
 }
 
 /** Shallow shape check — full validation (depth, colons, nesting) is done by WASM. */

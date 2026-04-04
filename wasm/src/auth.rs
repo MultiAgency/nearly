@@ -9,29 +9,6 @@ use outlayer::env;
 /// Nonce GC fires when `nonce_byte % GC_SAMPLE_DIVISOR < 1`, i.e. ~2% of calls.
 const GC_SAMPLE_DIVISOR: u8 = 50;
 
-/// Project owner from outlayer.toml — used as the default admin account
-/// when `OUTLAYER_ADMIN_ACCOUNT` env var is not set in the TEE.
-const PROJECT_OWNER: &str = "hack.near";
-
-/// Verify that the caller is the admin account.
-///
-/// Checks `OUTLAYER_ADMIN_ACCOUNT` env var first (allows override via
-/// OutLayer secrets), then falls back to the compile-time project owner.
-pub(crate) fn require_admin(caller: &str) -> Result<(), Response> {
-    let env_admin = std::env::var("OUTLAYER_ADMIN_ACCOUNT")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let admin = env_admin.as_deref().unwrap_or(PROJECT_OWNER);
-    if caller == admin {
-        Ok(())
-    } else {
-        Err(err_coded(
-            "AUTH_FAILED",
-            "Unauthorized: admin access required",
-        ))
-    }
-}
-
 /// Extract the NEAR account from a payment-key signer.
 /// Payment keys: `owner.near:nonce:secret` → `owner.near`.
 fn extract_owner(signer: &str) -> Option<&str> {
@@ -133,24 +110,10 @@ pub(crate) fn get_caller_from(req: &Request) -> Result<String, Response> {
         NONCE_TTL_SECS > nep413::TIMESTAMP_WINDOW_MS / 1000,
         "NONCE_TTL must exceed timestamp window"
     );
-    // Nonces use user-scoped storage (not worker-private) so that
-    // `set_if_absent` can use the host-level atomic primitive. This
-    // guarantees replay protection even if OutLayer runs concurrent
-    // executions for the same project. Nonce values are timestamps,
-    // not sensitive — user visibility is acceptable.
-    // See also: `prune_nonce_index` which reads/deletes from user scope.
     let nonce_key = keys::nonce(&auth.nonce);
     match set_if_absent(&nonce_key, &now.to_string()) {
         Ok(true) => {
             let _ = index_append(keys::nonce_idx(), &nonce_key);
-            // Probabilistic nonce GC: ~2% of auth calls.
-            // Decode first raw nonce byte (uniform 0-255) for unbiased sampling.
-            //
-            // Fallback 0 on decode failure is intentional: 0 % GC_SAMPLE_DIVISOR
-            // == 0 < 1 is true, so GC runs unconditionally — the safe direction
-            // (more cleanup, never less). A decode failure here would be
-            // surprising since verify_auth already accepted the nonce, but is
-            // not worth rejecting the request over.
             let gc_sample =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &auth.nonce)
                     .ok()

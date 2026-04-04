@@ -119,37 +119,38 @@ fn all_reserved_handles_rejected() {
 }
 
 #[test]
-fn all_action_variants_deserialize_from_snake_case() {
-    let actions = [
-        "register",
+fn active_actions_deserialize_to_named_variants() {
+    assert_eq!(
+        serde_json::from_str::<Action>(r#""register""#).unwrap(),
+        Action::Register,
+    );
+    assert_eq!(
+        serde_json::from_str::<Action>(r#""get_vrf_seed""#).unwrap(),
+        Action::GetVrfSeed,
+    );
+}
+
+#[test]
+fn migrated_actions_deserialize_to_other() {
+    for action_str in &[
         "get_me",
         "update_me",
-        "get_suggested",
         "follow",
         "unfollow",
         "heartbeat",
-        "get_activity",
-        "get_network",
-        "get_notifications",
-        "read_notifications",
         "endorse",
         "unendorse",
         "deregister",
-        "migrate_account",
-        "set_platforms",
-        "reconcile_all",
-        "admin_deregister",
-    ];
-    for action_str in &actions {
+    ] {
         let json = format!(r#""{action_str}""#);
-        let result: Result<Action, _> = serde_json::from_str(&json);
-        assert!(result.is_ok(), "Failed to deserialize action: {action_str}");
+        let result: Action = serde_json::from_str(&json)
+            .unwrap_or_else(|_| panic!("Failed to deserialize: {action_str}"));
+        assert_eq!(
+            result,
+            Action::Other,
+            "{action_str} should deserialize to Other"
+        );
     }
-    assert_eq!(
-        actions.len(),
-        18,
-        "Action count mismatch — did you add a new action?"
-    );
 }
 
 #[test]

@@ -401,14 +401,13 @@ async function persistPlatformResults(
  * then persists succeeded platform IDs via the admin-only set_platforms action.
  */
 export async function handleRegisterPlatforms(
-  authKey: string,
+  walletKey: string,
   wasmBody: Record<string, unknown>,
-  userAuthKey: string | undefined,
 ): Promise<NextResponse> {
   // 1. Load agent profile
   const { response: meResult } = await callOutlayer(
     { action: 'get_me' },
-    authKey,
+    walletKey,
   );
   if (meResult.status !== 200) {
     return NextResponse.json(
@@ -450,7 +449,7 @@ export async function handleRegisterPlatforms(
         ? agent.capabilities
         : undefined,
     },
-    userAuthKey,
+    walletKey,
   );
   const { platforms, warnings } = await tryPlatformRegistrations(
     ctx,
@@ -466,10 +465,10 @@ export async function handleRegisterPlatforms(
   // with the snapshot from step 1, and the last writer would overwrite the
   // first writer's newly-registered platforms (classic lost-update race).
   let bestAgent: Record<string, unknown> = agent;
-  if (succeeded.length > 0 && userAuthKey) {
+  if (succeeded.length > 0 && walletKey) {
     const { response: freshResult } = await callOutlayer(
       { action: 'get_me' },
-      authKey,
+      walletKey,
     );
     if (freshResult.status === 200) {
       const freshData: Record<string, unknown> = await freshResult.json();

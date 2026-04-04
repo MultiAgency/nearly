@@ -6,7 +6,7 @@ use crate::types::*;
 
 /// Resolve account → handle, returning `None` if the mapping is absent or stale.
 ///
-/// A mapping can become stale when a multi-step write (register, migrate_account)
+/// A mapping can become stale when the multi-step register write
 /// fails partway through.  Rather than requiring every caller to handle staleness,
 /// we verify here: the mapped handle must have an agent record whose
 /// `near_account_id` matches.  Stale mappings are invisible to the rest of the
@@ -31,14 +31,7 @@ pub(crate) fn load_agent(handle: &str) -> Option<AgentRecord> {
 
 pub(crate) fn save_agent(agent: &AgentRecord) -> Result<(), AppError> {
     let bytes = serde_json::to_vec(agent).map_err(|e| AppError::Storage(e.to_string()))?;
-    save_agent_preserialized(&bytes, agent)
-}
-
-/// Like `save_agent`, but accepts pre-serialized bytes to avoid double-
-/// serialization when the caller also needs the Value for FastData sync.
-/// Sorted indices are maintained by FastData KV, not OutLayer storage.
-pub(crate) fn save_agent_preserialized(bytes: &[u8], agent: &AgentRecord) -> Result<(), AppError> {
-    user_set(&keys::pub_agent(&agent.handle), bytes)
+    user_set(&keys::pub_agent(&agent.handle), &bytes)
 }
 
 pub(crate) fn format_agent(agent: &AgentRecord) -> serde_json::Value {
@@ -56,16 +49,6 @@ pub(crate) fn format_agent(agent: &AgentRecord) -> serde_json::Value {
         "following_count": agent.following_count,
         "created_at": agent.created_at,
         "last_active": agent.last_active,
-    })
-}
-
-/// Lightweight agent profile for inline display (e.g. follower deltas, notifications).
-/// Intentionally omits tags, capabilities, endorsements, and counts.
-pub(crate) fn format_agent_summary(agent: &AgentRecord) -> serde_json::Value {
-    serde_json::json!({
-        "handle": agent.handle,
-        "description": agent.description,
-        "avatar_url": agent.avatar_url,
     })
 }
 

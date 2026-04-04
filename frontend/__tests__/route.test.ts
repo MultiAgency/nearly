@@ -3,7 +3,7 @@
  */
 
 import { NextRequest } from 'next/server';
-import { setupFetchMock, TEST_AUTH } from './fixtures';
+import { setupFetchMock } from './fixtures';
 
 const mockCallOutlayer = jest.fn();
 jest.mock('@/lib/outlayer-server', () => ({
@@ -15,8 +15,10 @@ jest.mock('@/lib/outlayer-server', () => ({
 }));
 
 const mockDispatchFastData = jest.fn();
+const mockHandleGetSuggested = jest.fn();
 jest.mock('@/lib/fastdata-dispatch', () => ({
   dispatchFastData: (...args: unknown[]) => mockDispatchFastData(...args),
+  handleGetSuggested: (...args: unknown[]) => mockHandleGetSuggested(...args),
 }));
 
 jest.mock('@/lib/fastdata-sync', () => ({
@@ -84,6 +86,7 @@ beforeEach(() => {
     decoded: { success: true, data: {} },
   });
   mockDispatchFastData.mockResolvedValue({ data: {} });
+  mockHandleGetSuggested.mockResolvedValue({ data: [] });
   mockDispatchDirectWrite.mockResolvedValue({ success: true, data: {} });
   // Authenticated GETs resolve caller handle via kvGetAgent(accountId, 'name').
   // resolveAccountId is mocked via mintClaimForWalletKey returning null,
@@ -180,8 +183,6 @@ describe('route resolution', () => {
     ['POST', 'agents/me/heartbeat', 'heartbeat'],
     ['GET', 'agents/me/activity', 'get_activity'],
     ['GET', 'agents/me/network', 'get_network'],
-    ['GET', 'agents/me/notifications', 'get_notifications'],
-    ['POST', 'agents/me/notifications/read', 'read_notifications'],
     ['GET', 'agents/alice', 'get_profile'],
     ['POST', 'agents/alice/follow', 'follow'],
     ['DELETE', 'agents/alice/follow', 'unfollow'],
@@ -202,21 +203,40 @@ describe('route resolution', () => {
     };
     const isPublic = PUBLIC_ACTIONS.has(expectedAction);
     if (!isPublic) {
-      headers['x-payment-key'] = 'test.near:1:secret';
+      headers.authorization = 'Bearer wk_test';
     }
 
     const [req, params] = makeRequest(method, path, undefined, headers);
     await handler(req, params);
 
-    if (isPublic || method === 'GET') {
+    const DIRECT_WRITE_ACTIONS = new Set([
+      'follow',
+      'unfollow',
+      'endorse',
+      'unendorse',
+      'update_me',
+      'heartbeat',
+      'deregister',
+    ]);
+
+    if (expectedAction === 'get_suggested') {
+      // get_suggested uses handleGetSuggested, not dispatchFastData.
+      expect(mockHandleGetSuggested).toHaveBeenCalledTimes(1);
+    } else if (isPublic || method === 'GET') {
       // Public reads and authenticated GETs both go through FastData.
       expect(mockDispatchFastData).toHaveBeenCalledTimes(1);
       expect(mockDispatchFastData.mock.calls[0][0]).toBe(expectedAction);
-    } else {
+    } else if (DIRECT_WRITE_ACTIONS.has(expectedAction)) {
+      expect(mockDispatchDirectWrite).toHaveBeenCalledTimes(1);
+      expect(mockDispatchDirectWrite.mock.calls[0][0]).toBe(expectedAction);
+      expect(mockCallOutlayer).not.toHaveBeenCalled();
+    } else if (expectedAction === 'register') {
       expect(mockCallOutlayer).toHaveBeenCalledTimes(1);
       const wasmBody = mockCallOutlayer.mock.calls[0][0];
       expect(wasmBody.action).toBe(expectedAction);
     }
+    // Other POST actions (e.g. register_platforms) are handled by
+    // dedicated proxy paths, not callOutlayer.
   });
 
   it('returns 404 for unknown routes', async () => {
@@ -285,7 +305,7 @@ describe('injection prevention', () => {
       'POST',
       'agents/register',
       { action: 'get_me', handle: 'alice' },
-      { 'x-payment-key': 'pk_user' },
+      { authorization: 'Bearer wk_test' },
     );
     await POST(req, params);
 
@@ -298,12 +318,12 @@ describe('injection prevention', () => {
       'POST',
       'agents/alice/follow',
       { handle: 'mallory' },
-      { 'x-payment-key': 'pk_user' },
+      { authorization: 'Bearer wk_test' },
     );
     await POST(req, params);
 
-    const wasmBody = mockCallOutlayer.mock.calls[0][0];
-    expect(wasmBody.handle).toBe('alice');
+    expect(mockDispatchDirectWrite).toHaveBeenCalledTimes(1);
+    expect(mockDispatchDirectWrite.mock.calls[0][1].handle).toBe('alice');
   });
 
   it('sanitizePublic strips verifiable_claim and unknown fields on public reads', async () => {
@@ -345,17 +365,6 @@ describe('auth dispatch', () => {
     expect(mockCallOutlayer).not.toHaveBeenCalled();
   });
 
-  it('x-payment-key header dispatches authenticated GET to FastData', async () => {
-    const [req, params] = makeRequest('GET', 'agents/me', undefined, {
-      'x-payment-key': 'owner.near:1:secret',
-    });
-    await GET(req, params);
-
-    // Authenticated GETs go through FastData, not WASM.
-    expect(mockDispatchFastData).toHaveBeenCalledTimes(1);
-    expect(mockCallOutlayer).not.toHaveBeenCalled();
-  });
-
   it('Authorization: Bearer wk_ dispatches authenticated GET to FastData', async () => {
     const [req, params] = makeRequest('GET', 'agents/me', undefined, {
       authorization: 'Bearer wk_test1234abcdef',
@@ -366,18 +375,7 @@ describe('auth dispatch', () => {
     expect(mockCallOutlayer).not.toHaveBeenCalled();
   });
 
-  it('x-payment-key takes precedence over Authorization: Bearer', async () => {
-    const [req, params] = makeRequest('GET', 'agents/me', undefined, {
-      'x-payment-key': 'owner.near:1:secret',
-      authorization: 'Bearer wk_test1234abcdef',
-    });
-    await GET(req, params);
-
-    expect(mockDispatchFastData).toHaveBeenCalledTimes(1);
-    expect(mockCallOutlayer).not.toHaveBeenCalled();
-  });
-
-  it('ignores non-wk_ bearer tokens', async () => {
+  it('ignores non-wk_ and non-near: bearer tokens', async () => {
     const [req, params] = makeRequest('GET', 'agents/me', undefined, {
       authorization: 'Bearer some_other_token',
     });
@@ -386,7 +384,67 @@ describe('auth dispatch', () => {
     expect(mockCallOutlayer).not.toHaveBeenCalled();
   });
 
-  it('body verifiable_claim uses env payment key', async () => {
+  it('Bearer near: token dispatches authenticated GET to FastData', async () => {
+    const token = Buffer.from(
+      JSON.stringify({
+        account_id: 'test.near',
+        seed: 'my-seed',
+        pubkey: 'ed25519:abc',
+        timestamp: Date.now(),
+        signature: 'sig',
+      }),
+    )
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const [req, params] = makeRequest('GET', 'agents/me', undefined, {
+      authorization: `Bearer near:${token}`,
+    });
+    await GET(req, params);
+
+    expect(mockDispatchFastData).toHaveBeenCalledTimes(1);
+    expect(mockCallOutlayer).not.toHaveBeenCalled();
+  });
+
+  it('Bearer near: token does NOT dispatch direct writes (wk_-only for mutations)', async () => {
+    const token = Buffer.from(
+      JSON.stringify({
+        account_id: 'test.near',
+        seed: 'my-seed',
+        pubkey: 'ed25519:abc',
+        timestamp: Date.now(),
+        signature: 'sig',
+      }),
+    )
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const [req, params] = makeRequest(
+      'POST',
+      'agents/alice/follow',
+      {},
+      { authorization: `Bearer near:${token}` },
+    );
+    const res = await POST(req, params);
+
+    // near: tokens are not accepted for mutations — FastData writes require wk_
+    expect(mockDispatchDirectWrite).not.toHaveBeenCalled();
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects malformed near: token', async () => {
+    const [req, params] = makeRequest('GET', 'agents/me', undefined, {
+      authorization: 'Bearer near:not-valid-base64!!!',
+    });
+    const res = await GET(req, params);
+    expect(res.status).toBe(401);
+  });
+
+  it('verifiable_claim without wk_ key returns 401 for non-register mutations', async () => {
     const claim = {
       near_account_id: 'alice.near',
       public_key: 'ed25519:abc',
@@ -398,41 +456,12 @@ describe('auth dispatch', () => {
     const [req, params] = makeRequest('POST', 'agents/me/heartbeat', {
       verifiable_claim: claim,
     });
-    await POST(req, params);
-
-    const wasmBody = mockCallOutlayer.mock.calls[0][0];
-    expect(wasmBody.verifiable_claim).toEqual(claim);
-    const paymentKey = mockCallOutlayer.mock.calls[0][1];
-    expect(paymentKey).toBe('pk_test');
-  });
-
-  it('rejects malformed verifiable_claim (missing fields)', async () => {
-    const claim = { near_account_id: 'alice.near', signature: 'sig' };
-    const [req, params] = makeRequest('POST', 'agents/me/heartbeat', {
-      verifiable_claim: claim,
-    });
     const res = await POST(req, params);
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(401);
     expect(mockCallOutlayer).not.toHaveBeenCalled();
   });
 
-  it('rejects verifiable_claim with wrong field types', async () => {
-    const claim = {
-      near_account_id: 123,
-      public_key: 'ed25519:abc',
-      signature: 'ed25519:sig',
-      nonce: 'bm9uY2U=',
-      message: '{}',
-    };
-    const [req, params] = makeRequest('POST', 'agents/me/heartbeat', {
-      verifiable_claim: claim,
-    });
-    const res = await POST(req, params);
-    expect(res.status).toBe(400);
-    expect(mockCallOutlayer).not.toHaveBeenCalled();
-  });
-
-  it('rejects register_platforms with verifiable_claim (multi-step needs reusable key)', async () => {
+  it('rejects register_platforms with verifiable_claim (requires wk_ key)', async () => {
     const claim = {
       near_account_id: 'alice.near',
       public_key: 'ed25519:abc',
@@ -444,9 +473,7 @@ describe('auth dispatch', () => {
       verifiable_claim: claim,
     });
     const res = await POST(req, params);
-    const body = await json(res);
     expect(res.status).toBe(401);
-    expect(body.error).toMatch(/wallet key/i);
     expect(mockCallOutlayer).not.toHaveBeenCalled();
   });
 
@@ -467,9 +494,6 @@ describe('CORS', () => {
     expect(res.headers.get('Access-Control-Allow-Headers')).toContain(
       'Authorization',
     );
-    expect(res.headers.get('Access-Control-Allow-Headers')).toContain(
-      'X-Payment-Key',
-    );
   });
 
   it('handles OPTIONS preflight', () => {
@@ -488,7 +512,7 @@ describe('error handling', () => {
       method: 'POST',
       body: largeBody,
       headers: {
-        'x-payment-key': 'pk_user',
+        authorization: 'Bearer wk_test_key',
         'content-type': 'application/json',
       },
     });
@@ -507,7 +531,7 @@ describe('error handling', () => {
       method: 'POST',
       body: 'not json{{{',
       headers: {
-        'x-payment-key': 'pk_user',
+        authorization: 'Bearer wk_test_key',
         'content-type': 'application/json',
       },
     });
@@ -554,8 +578,8 @@ describe('platform auto-registration on register (background)', () => {
     const [req, params] = makeRequest(
       'POST',
       'agents/register',
-      { handle: 'my_bot', tags: ['ai'], verifiable_claim: TEST_AUTH },
-      { 'x-payment-key': 'pk_user' },
+      { handle: 'my_bot', tags: ['ai'] },
+      { authorization: 'Bearer wk_test_key' },
     );
     const res = await POST(req, params);
     const body = await json(res);
@@ -652,20 +676,21 @@ describe('direct write dispatch for wk_ keys', () => {
     expect(mockCallOutlayer).not.toHaveBeenCalled();
   });
 
-  it('payment key still goes through callOutlayer for follow', async () => {
+  it('x-payment-key without wk_ returns 401 for follow', async () => {
     const [req, params] = makeRequest(
       'POST',
       'agents/alice/follow',
       {},
       { 'x-payment-key': 'owner.near:1:secret' },
     );
-    await POST(req, params);
+    const res = await POST(req, params);
 
-    expect(mockCallOutlayer).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(401);
+    expect(mockCallOutlayer).not.toHaveBeenCalled();
     expect(mockDispatchDirectWrite).not.toHaveBeenCalled();
   });
 
-  it('verifiable_claim still goes through callOutlayer', async () => {
+  it('verifiable_claim without wk_ returns 401 for heartbeat', async () => {
     const claim = {
       near_account_id: 'alice.near',
       public_key: 'ed25519:abc',
@@ -677,9 +702,10 @@ describe('direct write dispatch for wk_ keys', () => {
     const [req, params] = makeRequest('POST', 'agents/me/heartbeat', {
       verifiable_claim: claim,
     });
-    await POST(req, params);
+    const res = await POST(req, params);
 
-    expect(mockCallOutlayer).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(401);
+    expect(mockCallOutlayer).not.toHaveBeenCalled();
     expect(mockDispatchDirectWrite).not.toHaveBeenCalled();
   });
 

@@ -18,7 +18,33 @@
 
 import type { Agent } from '@/types';
 import { FASTDATA_NAMESPACE, OUTLAYER_API_URL } from './constants';
+import type { KvEntry } from './fastdata';
 import { fetchWithTimeout } from './fetch';
+
+/**
+ * Build endorsement counts from cross-predecessor endorsement entries.
+ * Takes entries from kvListAll(`endorsing/${handle}/`) and returns
+ * {ns: {value: endorser_count}} — the live endorsement structure.
+ */
+export function buildEndorsementCounts(
+  entries: KvEntry[],
+  handle: string,
+): Record<string, Record<string, number>> {
+  const counts: Record<string, Record<string, number>> = {};
+  const prefix = `endorsing/${handle}/`;
+  for (const e of entries) {
+    const suffix = e.key.startsWith(prefix)
+      ? e.key.slice(prefix.length)
+      : e.key;
+    const slash = suffix.indexOf('/');
+    if (slash < 0) continue;
+    const ns = suffix.slice(0, slash);
+    const value = suffix.slice(slash + 1);
+    if (!counts[ns]) counts[ns] = {};
+    counts[ns][value] = (counts[ns][value] ?? 0) + 1;
+  }
+  return counts;
+}
 
 /** Compute endorsement total from nested {ns: {val: count}} structure. */
 function endorsementTotal(

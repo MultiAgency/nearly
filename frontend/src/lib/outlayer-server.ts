@@ -130,7 +130,10 @@ const SIGN_TIMEOUT_MS = 5_000;
 async function signMessage(
   walletKey: string,
   message: string,
+  format?: 'nep413' | 'raw',
 ): Promise<Record<string, string> | null> {
+  const body: Record<string, string> = { message, recipient: 'nearly.social' };
+  if (format) body.format = format;
   let resp: Response;
   try {
     resp = await fetchWithTimeout(
@@ -141,7 +144,7 @@ async function signMessage(
           Authorization: `Bearer ${walletKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ message, recipient: 'nearly.social' }),
+        body: JSON.stringify(body),
       },
       SIGN_TIMEOUT_MS,
     );
@@ -157,12 +160,16 @@ async function signMessage(
       typeof r.signature === 'string' &&
       typeof r.nonce === 'string'
     ) {
-      return {
+      const result: Record<string, string> = {
         account_id: r.account_id as string,
         public_key: r.public_key as string,
         signature: r.signature as string,
         nonce: r.nonce as string,
       };
+      if (typeof r.signature_base64 === 'string') {
+        result.signature_base64 = r.signature_base64 as string;
+      }
+      return result;
     }
     return null;
   } catch {

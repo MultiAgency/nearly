@@ -112,15 +112,6 @@ describe('contract: heartbeat', () => {
         new_followers_count: 1,
         new_following_count: 0,
         profile_completeness: 60,
-        notifications: [
-          {
-            type: 'follow',
-            from: 'alice',
-            is_mutual: false,
-            at: 1700001000,
-            read: false,
-          },
-        ],
       },
       suggested_action: {
         action: 'get_suggested',
@@ -132,7 +123,6 @@ describe('contract: heartbeat', () => {
 
     expect(result).toBeDefined();
     expect(result.delta.new_followers_count).toBe(1);
-    expect(result.delta.notifications).toHaveLength(1);
     expect(result.suggested_action.action).toBe('get_suggested');
   });
 });
@@ -181,14 +171,19 @@ describe('contract: getSuggested', () => {
           reason: 'Shared tags: ai',
         },
       ],
-      vrf: { output: 'abcdef', proof: '012345', alpha: 'suggestions' },
+      vrf: {
+        output_hex: 'abcdef',
+        signature_hex: '012345',
+        alpha: 'suggestions',
+        vrf_public_key: 'pk1',
+      },
     });
 
     const result = await api.getSuggested(5);
 
     expect(result.vrf).toBeDefined();
-    expect(result.vrf!.output).toBe('abcdef');
-    expect(result.vrf!.proof).toBe('012345');
+    expect(result.vrf!.output_hex).toBe('abcdef');
+    expect(result.vrf!.signature_hex).toBe('012345');
   });
 });
 
@@ -315,40 +310,6 @@ describe('contract: getActivity summaries always include description', () => {
 });
 
 // ---------------------------------------------------------------------------
-// getNotifications: Notification.read is always boolean (required)
-// ---------------------------------------------------------------------------
-describe('contract: notification read is always boolean', () => {
-  it('should have read as required boolean on every notification', async () => {
-    mockSuccess({
-      notifications: [
-        {
-          type: 'follow',
-          from: 'alice',
-          is_mutual: false,
-          at: 1700001000,
-          read: true,
-        },
-        {
-          type: 'endorse',
-          from: 'bob',
-          is_mutual: false,
-          at: 1700002000,
-          read: false,
-          detail: { tags: ['ai'] },
-        },
-      ],
-      unread_count: 1,
-    });
-
-    const result = await api.getNotifications();
-
-    for (const notif of result.notifications) {
-      expect(typeof notif.read).toBe('boolean');
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
 // endorse/unendorse: return types include warnings
 // ---------------------------------------------------------------------------
 describe('contract: endorseAgent includes warnings', () => {
@@ -402,27 +363,6 @@ describe('contract: deregister', () => {
     expect(result.action).toBe('deregistered');
     expect(result.handle).toBe('test_bot');
     expect(result.warnings).toEqual(['failed to update follower some_bot']);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// migrateAccount: returns action, agent, old_account, new_account
-// ---------------------------------------------------------------------------
-describe('contract: migrateAccount', () => {
-  it('should return full migration response', async () => {
-    mockSuccess({
-      action: 'migrated',
-      agent: { ...STUB_AGENT, near_account_id: 'new.near' },
-      old_account: 'test.near',
-      new_account: 'new.near',
-    });
-
-    const result = await api.migrateAccount('new.near');
-
-    expect(result.action).toBe('migrated');
-    expect(result.agent.near_account_id).toBe('new.near');
-    expect(result.old_account).toBe('test.near');
-    expect(result.new_account).toBe('new.near');
   });
 });
 
@@ -557,19 +497,6 @@ describe('contract: getNetwork', () => {
 });
 
 // ---------------------------------------------------------------------------
-// readNotifications: read_at timestamp
-// ---------------------------------------------------------------------------
-describe('contract: readNotifications', () => {
-  it('should return read_at timestamp', async () => {
-    mockSuccess({ read_at: 1700005000 });
-
-    const result = await api.readNotifications();
-
-    expect(result.read_at).toBe(1700005000);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // getEndorsers: nested endorsers map
 // ---------------------------------------------------------------------------
 describe('contract: getEndorsers', () => {
@@ -646,13 +573,10 @@ describe('contract errors: AUTH_REQUIRED (no API key)', () => {
     ['heartbeat', () => api.heartbeat()],
     ['register', () => api.register({ handle: 'new_bot' })],
     ['deregister', () => api.deregister()],
-    ['migrateAccount', () => api.migrateAccount('new.near')],
     ['followAgent', () => api.followAgent('test_bot')],
     ['unfollowAgent', () => api.unfollowAgent('test_bot')],
     ['endorseAgent', () => api.endorseAgent('test_bot', { tags: ['ai'] })],
     ['unendorseAgent', () => api.unendorseAgent('test_bot', { tags: ['ai'] })],
-    ['getNotifications', () => api.getNotifications()],
-    ['readNotifications', () => api.readNotifications()],
     ['getActivity', () => api.getActivity()],
     ['getNetwork', () => api.getNetwork()],
     ['getSuggested', () => api.getSuggested()],

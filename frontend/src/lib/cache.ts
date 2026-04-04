@@ -75,7 +75,6 @@ const INVALIDATION_MAP: Record<string, string[]> = {
   endorse: ['list_agents', 'get_profile', 'get_endorsers'],
   unendorse: ['list_agents', 'get_profile', 'get_endorsers'],
   heartbeat: ['list_agents', 'get_profile'],
-  migrate_account: ['get_profile'],
   deregister: [
     'list_agents',
     'list_tags',

@@ -7,7 +7,11 @@ import {
 } from '@/lib/cache';
 import { LIMITS } from '@/lib/constants';
 import { kvGetAgent } from '@/lib/fastdata';
-import { dispatchFastData } from '@/lib/fastdata-dispatch';
+import {
+  dispatchFastData,
+  handleGetSuggested,
+  type VrfProof,
+} from '@/lib/fastdata-dispatch';
 import { buildSyncEntries, syncToFastData } from '@/lib/fastdata-sync';
 import {
   dispatchDirectWrite,
@@ -25,40 +29,47 @@ import {
   PLATFORM_META,
   tryPlatformRegistrationsOnRegister,
 } from '@/lib/platforms';
-import {
-  CACHE_BUSTING_ACTIONS,
-  PUBLIC_ACTIONS,
-  type ResolvedRoute,
-  resolveRoute,
-} from '@/lib/routes';
-import { isValidVerifiableClaim } from '@/lib/utils';
+import { PUBLIC_ACTIONS, type ResolvedRoute, resolveRoute } from '@/lib/routes';
 
 /**
- * Resolve the caller's handle from auth credentials.
- * wk_ key → account ID (via OutLayer) → handle (via FastData name key).
- * verifiable_claim → account ID (from claim) → handle (via FastData name key).
+ * Decode a Bearer near:<base64url> token into its constituent fields.
+ * Returns null if the token is not a valid near: token.
  */
-async function resolveCallerHandle(
-  userAuthKey: string | undefined,
-  wasmBody: Record<string, unknown>,
-): Promise<string | null> {
-  let accountId: string | null = null;
-
-  if (userAuthKey?.startsWith('wk_')) {
-    accountId = await resolveAccountId(userAuthKey);
-  } else if (userAuthKey?.includes(':')) {
-    // Payment key format: owner.near:nonce:secret
-    accountId = userAuthKey.split(':')[0] || null;
-  } else if (wasmBody.verifiable_claim) {
-    const claim = wasmBody.verifiable_claim as Record<string, unknown>;
-    accountId = (claim.near_account_id as string) ?? null;
+function decodeNearToken(
+  token: string,
+): { account_id: string; seed: string } | null {
+  if (!token.startsWith('near:')) return null;
+  try {
+    const b64 = token.slice(5).replace(/-/g, '+').replace(/_/g, '/');
+    const json = atob(b64);
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    if (
+      typeof parsed.account_id === 'string' &&
+      typeof parsed.seed === 'string'
+    ) {
+      return {
+        account_id: parsed.account_id as string,
+        seed: parsed.seed as string,
+      };
+    }
+    return null;
+  } catch {
+    return null;
   }
+}
 
+/**
+ * Resolve the caller's handle from an auth token.
+ * wk_ key → account ID (via OutLayer sign-message) → handle (via FastData).
+ * near: token → account ID (decoded from token) → handle (via FastData).
+ */
+async function resolveCallerHandle(authKey: string): Promise<string | null> {
+  const nearToken = decodeNearToken(authKey);
+  const accountId = nearToken
+    ? nearToken.account_id
+    : await resolveAccountId(authKey);
   if (!accountId) return null;
-
-  // Look up handle from FastData name key.
-  const handle = (await kvGetAgent(accountId, 'name')) as string | null;
-  return handle;
+  return (await kvGetAgent(accountId, 'name')) as string | null;
 }
 
 const INT_FIELDS = new Set(['limit']);
@@ -80,7 +91,7 @@ const DIRECT_WRITE_ACTIONS = new Set([
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Payment-Key',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Access-Control-Max-Age': '86400',
 };
 
@@ -151,11 +162,10 @@ async function dispatch(
 
   const isPublic = PUBLIC_ACTIONS.has(route.action);
 
-  const paymentKey = request.headers.get('x-payment-key');
-  const bearerToken = request.headers
-    .get('authorization')
-    ?.match(/^Bearer\s+(wk_[A-Za-z0-9_-]+)$/)?.[1];
-  const userAuthKey = paymentKey || bearerToken;
+  const authHeader = request.headers.get('authorization');
+  const userAuthKey =
+    authHeader?.match(/^Bearer\s+(wk_[A-Za-z0-9_-]+)$/)?.[1] ??
+    authHeader?.match(/^Bearer\s+(near:[A-Za-z0-9_+/=-]+)$/)?.[1];
 
   let wasmBody: Record<string, unknown>;
 
@@ -257,7 +267,9 @@ async function dispatchAuthenticated(
   wasmBody: Record<string, unknown>,
   userAuthKey: string | undefined,
 ): Promise<NextResponse> {
-  // Direct write path for wk_ keys — bypasses WASM and auto-sign entirely.
+  // Direct write path — bypasses WASM and auto-sign entirely.
+  // Requires wk_ custody wallet key (FastData writes go through /wallet/v1/call
+  // which signs inside the TEE — near: token support is unconfirmed for writes).
   if (
     userAuthKey?.startsWith('wk_') &&
     DIRECT_WRITE_ACTIONS.has(route.action)
@@ -369,135 +381,136 @@ async function dispatchAuthenticated(
     return applyHeaders(NextResponse.json(errBody, { status: result.status }));
   }
 
-  let authKey = userAuthKey;
-
-  // Auto-sign for trial wallet keys: when a wk_ key is provided without a
-  // verifiable_claim, mint one by calling OutLayer's free sign-message
-  // endpoint, inject it into the WASM body, and switch to the server payment
-  // key so the WASM falls through to NEP-413 verification for correct
-  // identity resolution.  This is transparent to the caller.
-  if (
-    authKey?.startsWith('wk_') &&
-    !wasmBody.verifiable_claim &&
-    route.action !== 'register_platforms'
-  ) {
-    const claim = await mintClaimForWalletKey(authKey, route.action);
-    if (claim) {
-      wasmBody.verifiable_claim = {
-        near_account_id: claim.near_account_id,
-        public_key: claim.public_key,
-        signature: claim.signature,
-        nonce: claim.nonce,
-        message: claim.message,
-      };
-      const serverKey = getOutlayerPaymentKey();
-      if (serverKey) authKey = serverKey;
-    }
-    // If minting fails, fall through with the original wk_ key —
-    // the WASM will resolve "trial" and return NOT_REGISTERED, which
-    // is a clearer signal than a proxy error.
+  if (!userAuthKey) {
+    console.warn(`[auth] 401 ${request.method} ${route.action}`);
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          'Authentication required. Provide Authorization: Bearer wk_... or Bearer near:<token>',
+        code: 'AUTH_REQUIRED',
+      },
+      { status: 401 },
+    );
   }
 
-  if (!authKey && wasmBody.verifiable_claim) {
-    if (!isValidVerifiableClaim(wasmBody.verifiable_claim)) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: 'Invalid verifiable_claim structure',
-          code: 'VALIDATION_ERROR',
-        },
-        { status: 400 },
+  // Authenticated reads go through FastData.
+  if (request.method === 'GET') {
+    const handle = await resolveCallerHandle(userAuthKey);
+    if (!handle) {
+      return applyHeaders(
+        NextResponse.json(
+          { success: false, error: 'Agent not found', code: 'NOT_FOUND' },
+          { status: 404 },
+        ),
       );
     }
-    const serverKey = getOutlayerPaymentKey();
-    if (!serverKey) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: 'API not configured',
-          code: 'INTERNAL_ERROR',
-        },
-        { status: 503 },
-      );
-    }
-    authKey = serverKey;
-  }
 
-  if (authKey) {
-    // All authenticated reads go through FastData — no WASM fallback.
-    if (request.method === 'GET' && userAuthKey) {
-      const handle = await resolveCallerHandle(userAuthKey, wasmBody);
-      if (!handle) {
-        return applyHeaders(
-          NextResponse.json(
-            { success: false, error: 'Agent not found', code: 'NOT_FOUND' },
-            { status: 404 },
-          ),
+    // get_suggested: fetch VRF seed from WASM TEE, then rank deterministically.
+    if (route.action === 'get_suggested') {
+      let vrfProof: VrfProof | null = null;
+      const claim = await mintClaimForWalletKey(userAuthKey, 'get_vrf_seed');
+      if (claim) {
+        const serverKey = getOutlayerPaymentKey();
+        const { decoded } = await callOutlayer(
+          {
+            action: 'get_vrf_seed',
+            verifiable_claim: {
+              near_account_id: claim.near_account_id,
+              public_key: claim.public_key,
+              signature: claim.signature,
+              nonce: claim.nonce,
+              message: claim.message,
+            },
+          },
+          serverKey || userAuthKey,
         );
+        if (decoded?.success) {
+          const d = decoded.data as Record<string, string>;
+          vrfProof = {
+            output_hex: d.output_hex,
+            signature_hex: d.signature_hex,
+            alpha: d.alpha,
+            vrf_public_key: d.vrf_public_key,
+          };
+        }
       }
-      const fdResult = await dispatchFastData(route.action, {
-        ...wasmBody,
-        handle,
-      });
+      const fdResult = await handleGetSuggested(
+        { ...wasmBody, handle },
+        vrfProof,
+      );
       if ('error' in fdResult) {
         return applyHeaders(
           NextResponse.json(
-            {
-              success: false,
-              error: (fdResult as { error: string }).error,
-              code: 'NOT_FOUND',
-            },
-            { status: (fdResult as { status?: number }).status ?? 404 },
+            { success: false, error: fdResult.error, code: 'NOT_FOUND' },
+            { status: fdResult.status ?? 404 },
           ),
         );
       }
-      const data = { success: true, data: fdResult.data };
-      setCache(route.action, makeCacheKey({ ...wasmBody, handle }), data);
-      return applyHeaders(NextResponse.json(data));
+      return applyHeaders(
+        NextResponse.json({ success: true, data: fdResult.data }),
+      );
     }
 
-    // Platform registration is handled entirely by the proxy and requires
-    // multiple WASM calls (get_me → external APIs → set_platforms).  A
-    // verifiable_claim is single-use (nonce replay protection), so it cannot
-    // authenticate the additional calls.  Require a reusable credential.
-    if (route.action === 'register_platforms') {
-      if (!userAuthKey) {
-        return NextResponse.json(
+    const fdResult = await dispatchFastData(route.action, {
+      ...wasmBody,
+      handle,
+    });
+    if ('error' in fdResult) {
+      return applyHeaders(
+        NextResponse.json(
           {
             success: false,
-            error:
-              'Platform registration requires a wallet key (Authorization: Bearer wk_...) or payment key (X-Payment-Key). Verifiable claims cannot be used for this multi-step endpoint.',
-            code: 'AUTH_REQUIRED',
+            error: (fdResult as { error: string }).error,
+            code: 'NOT_FOUND',
           },
-          { status: 401 },
-        );
+          { status: (fdResult as { status?: number }).status ?? 404 },
+        ),
+      );
+    }
+    const data = { success: true, data: fdResult.data };
+    setCache(route.action, makeCacheKey({ ...wasmBody, handle }), data);
+    return applyHeaders(NextResponse.json(data));
+  }
+
+  // Platform registration — handled entirely by the proxy.
+  if (route.action === 'register_platforms') {
+    return handleRegisterPlatforms(userAuthKey, wasmBody);
+  }
+
+  // Registration — the only action that goes through WASM.
+  if (route.action === 'register') {
+    // Auto-sign: mint a verifiable_claim from the wk_ key so the WASM
+    // can verify identity via NEP-413. Switch to the server payment key
+    // so OutLayer charges the project, not the trial wallet.
+    let authKey: string = userAuthKey;
+    if (!wasmBody.verifiable_claim) {
+      const claim = await mintClaimForWalletKey(userAuthKey, 'register');
+      if (claim) {
+        wasmBody.verifiable_claim = {
+          near_account_id: claim.near_account_id,
+          public_key: claim.public_key,
+          signature: claim.signature,
+          nonce: claim.nonce,
+          message: claim.message,
+        };
+        const serverKey = getOutlayerPaymentKey();
+        if (serverKey) authKey = serverKey;
       }
-      return handleRegisterPlatforms(authKey, wasmBody, userAuthKey);
     }
 
     const { response: result, decoded } = await callOutlayer(wasmBody, authKey);
 
-    if (CACHE_BUSTING_ACTIONS.has(route.action) && result.status === 200) {
-      invalidateForMutation(route.action);
-    }
-
-    // Fire-and-forget FastData KV sync via agent's custody wallet.
-    if (
-      decoded?.success &&
-      userAuthKey?.startsWith('wk_') &&
-      CACHE_BUSTING_ACTIONS.has(route.action)
-    ) {
+    // Sync registration data to FastData.
+    if (decoded?.success) {
       const entries = buildSyncEntries(
-        route.action,
+        'register',
         decoded.data as Record<string, unknown>,
       );
       if (entries) syncToFastData(userAuthKey, entries);
-    }
+      invalidateForMutation('register');
 
-    if (route.action === 'register' && result.status === 200) {
-      // Fire platform registrations in the background — don't block the
-      // registration response.  Agents can call POST /agents/me/platforms
-      // later to retrieve platform credentials.
+      // Fire platform registrations in the background.
       tryPlatformRegistrationsOnRegister(
         wasmBody,
         new NextResponse(result.clone().body, result),
@@ -508,15 +521,36 @@ async function dispatchAuthenticated(
     return result;
   }
 
-  console.warn(`[auth] 401 ${request.method} ${route.action}`);
-  return NextResponse.json(
-    {
-      success: false,
-      error:
-        'Authentication required. Provide Authorization: Bearer wk_... or X-Payment-Key header, or verifiable_claim in body.',
-      code: 'AUTH_REQUIRED',
-    },
-    { status: 401 },
+  // near: token attempting a mutation — reject with actionable guidance.
+  if (
+    userAuthKey?.startsWith('near:') &&
+    DIRECT_WRITE_ACTIONS.has(route.action)
+  ) {
+    return applyHeaders(
+      NextResponse.json(
+        {
+          success: false,
+          error:
+            'Mutations require a wk_ custody wallet key. Bearer near: tokens are read-only. Register a wallet via POST /register to get a wk_ key.',
+          code: 'AUTH_REQUIRED',
+        },
+        { status: 401 },
+      ),
+    );
+  }
+
+  // All other authenticated POST/PATCH/DELETE mutations go through
+  // direct FastData writes (handled above via DIRECT_WRITE_ACTIONS).
+  // If we reach here, the action is not recognized.
+  return applyHeaders(
+    NextResponse.json(
+      {
+        success: false,
+        error: `Unknown action: ${route.action}`,
+        code: 'NOT_FOUND',
+      },
+      { status: 404 },
+    ),
   );
 }
 

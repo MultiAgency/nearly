@@ -37,13 +37,6 @@ fn test_request(action: Action) -> Request {
         tags: None,
         capabilities: None,
         verifiable_claim: None,
-        limit: None,
-        cursor: None,
-        sort: None,
-        direction: None,
-        tag: None,
-        include_history: None,
-        platforms: None,
     }
 }
 
@@ -67,22 +60,6 @@ impl RequestBuilder {
     }
     fn tags(mut self, t: &[&str]) -> Self {
         self.req.tags = Some(t.iter().map(std::string::ToString::to_string).collect());
-        self
-    }
-    fn capabilities(mut self, c: serde_json::Value) -> Self {
-        self.req.capabilities = Some(c);
-        self
-    }
-    fn avatar_url(mut self, url: &str) -> Self {
-        self.req.avatar_url = Some(Some(url.into()));
-        self
-    }
-    fn clear_avatar(mut self) -> Self {
-        self.req.avatar_url = Some(None);
-        self
-    }
-    fn platforms(mut self, p: Vec<String>) -> Self {
-        self.req.platforms = Some(p);
         self
     }
     fn build(self) -> Request {
@@ -119,6 +96,5 @@ fn teardown_nep413() {
 }
 
 mod auth;
-mod graph;
 mod registration;
 mod validation;

@@ -6,7 +6,7 @@
 //! and is TOCTOU-safe regardless of execution model.
 //!
 //! Auxiliary index operations (`index_append`, `prune_nonce_index`) on non-pub keys
-//! (nonce_idx, notif_idx) are read-modify-write
+//! (nonce_idx) are read-modify-write
 //! cycles that are **not** atomic at the storage layer.  Correctness depends on
 //! OutLayer serialising WASM executions per project.  If OutLayer ever allows
 //! parallel execution, these auxiliary RMW operations must be replaced with
@@ -31,7 +31,7 @@ pub(crate) mod test_backend {
     use std::collections::HashMap;
 
     thread_local! {
-        /// Worker-scoped storage (auxiliary indices: notifications, rate limits, etc.).
+        /// Worker-scoped storage (auxiliary indices: nonce index).
         static STORE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
         /// User-scoped storage (all pub: keys, atomic counters, nonces).
         static USER_STORE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
@@ -138,19 +138,6 @@ pub(crate) mod test_backend {
         Ok(())
     }
 
-    pub fn user_list_keys(prefix: &str) -> Result<Vec<String>, outlayer::storage::StorageError> {
-        Ok(USER_STORE.with(|s| {
-            let store = s.borrow();
-            let mut keys: Vec<String> = store
-                .keys()
-                .filter(|k| k.starts_with(prefix))
-                .cloned()
-                .collect();
-            keys.sort();
-            keys
-        }))
-    }
-
     // Wrappers matching outlayer::storage names so cfg-aliased `backend` works.
     pub fn set(key: &str, value: &[u8]) -> Result<(), outlayer::storage::StorageError> {
         user_set(key, value)
@@ -164,9 +151,6 @@ pub(crate) mod test_backend {
     pub fn set_if_absent(key: &str, value: &[u8]) -> Result<bool, outlayer::storage::StorageError> {
         user_set_if_absent(key, value)
     }
-    pub fn list_keys(prefix: &str) -> Result<Vec<String>, outlayer::storage::StorageError> {
-        user_list_keys(prefix)
-    }
 }
 
 /// Storage key schema (all colon-delimited):
@@ -174,8 +158,6 @@ pub(crate) mod test_backend {
 /// User-scoped (pub: prefix — atomic, TOCTOU-safe):
 ///   pub:agent:{handle}                            — full AgentRecord JSON
 ///   pub:agent_reg:{handle}                        — registry marker (value = "1")
-///   pub:meta:agent_count                          — total registered agents
-///   pub:tag_counts                                — HashMap<tag, count> JSON
 ///   pub:near:{account_id}                         — account → handle mapping
 ///       Can become stale after partial failures; `agent_handle_for_account()`
 ///       verifies the agent record before returning, so stale mappings are
@@ -184,9 +166,6 @@ pub(crate) mod test_backend {
 /// Worker-scoped (auxiliary, RMW — requires serialised execution):
 ///   nonce:{nonce_val}          — replay-protection marker (user-scoped atomic)
 ///   nonce_idx                  — JSON array of active nonce keys
-///   notif_idx:{handle}         — JSON array of notification keys
-///   notif_read:{handle}        — last-read timestamp
-///   rate:{action}:{caller}     — rate-limit window:count
 pub mod keys {
     pub fn pub_agent(handle: &str) -> String {
         format!("pub:agent:{handle}")
@@ -194,29 +173,7 @@ pub mod keys {
     pub fn pub_agent_reg(handle: &str) -> String {
         format!("pub:agent_reg:{handle}")
     }
-    pub fn pub_agent_reg_prefix() -> &'static str {
-        "pub:agent_reg:"
-    }
 
-    #[cfg(test)]
-    pub fn pub_follower(target: &str, follower: &str) -> String {
-        format!("pub:follower:{target}:{follower}")
-    }
-    #[cfg(test)]
-    pub fn pub_follower_prefix(handle: &str) -> String {
-        format!("pub:follower:{handle}:")
-    }
-    #[cfg(test)]
-    pub fn pub_edge(from: &str, to: &str) -> String {
-        format!("pub:edge:{from}:follows:{to}")
-    }
-
-    pub fn pub_meta_count() -> &'static str {
-        "pub:meta:agent_count"
-    }
-    pub fn pub_tag_counts() -> &'static str {
-        "pub:tag_counts"
-    }
     pub fn near_account(account_id: &str) -> String {
         format!("pub:near:{account_id}")
     }
@@ -227,15 +184,6 @@ pub mod keys {
     pub fn nonce_idx() -> &'static str {
         "nonce_idx"
     }
-    pub fn notif_idx(handle: &str) -> String {
-        format!("notif_idx:{handle}")
-    }
-    pub fn notif_read(handle: &str) -> String {
-        format!("notif_read:{handle}")
-    }
-    pub fn rate(action: &str, caller: &str) -> String {
-        format!("rate:{action}:{caller}")
-    }
 }
 
 fn backend_set(key: &str, val: &[u8]) -> Result<(), AppError> {
@@ -244,10 +192,6 @@ fn backend_set(key: &str, val: &[u8]) -> Result<(), AppError> {
 
 fn backend_get(key: &str) -> Result<Option<Vec<u8>>, AppError> {
     backend::get_worker(key).map_err(|e| AppError::Storage(e.to_string()))
-}
-
-pub(crate) fn set_string(key: &str, val: &str) -> Result<(), AppError> {
-    backend_set(key, val.as_bytes())
 }
 
 /// Scope-routed read: `pub:` keys read from user scope, others from worker scope.
@@ -265,10 +209,6 @@ fn read_scoped(key: &str) -> Option<Vec<u8>> {
     }
 }
 
-pub(crate) fn get_string(key: &str) -> Option<String> {
-    read_scoped(key).and_then(|b| String::from_utf8(b).ok())
-}
-
 /// Read from user-scoped storage (used for nonce replay markers).
 pub(crate) fn get_user_string(key: &str) -> Option<String> {
     backend::get(key)
@@ -283,32 +223,22 @@ pub(crate) fn delete_user(key: &str) {
     backend::delete(key);
 }
 
-pub(crate) fn set_json<T: Serialize>(key: &str, val: &T) -> Result<(), AppError> {
+fn set_json<T: Serialize>(key: &str, val: &T) -> Result<(), AppError> {
     let bytes = serde_json::to_vec(val).map_err(|e| AppError::Storage(e.to_string()))?;
     backend_set(key, &bytes)
 }
 
-pub(crate) fn get_json<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
+fn get_json<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
     read_scoped(key).and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-/// Write to public storage. Now routes to user scope for all pub: keys.
-pub(crate) fn set_public(key: &str, val: &[u8]) -> Result<(), AppError> {
-    user_set(key, val)
-}
-
 /// Atomic set-if-absent using user-scoped storage.
-///
-/// Nonce keys are replay markers (not sensitive data), so user-scoped
-/// storage is appropriate. The host-level `backend::set_if_absent` is
-/// atomic — no TOCTOU race regardless of whether OutLayer serialises
-/// WASM executions per project.
 pub(crate) fn set_if_absent(key: &str, val: &str) -> Result<bool, AppError> {
     backend::set_if_absent(key, val.as_bytes()).map_err(|e| AppError::Storage(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
-// User-scoped storage primitives (individual keys, atomic counters)
+// User-scoped storage primitives
 // ---------------------------------------------------------------------------
 
 pub(crate) fn user_set(key: &str, val: &[u8]) -> Result<(), AppError> {
@@ -327,26 +257,7 @@ pub(crate) fn user_get_json<T: serde::de::DeserializeOwned>(key: &str) -> Option
         .and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-/// List all user-scope keys matching a prefix (sorted).
-pub(crate) fn user_list(prefix: &str) -> Vec<String> {
-    backend::list_keys(prefix).unwrap_or_default()
-}
-
-/// Extract the last `:` segment from a key (the handle/id stored as suffix).
-pub(crate) fn key_suffix(key: &str) -> &str {
-    key.rsplit(':').next().unwrap_or(key)
-}
-
-/// List user-scope keys by prefix and extract the suffix of each as a handle.
-pub(crate) fn handles_from_prefix(prefix: &str) -> Vec<String> {
-    user_list(prefix)
-        .iter()
-        .map(|k| key_suffix(k).to_string())
-        .collect()
-}
-
 /// Write a JSON index to worker-scope storage.
-/// Only used for auxiliary (non-pub) indices: nonce_idx, notif_idx.
 fn write_index<T: Serialize>(key: &str, val: &T) -> Result<(), AppError> {
     debug_assert!(
         !key.starts_with("pub:"),
@@ -356,13 +267,11 @@ fn write_index<T: Serialize>(key: &str, val: &T) -> Result<(), AppError> {
     backend_set(key, &bytes)
 }
 
-pub(crate) fn index_list(key: &str) -> Vec<String> {
+fn index_list(key: &str) -> Vec<String> {
     get_json::<Vec<String>>(key).unwrap_or_default()
 }
 
 /// Idempotent append: adds `entry` to the end of the index if not already present.
-/// Preserves insertion order (used for followers, following, endorsers, etc.).
-/// Do not mix with `index_insert_sorted` on the same key — they assume different orderings.
 pub(crate) fn index_append(key: &str, entry: &str) -> Result<(), AppError> {
     let mut idx = index_list(key);
     if !idx.iter().any(|e| e == entry) {
@@ -373,7 +282,6 @@ pub(crate) fn index_append(key: &str, entry: &str) -> Result<(), AppError> {
 }
 
 pub(crate) fn now_secs() -> Result<u64, AppError> {
-    // NEAR mode: use block timestamp (deterministic, on-chain)
     if let Some(ns) = std::env::var("NEAR_BLOCK_TIMESTAMP")
         .ok()
         .filter(|s| !s.is_empty())
@@ -381,77 +289,14 @@ pub(crate) fn now_secs() -> Result<u64, AppError> {
     {
         return Ok(ns / NANOS_PER_SEC);
     }
-    // HTTPS mode (and tests): use system time.
-    // OutLayer runs on wasmtime which provides wasi:clocks/wall-clock to all
-    // WASI P1/P2 guests. Confirmed by: stdin/stdout work (same WASI tier),
-    // NEAR_MAX_EXECUTION_SECONDS implies host tracks wall time, and this path
-    // has been exercised since initial deployment with no failure.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| AppError::Clock)
 }
 
-#[cfg(test)]
-pub(crate) fn edge_timestamp(val: &str) -> Option<u64> {
-    if let Ok(ts) = val.parse::<u64>() {
-        return Some(ts);
-    }
-    serde_json::from_str::<serde_json::Value>(val)
-        .ok()
-        .and_then(|v| v.get("ts")?.as_u64())
-}
-
-fn rate_count(action: &str, caller: &str, window_secs: u64) -> Result<(u64, u64, u32), AppError> {
-    debug_assert!(window_secs > 0, "rate window must be nonzero");
-    let now = now_secs()?;
-    let window = now / window_secs;
-    let key = keys::rate(action, caller);
-    let count = get_string(&key)
-        .and_then(|s| {
-            let (w, c) = s.split_once(':')?;
-            if w.parse::<u64>().ok()? == window {
-                c.parse().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-    Ok((now, window, count))
-}
-
-pub(crate) fn check_rate_limit(
-    action: &str,
-    caller: &str,
-    limit: u32,
-    window_secs: u64,
-) -> Result<(), AppError> {
-    let (now, window, count) = rate_count(action, caller, window_secs)?;
-    if count >= limit {
-        let retry_after = (window + 1) * window_secs - now;
-        return Err(AppError::RateLimit(
-            format!("Rate limit exceeded: {limit} {action} requests per {window_secs}s"),
-            retry_after,
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn increment_rate_limit(action: &str, caller: &str, window_secs: u64) {
-    if let Ok((_now, window, count)) = rate_count(action, caller, window_secs) {
-        let _ = set_string(
-            &keys::rate(action, caller),
-            &format!("{window}:{}", count.saturating_add(1)),
-        );
-    }
-}
-
-pub(crate) fn prune_index_with(
-    index_key: &str,
-    cutoff: u64,
-    extract_ts: impl Fn(&str) -> Option<u64>,
-    delete_fn: impl Fn(&str),
-) -> Result<(), AppError> {
+/// Prune expired nonce keys from the nonce index.
+pub(crate) fn prune_nonce_index(index_key: &str, cutoff: u64) -> Result<(), AppError> {
     let keys: Vec<String> = get_json(index_key).unwrap_or_default();
     if keys.is_empty() {
         return Ok(());
@@ -459,7 +304,11 @@ pub(crate) fn prune_index_with(
     let mut retained = Vec::new();
     let mut expired = Vec::new();
     for key in keys {
-        if extract_ts(&key).map(|ts| ts < cutoff).unwrap_or(false) {
+        let is_expired = get_user_string(&key)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|ts| ts < cutoff)
+            .unwrap_or(false);
+        if is_expired {
             expired.push(key);
         } else {
             retained.push(key);
@@ -468,45 +317,8 @@ pub(crate) fn prune_index_with(
     if !expired.is_empty() {
         set_json(index_key, &retained)?;
         for key in &expired {
-            delete_fn(key);
+            delete_user(key);
         }
     }
     Ok(())
-}
-
-/// Prune expired nonce keys from the nonce index.
-///
-/// Reads/deletes nonce values from user-scoped storage
-/// (where `set_if_absent` writes them atomically).
-pub(crate) fn prune_nonce_index(index_key: &str, cutoff: u64) -> Result<(), AppError> {
-    prune_index_with(
-        index_key,
-        cutoff,
-        |key| get_user_string(key).and_then(|v| v.parse::<u64>().ok()),
-        delete_user,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Notification storage: query existing notifications.
-// ---------------------------------------------------------------------------
-
-fn load_notif_index(handle: &str) -> Vec<String> {
-    get_json::<Vec<String>>(&keys::notif_idx(handle)).unwrap_or_default()
-}
-
-pub(crate) fn load_notifications_since(handle: &str, since: u64) -> Vec<serde_json::Value> {
-    load_notif_index(handle)
-        .iter()
-        .filter_map(|key| {
-            let val = get_string(key)?;
-            let parsed: serde_json::Value = serde_json::from_str(&val).ok()?;
-            let at = parsed.get("at")?.as_u64()?;
-            if at > since {
-                Some(parsed)
-            } else {
-                None
-            }
-        })
-        .collect()
 }

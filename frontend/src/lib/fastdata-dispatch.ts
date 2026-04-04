@@ -22,7 +22,11 @@ import {
   kvMultiAgent,
   resolveHandle,
 } from './fastdata';
-import { extractCapabilityPairs, profileCompleteness } from './fastdata-sync';
+import {
+  buildEndorsementCounts,
+  extractCapabilityPairs,
+  profileCompleteness,
+} from './fastdata-sync';
 
 export type FastDataError = { error: string; status?: number };
 type FastDataResult = { data: unknown } | FastDataError;
@@ -90,7 +94,7 @@ export async function dispatchFastData(
       case 'get_me':
         return await handleGetMe(body);
       case 'get_suggested':
-        return await handleGetSuggested(body);
+        return await handleGetSuggested(body, null);
       case 'get_edges':
         return await handleGetEdges(body);
       case 'get_endorsers':
@@ -141,6 +145,11 @@ async function handleGetProfile(
   if (!accountId) return { error: 'Agent not found', status: 404 };
   const agent = (await kvGetAgent(accountId, 'profile')) as Agent | null;
   if (!agent) return { error: 'Agent not found', status: 404 };
+
+  // Live endorsement counts from graph (not stale profile data)
+  const endorseEntries = await kvListAll(`endorsing/${handle}/`);
+  agent.endorsements = buildEndorsementCounts(endorseEntries, handle);
+
   return { data: { agent } };
 }
 
@@ -301,6 +310,10 @@ async function handleGetMe(
   const agent = (await kvGetAgent(accountId, 'profile')) as Agent | null;
   if (!agent) return { error: 'Agent not found', status: 404 };
 
+  // Live endorsement counts from graph (not stale profile data)
+  const endorseEntries = await kvListAll(`endorsing/${handle}/`);
+  agent.endorsements = buildEndorsementCounts(endorseEntries, handle);
+
   return {
     data: {
       agent,
@@ -312,8 +325,41 @@ async function handleGetMe(
   };
 }
 
-async function handleGetSuggested(
+// ---------------------------------------------------------------------------
+// VRF-seeded suggestion ranking
+// ---------------------------------------------------------------------------
+
+export interface VrfProof {
+  output_hex: string;
+  signature_hex: string;
+  alpha: string;
+  vrf_public_key: string;
+}
+
+/** Deterministic xorshift32 PRNG seeded from VRF output bytes. */
+function makeRng(hex: string) {
+  let state = 0;
+  for (let i = 0; i < Math.min(hex.length, 8); i += 2) {
+    state ^= Number.parseInt(hex.slice(i, i + 2), 16) << ((i / 2) * 8);
+  }
+  if (state === 0) state = 1;
+  state = state >>> 0; // ensure unsigned 32-bit
+
+  return {
+    pick(n: number): number | null {
+      if (n === 0) return null;
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      state = state >>> 0;
+      return state % n;
+    },
+  };
+}
+
+export async function handleGetSuggested(
   body: Record<string, unknown>,
+  vrfProof: VrfProof | null,
 ): Promise<FastDataResult> {
   const handle = handleOf(body);
   if (!handle) return { error: 'Handle is required', status: 400 };
@@ -322,65 +368,77 @@ async function handleGetSuggested(
   const accountId = await resolveHandle(handle);
   if (!accountId) return { error: 'Agent not found', status: 404 };
 
-  // 1. Read caller's profile for tags.
-  const callerAgent = (await kvGetAgent(accountId, 'profile')) as Agent | null;
+  // Caller context.
+  const [callerAgent, followEntries] = await Promise.all([
+    kvGetAgent(accountId, 'profile') as Promise<Agent | null>,
+    kvListAgent(accountId, 'graph/follow/'),
+  ]);
   const callerTags = new Set(callerAgent?.tags ?? []);
-
-  // 2. Read caller's follow list to exclude.
-  const followEntries = await kvListAgent(accountId, 'graph/follow/');
   const followSet = new Set(
     followEntries.map((e) => e.key.replace('graph/follow/', '')),
   );
-  followSet.add(handle); // exclude self
+  followSet.add(handle);
 
-  // 3. Read all agents by follower count.
+  // Candidates: top agents by follower count, excluding already-followed.
   const allScored = await kvGetAll('sorted/followers');
-  const candidates = allScored
-    .filter(() => {
-      // Filter happens after profile fetch (need handle to check followSet).
-      return true;
-    })
-    .sort(
-      (a, b) =>
-        ((b.value as Record<string, number>)?.score ?? 0) -
-        ((a.value as Record<string, number>)?.score ?? 0),
-    )
-    .slice(0, limit * 5); // fetch extra for filtering
-
-  // 4. Batch-fetch profiles.
-  const profiles = await kvMultiAgent(
-    candidates.map((c) => ({ accountId: c.predecessor_id, key: 'profile' })),
+  allScored.sort(
+    (a, b) =>
+      ((b.value as Record<string, number>)?.score ?? 0) -
+      ((a.value as Record<string, number>)?.score ?? 0),
+  );
+  const profiles = (await kvMultiAgent(
+    allScored
+      .slice(0, limit * 5)
+      .map((c) => ({ accountId: c.predecessor_id, key: 'profile' })),
+  )) as (Agent | null)[];
+  const candidates = profiles.filter(
+    (a): a is Agent => a !== null && !followSet.has(a.handle),
   );
 
-  // 5. Filter and score.
-  const suggestions: Record<string, unknown>[] = [];
-  for (let i = 0; i < profiles.length && suggestions.length < limit; i++) {
-    const agent = profiles[i] as Agent | null;
-    if (!agent) continue;
-    if (followSet.has(agent.handle)) continue;
+  // Score each candidate: shared tags first, then follower count.
+  const scored = candidates.map((agent) => {
+    const shared = agent.tags?.filter((t) => callerTags.has(t)) ?? [];
+    return {
+      agent,
+      shared,
+      score: shared.length * 1000 + agent.follower_count,
+    };
+  });
+  scored.sort((a, b) => b.score - a.score);
 
-    const sharedTags = agent.tags?.filter((t) => callerTags.has(t)) ?? [];
-    let reason: string;
-    if (sharedTags.length > 0) {
-      reason = `Shared tags: ${sharedTags.join(', ')}`;
-    } else if (agent.follower_count > 0) {
-      reason = 'Popular on the network';
-    } else {
-      reason = 'New on the network';
+  // VRF shuffle within equal-score tiers for fairness.
+  if (vrfProof) {
+    const rng = makeRng(vrfProof.output_hex);
+    let i = 0;
+    while (i < scored.length) {
+      const tierScore = scored[i].score;
+      const start = i;
+      while (i < scored.length && scored[i].score === tierScore) i++;
+      // Fisher-Yates shuffle within the tier.
+      for (let j = i - 1; j > start; j--) {
+        const k = rng.pick(j - start + 1);
+        if (k !== null) {
+          [scored[start + k], scored[j]] = [scored[j], scored[start + k]];
+        }
+      }
     }
-    suggestions.push({
-      ...agent,
-      follow_url: `/api/v1/agents/${agent.handle}/follow`,
-      reason,
-    });
   }
 
-  return {
-    data: {
-      agents: suggestions,
-      vrf: null,
-    },
-  };
+  const agents = scored.slice(0, limit).map((s) => {
+    const reason =
+      s.shared.length > 0
+        ? `Shared tags: ${s.shared.join(', ')}`
+        : s.agent.follower_count > 0
+          ? 'Popular on the network'
+          : 'New on the network';
+    return {
+      ...s.agent,
+      follow_url: `/api/v1/agents/${s.agent.handle}/follow`,
+      reason,
+    };
+  });
+
+  return { data: { agents, vrf: vrfProof } };
 }
 
 // ---------------------------------------------------------------------------
@@ -608,12 +666,13 @@ async function handleGetNetwork(
   const accountId = await resolveHandle(handle);
   if (!accountId) return { error: 'Agent not found', status: 404 };
 
-  const agent = (await kvGetAgent(accountId, 'profile')) as Agent | null;
+  // Profile + graph data in parallel.
+  const [agent, followerEntries, followingEntries] = await Promise.all([
+    kvGetAgent(accountId, 'profile') as Promise<Agent | null>,
+    kvGetAll(`graph/follow/${handle}`),
+    kvListAgent(accountId, 'graph/follow/'),
+  ]);
   if (!agent) return { error: 'Agent not found', status: 404 };
-
-  // Live counts from graph data
-  const followerEntries = await kvGetAll(`graph/follow/${handle}`);
-  const followingEntries = await kvListAgent(accountId, 'graph/follow/');
 
   const followerAccounts = new Set(
     followerEntries.map((e) => e.predecessor_id),

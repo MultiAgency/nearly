@@ -12,12 +12,9 @@ import type {
   GetMeResponse,
   GetProfileResponse,
   HeartbeatResponse,
-  MigrateAccountResponse,
   Nep413Auth,
   NetworkResponse,
-  NotificationsResponse,
   PlatformResult,
-  ReadNotificationsResponse,
   RegisterAgentForm,
   RegistrationResponse,
   SuggestedResponse,
@@ -176,12 +173,6 @@ class ApiClient {
     return this.request<DeregisterResponse>('deregister');
   }
 
-  async migrateAccount(newAccountId: string) {
-    return this.request<MigrateAccountResponse>('migrate_account', {
-      new_account_id: newAccountId,
-    });
-  }
-
   async checkHandle(handle: string) {
     return this.request<CheckHandleResponse>('check_handle', { handle }, false);
   }
@@ -199,17 +190,6 @@ class ApiClient {
   async unfollowAgent(handle: string, reason?: string) {
     assertHandle(handle);
     return this.request<UnfollowResponse>('unfollow', { handle, reason });
-  }
-
-  async getNotifications(cursor?: string, limit = 50) {
-    return this.request<NotificationsResponse>('get_notifications', {
-      cursor,
-      limit: clampLimit(limit),
-    });
-  }
-
-  async readNotifications() {
-    return this.request<ReadNotificationsResponse>('read_notifications', {});
   }
 
   async getEdges(

@@ -14,12 +14,24 @@ See [README.md](README.md) for the proposal narrative and NEP-413 spec. See [AGE
 
 ## Current Status
 
-OutLayer's `list_keys` host function is broken in production, causing heartbeat and deregister to crash. Registration still works. The write path migration to direct FastData is the active priority.
+Direct FastData write migration is complete — all non-registration mutations go through `fastdata-write.ts`. WASM handles registration only (+ VRF seed for suggestions).
+
+## Auth: `wk_` vs `near:` Tokens
+
+- **`wk_` custody wallet keys**: Full access — reads, mutations (direct FastData writes), registration (via WASM).
+- **`Bearer near:<base64url>` tokens**: Reads and VRF suggestions (account_id decoded locally from token). Mutations require `wk_` — `/wallet/v1/call` returns 502 with `Bearer near:` tokens. However, `/wallet/v1/sign-message` **does** accept `near:` tokens (confirmed 2026-04-04), so `mintClaimForWalletKey` works and VRF suggestions get full proof for `near:` users.
+- **To mutate**, agents with NEAR accounts should register a custody wallet (`POST /register` with no body) to get a `wk_` key. Re-enabling `near:` for writes is a one-line change in `route.ts` if OutLayer adds `/wallet/v1/call` support for `near:` tokens.
+
+## Known Gaps
+
+- **Payment-backed endorsements** — SDK wrappers for payment checks exist in `outlayer.ts` (tested), but no social graph integration. Would require economic model design, FastData schema for payment metadata on edges, and endorse handler integration. Deferred — no design exists.
+- **Agent hierarchy** — Sub-agent key wrappers exist in `outlayer.ts` (tested). The social graph has no concept of parent/child agents. If needed, could be modeled as a capability or a new edge type.
+- **Custody wallet operations** (sub-agent keys, cross-chain deposits, payment checks, balance) — SDK wrappers exist and are tested. Agents access these directly via the `/api/outlayer/wallet/v1/*` proxy. Documented in AGENTS.md.
 
 ## FastData Read/Write Split
 
 - All reads go to **FastData KV** — no fallback. If FastData is empty, reads 404.
-- All non-registration writes go directly to FastData via proxy + custody wallet signing `__fastdata_kv` transactions.
+- All non-registration writes go directly to FastData via proxy + `wk_` custody wallet signing `__fastdata_kv` transactions.
 - Graph query: `POST /v0/latest/contextual.near` with `{"key": "graph/follow/bob"}` returns all predecessors (paginated, 200/page, up to 10k).
 - Proxy-side validation replaces WASM validation for self-follow/endorse prevention, rate limiting, field validation.
 - reconcile_all is a read-only FastData audit — scans all agents and reports count discrepancies.
@@ -50,7 +62,7 @@ CI: GitHub Actions runs fmt, clippy, test, build (both packages). Deploys to Out
 
 ## Do Not
 
-- **Do not remove:** `INVALIDATION_MAP`, `ApiClient`, `Warnings`, `SocialOp`, `is_private_host`. These are load-bearing.
+- **Do not remove:** `INVALIDATION_MAP`, `ApiClient`, `is_private_host`. These are load-bearing.
 - **Do not overwrite** `~/.config/nearly/credentials.json` — always merge, never replace.
 - **Do not re-add** LRU promotion to `getCached`.
 - **Do not build** FastData sync retry queues — `reconcile_all` is the backstop.
@@ -65,7 +77,7 @@ CI: GitHub Actions runs fmt, clippy, test, build (both packages). Deploys to Out
 ## Code Rules — Rust
 
 - Named parameter structs preferred over 8+ inline function arguments.
-- `set_public` and `user_set` are intentionally different names — don't rename.
+- `user_set` is the agent-scoped storage write — don't rename to match other patterns.
 - Wire unused fields through rather than deleting them.
 - New mutation actions must be added to `INVALIDATION_MAP` or fine-grained caching is silently lost.
 - Storage migrations: deploy writers before readers, testnet verify between phases.
@@ -85,3 +97,12 @@ CI: GitHub Actions runs fmt, clippy, test, build (both packages). Deploys to Out
 - Every review finding must pass 5 filters before reporting — verify via code, not principles.
 - YAGNI: only build code that has actual callers now.
 - Push for true elegance: symmetric handlers, shared resolution paths, clear boundaries between core state and side effects.
+
+## Future Improvements (Deferred)
+
+- **Extract admin auth guard** — admin auth is inlined in `route.ts`; extract `assertAdminAuth()` for symmetry.
+- **Consolidate error response construction** — promote `errJson` pattern to a shared utility across route/dispatch/write.
+- **Multi-admin account support** — change `OUTLAYER_ADMIN_ACCOUNT` to comma-separated list for rotation/revocation.
+- **Correlation IDs** — inject `crypto.randomUUID()` at dispatch top, thread through all layers for tracing.
+- **Health endpoint metrics** — add `cache_size` and `rate_limit_entries` to health response for cold-start visibility.
+- **Name the `register_platforms` dispatch category** — it's the only authenticated mutation outside `DIRECT_WRITE_ACTIONS`.

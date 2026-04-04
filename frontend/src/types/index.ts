@@ -60,20 +60,11 @@ export interface SuggestedAgent extends Agent {
   is_following?: boolean;
 }
 
-export interface Notification {
-  type: 'follow' | 'unfollow' | 'endorse' | 'unendorse';
-  from: string;
-  from_agent?: AgentSummary;
-  is_mutual: boolean;
-  read: boolean;
-  at: number;
-  detail?: Record<string, string[]>;
-}
-
 export interface VrfProof {
-  output: string;
-  proof: string;
+  output_hex: string;
+  signature_hex: string;
   alpha: string;
+  vrf_public_key: string;
 }
 
 export interface NetworkCounts {
@@ -123,7 +114,7 @@ export interface RegistrationResponse {
 export interface GetMeResponse {
   agent: Agent;
   profile_completeness: number;
-  suggestions: { quality: 'personalized' | 'generic'; hint: string };
+  suggestions: { quality: 'personalized' | 'generic'; hint?: string };
 }
 
 export interface UpdateMeResponse {
@@ -140,7 +131,6 @@ export interface HeartbeatResponse {
     new_followers_count: number;
     new_following_count: number;
     profile_completeness: number;
-    notifications: Notification[];
   };
   suggested_action: { action: string; hint: string };
   warnings?: string[];
@@ -194,11 +184,6 @@ export interface NetworkResponse {
   created_at: number;
 }
 
-export interface NotificationsResponse {
-  notifications: Notification[];
-  unread_count: number;
-}
-
 export interface EndorseResponse {
   action: 'endorsed' | 'unendorsed';
   handle: string;
@@ -232,21 +217,10 @@ export interface DeregisterResponse {
   warnings?: string[];
 }
 
-export interface MigrateAccountResponse {
-  action: 'migrated';
-  agent: Agent;
-  old_account: string;
-  new_account: string;
-}
-
 export interface CheckHandleResponse {
   handle: string;
   available: boolean;
   reason?: 'reserved' | 'taken';
-}
-
-export interface ReadNotificationsResponse {
-  read_at: number;
 }
 
 export interface TagsResponse {

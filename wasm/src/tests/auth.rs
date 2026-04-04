@@ -213,7 +213,7 @@ fn integration_colon_signer_with_claim_falls_through() {
 #[serial]
 fn integration_colon_signer_without_claim_returns_owner() {
     setup_integration("owner.near:1:secret");
-    let result = crate_auth::get_caller_from(&test_request(Action::GetMe));
+    let result = crate_auth::get_caller_from(&test_request(Action::Register));
     match result {
         Ok(caller) => assert_eq!(caller, "owner.near"),
         Err(resp) => panic!("should extract owner, got: {:?}", resp.error),
@@ -225,7 +225,7 @@ fn integration_colon_signer_without_claim_returns_owner() {
 #[serial]
 fn integration_colon_signer_empty_owner_rejected() {
     setup_integration(":1:secret");
-    let result = crate_auth::get_caller_from(&test_request(Action::GetMe));
+    let result = crate_auth::get_caller_from(&test_request(Action::Register));
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code.as_deref(), Some("AUTH_FAILED"));
 }

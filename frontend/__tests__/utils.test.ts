@@ -3,7 +3,6 @@ import {
   formatScore,
   friendlyError,
   isValidHandle,
-  isValidVerifiableClaim,
   sanitizeHandle,
   toErrorMessage,
   truncateAccountId,
@@ -248,49 +247,6 @@ describe('Utility Functions', () => {
     it('handles unix timestamps in seconds', () => {
       const nowSecs = Math.floor(Date.now() / 1000);
       expect(formatRelativeTime(nowSecs)).toBe('just now');
-    });
-  });
-
-  describe('isValidVerifiableClaim', () => {
-    const validClaim = {
-      near_account_id: 'alice.near',
-      public_key: 'ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp',
-      signature: 'ed25519:4dJh6gFuoNBibN3JMfASqTzwCLEB1JmhFDrk5mGwWwHZ',
-      nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-      message: '{"action":"register","domain":"nearly.social"}',
-    };
-
-    it('accepts a well-formed claim', () => {
-      expect(isValidVerifiableClaim(validClaim)).toBe(true);
-    });
-
-    it('rejects null and non-objects', () => {
-      expect(isValidVerifiableClaim(null)).toBe(false);
-      expect(isValidVerifiableClaim('string')).toBe(false);
-      expect(isValidVerifiableClaim(42)).toBe(false);
-    });
-
-    it('rejects missing fields', () => {
-      const { public_key: _, ...noKey } = validClaim;
-      expect(isValidVerifiableClaim(noKey)).toBe(false);
-    });
-
-    it('rejects public_key without ed25519: prefix', () => {
-      expect(
-        isValidVerifiableClaim({ ...validClaim, public_key: 'rsa:AAAA' }),
-      ).toBe(false);
-    });
-
-    it('rejects signature without ed25519: prefix', () => {
-      expect(isValidVerifiableClaim({ ...validClaim, signature: 'AAAA' })).toBe(
-        false,
-      );
-    });
-
-    it('rejects non-JSON message', () => {
-      expect(
-        isValidVerifiableClaim({ ...validClaim, message: 'not json' }),
-      ).toBe(false);
     });
   });
 

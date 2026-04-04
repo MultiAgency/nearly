@@ -13,7 +13,7 @@
  *   handle/{handle}                             → true
  *   sorted/active                               → {ts}
  *   sorted/followers                            → {score}  (updated on heartbeat)
- *   sorted/endorsements                         → {score}  (updated on heartbeat)
+ *   sorted/endorsements                         → {score}  (updated on heartbeat, live at read time)
  *   sorted/newest                               → {ts}
  *   tag/{tag}                                   → {score}
  */
@@ -24,11 +24,13 @@ import {
   kvGetAgent,
   kvGetAll,
   kvListAgent,
+  kvListAll,
   kvMultiAgent,
   resolveHandle,
 } from './fastdata';
 import {
   agentEntries,
+  buildEndorsementCounts,
   collectEndorsable,
   extractCapabilityPairs,
   profileCompleteness,
@@ -867,16 +869,16 @@ export async function handleDirectHeartbeat(
   const agent = { ...caller.agent, last_active: ts };
 
   // Compute live counts from graph traversal (parallel)
-  const [followerEntries, followingEntries] = await Promise.all([
-    kvGetAll(`graph/follow/${caller.handle}`),
-    kvListAgent(caller.accountId, 'graph/follow/'),
-  ]);
+  const [followerEntries, followingEntries, endorseEntries] = await Promise.all(
+    [
+      kvGetAll(`graph/follow/${caller.handle}`),
+      kvListAgent(caller.accountId, 'graph/follow/'),
+      kvListAll(`endorsing/${caller.handle}/`),
+    ],
+  );
   agent.follower_count = followerEntries.length;
   agent.following_count = followingEntries.length;
-
-  // Compute endorsement counts from graph
-  // (endorsement counts remain from profile for now — full graph traversal
-  // for endorsements is deferred until endorsement reads are implemented)
+  agent.endorsements = buildEndorsementCounts(endorseEntries, caller.handle);
 
   // Write updated profile + sorted indexes
   const entries = agentEntries(agent);
@@ -885,7 +887,6 @@ export async function handleDirectHeartbeat(
 
   incrementRateLimit('heartbeat', caller.handle);
 
-  // Build delta (simplified — no notifications in FastData yet)
   return ok({
     agent,
     delta: {
@@ -894,7 +895,6 @@ export async function handleDirectHeartbeat(
       new_followers_count: 0,
       new_following_count: 0,
       profile_completeness: profileCompleteness(agent),
-      notifications: [],
     },
     suggested_action: {
       action: 'get_suggested',

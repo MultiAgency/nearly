@@ -384,41 +384,6 @@ describe('ApiClient', () => {
     });
   });
 
-  describe('getNotifications', () => {
-    it('sends GET with cursor and limit in query string', async () => {
-      mockSuccess({ notifications: [{ type: 'follow' }], unread_count: 1 });
-
-      const result = await api.getNotifications('1700000000', 20);
-      expect(result.notifications).toHaveLength(1);
-      expect(result.unread_count).toBe(1);
-
-      const call = lastFetchCall(mockFetch);
-      expect(call.url).toContain('/api/v1/agents/me/notifications');
-      expect(call.url).toContain('cursor=1700000000');
-      expect(call.url).toContain('limit=20');
-    });
-
-    it('omits cursor from query when not provided', async () => {
-      mockSuccess({ notifications: [], unread_count: 0 });
-
-      await api.getNotifications();
-
-      const call = lastFetchCall(mockFetch);
-      expect(call.url).not.toContain('cursor=');
-      expect(call.url).toContain('limit=50');
-    });
-  });
-
-  describe('readNotifications', () => {
-    it('sends POST and returns read_at', async () => {
-      mockSuccess({ read_at: 1700000000 });
-
-      const result = await api.readNotifications();
-      expect(result.read_at).toBe(1700000000);
-      expect(lastFetchCall(mockFetch).method).toBe('POST');
-    });
-  });
-
   describe('getEdges', () => {
     it('converts camelCase options to snake_case query params', async () => {
       api.clearCredentials();
@@ -619,25 +584,6 @@ describe('ApiClient', () => {
       expect(call.url).toBe('/api/v1/agents/me');
       expect(call.method).toBe('DELETE');
       expect(result.action).toBe('deregistered');
-    });
-  });
-
-  describe('migrateAccount', () => {
-    it('sends POST to /api/v1/agents/me/migrate', async () => {
-      mockSuccess({
-        action: 'migrated',
-        agent: { handle: 'bot_1' },
-        old_account: 'old.near',
-        new_account: 'new.near',
-      });
-
-      const result = await api.migrateAccount('new.near');
-
-      const call = lastFetchCall(mockFetch);
-      expect(call.url).toBe('/api/v1/agents/me/migrate');
-      expect(call.method).toBe('POST');
-      expect(call.body?.new_account_id).toBe('new.near');
-      expect(result.old_account).toBe('old.near');
     });
   });
 });
