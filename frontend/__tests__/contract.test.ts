@@ -8,6 +8,7 @@ import { api } from '@/lib/api';
 import {
   mockJsonResponse,
   mockWasmErrorResponse,
+  STUB_AGENT,
   setupFetchMock,
 } from './fixtures';
 
@@ -42,42 +43,28 @@ function mockHttpError(status: number, body: string) {
   });
 }
 
-const STUB_AGENT = {
-  handle: 'test_bot',
-  description: 'A test agent',
-  avatar_url: null,
-  tags: ['ai'],
-  capabilities: {},
-  endorsements: {},
-  platforms: [],
-  near_account_id: 'test.near',
-  follower_count: 5,
-  following_count: 3,
-  created_at: 1700000000,
-  last_active: 1700001000,
-};
-
 // ---------------------------------------------------------------------------
 // getMe: returns profile_completeness and suggestions
 // ---------------------------------------------------------------------------
 describe('contract: getMe', () => {
-  it('should return profile_completeness and suggestions', async () => {
+  it('should return profile_completeness and actions', async () => {
     mockSuccess({
       agent: STUB_AGENT,
       profile_completeness: 60,
-      suggestions: {
-        quality: 'generic',
-        hint: 'Add tags to unlock personalized suggestions.',
-      },
+      actions: [
+        {
+          action: 'update_me',
+          hint: 'Set capabilities to improve discoverability.',
+          missing: ['capabilities'],
+        },
+      ],
     });
 
     const result = await api.getMe();
 
     expect(result.profile_completeness).toBe(60);
-    expect(result.suggestions.quality).toBe('generic');
-    expect(result.suggestions.hint).toBe(
-      'Add tags to unlock personalized suggestions.',
-    );
+    expect(result.actions).toBeDefined();
+    expect(result.actions![0].action).toBe('update_me');
   });
 });
 
@@ -100,10 +87,10 @@ describe('contract: updateMe', () => {
 });
 
 // ---------------------------------------------------------------------------
-// heartbeat: returns full response with delta and suggested_action
+// heartbeat: returns full response with delta and contextual actions
 // ---------------------------------------------------------------------------
 describe('contract: heartbeat', () => {
-  it('should return delta and suggested_action', async () => {
+  it('should return delta and actions', async () => {
     mockSuccess({
       agent: STUB_AGENT,
       delta: {
@@ -113,17 +100,20 @@ describe('contract: heartbeat', () => {
         new_following_count: 0,
         profile_completeness: 60,
       },
-      suggested_action: {
-        action: 'get_suggested',
-        hint: 'Call get_suggested for VRF-fair recommendations.',
-      },
+      actions: [
+        {
+          action: 'discover_agents',
+          hint: 'Call GET /agents/discover for recommendations.',
+        },
+      ],
     });
 
     const result = await api.heartbeat();
 
     expect(result).toBeDefined();
     expect(result.delta.new_followers_count).toBe(1);
-    expect(result.suggested_action.action).toBe('get_suggested');
+    expect(result.actions).toBeDefined();
+    expect(result.actions![0].action).toBe('discover_agents');
   });
 });
 

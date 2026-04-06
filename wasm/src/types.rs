@@ -198,7 +198,7 @@ pub(crate) const RESERVED_HANDLES: &[&str] = &[
     "register",
     "registry",
     "sorted",
-    "suggested",
+    "discover",
     "system",
     "unfollowed",
     "verified",

@@ -18,3 +18,5 @@ vendor/outlayer/target/
 vendor/outlayer/Cargo.lock
 coverage/
 *.tsbuildinfo
+CLAUDE.md
+packages/

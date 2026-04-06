@@ -12,6 +12,7 @@ import {
   handleGetSuggested,
   type VrfProof,
 } from '@/lib/fastdata-dispatch';
+import { profileGaps } from '@/lib/fastdata-utils';
 import { dispatchWrite } from '@/lib/fastdata-write';
 import {
   callOutlayer,
@@ -20,12 +21,7 @@ import {
   resolveAccountId,
   sanitizePublic,
 } from '@/lib/outlayer-server';
-import {
-  handleRegisterPlatforms,
-  PLATFORM_META,
-  shouldAutoRegisterPlatforms,
-  tryAutoRegisterPlatforms,
-} from '@/lib/platforms';
+import { handleRegisterPlatforms, PLATFORM_META } from '@/lib/platforms';
 import { PUBLIC_ACTIONS, type ResolvedRoute, resolveRoute } from '@/lib/routes';
 
 /**
@@ -82,6 +78,49 @@ const DIRECT_WRITE_ACTIONS = new Set([
   'heartbeat',
   'deregister',
 ]);
+
+/** Compute contextual actions based on agent state. */
+function agentActions(
+  agent: Record<string, unknown>,
+): { action: string; hint: string; [key: string]: unknown }[] {
+  const actions: { action: string; hint: string; [key: string]: unknown }[] =
+    [];
+
+  // Profile incomplete?
+  const missing = profileGaps(agent);
+  if (missing.length > 0) {
+    actions.push({
+      action: 'update_me',
+      hint: `Set ${missing.join(', ')} to improve discoverability.`,
+      missing,
+    });
+  }
+
+  // Unregistered platforms?
+  const registered = new Set(
+    Array.isArray(agent.platforms) ? agent.platforms : [],
+  );
+  const unregistered = PLATFORM_META.filter((p) => !registered.has(p.id));
+  if (unregistered.length > 0) {
+    actions.push({
+      action: 'register_platforms',
+      hint: 'Call POST /agents/me/platforms to register and receive credentials.',
+      platforms: unregistered.map((p) => ({
+        id: p.id,
+        displayName: p.displayName,
+        description: p.description,
+      })),
+    });
+  }
+
+  // Discover agents
+  actions.push({
+    action: 'discover_agents',
+    hint: 'Call GET /agents/discover for recommendations.',
+  });
+
+  return actions;
+}
 
 function extractQueryParams(
   url: URL,
@@ -236,8 +275,8 @@ async function handleAuthenticatedGet(
     return errJson('AUTH_FAILED', 'Could not resolve account', 401);
   }
 
-  // get_suggested: fetch VRF seed from WASM TEE, then rank deterministically.
-  if (route.action === 'get_suggested') {
+  // discover_agents: fetch VRF seed from WASM TEE, then rank deterministically.
+  if (route.action === 'discover_agents') {
     let vrfProof: VrfProof | null = null;
     const claim = await mintClaimForWalletKey(walletKey, 'get_vrf_seed');
     if (claim) {
@@ -287,6 +326,16 @@ async function handleAuthenticatedGet(
       (fdResult as { status?: number }).status ?? 404,
     );
   }
+
+  // Inject contextual actions on me.
+  if (route.action === 'me' && fdResult.data) {
+    const d = fdResult.data as Record<string, unknown>;
+    if (d.agent) {
+      const actions = agentActions(d.agent as Record<string, unknown>);
+      if (actions.length > 0) d.actions = actions;
+    }
+  }
+
   const data = { success: true, data: fdResult.data };
   setCache(
     route.action,
@@ -337,8 +386,8 @@ async function handleRegistration(walletKey: string): Promise<NextResponse> {
           hint: 'Add tags, description, and capabilities so other agents can discover you.',
         },
         {
-          action: 'get_suggested',
-          hint: 'After setting tags, fetch personalized follow suggestions.',
+          action: 'discover_agents',
+          hint: 'After setting tags, call GET /agents/discover for recommendations.',
         },
         {
           action: 'follow',
@@ -346,10 +395,16 @@ async function handleRegistration(walletKey: string): Promise<NextResponse> {
         },
         {
           action: 'register_platforms',
-          hint: 'Platforms are registered automatically on first heartbeat/update_me with a profile. Or call POST /agents/me/platforms explicitly.',
+          hint: 'After setting up your profile, call POST /agents/me/platforms to register and receive your platform credentials.',
         },
       ],
     },
+    platforms: PLATFORM_META.map((p) => ({
+      id: p.id,
+      displayName: p.displayName,
+      description: p.description,
+      hint: 'Call POST /agents/me/platforms to register and receive credentials.',
+    })),
   });
 }
 
@@ -374,28 +429,15 @@ async function dispatchAuthenticated(
     if (result.success) {
       invalidateForMutation(route.action);
 
-      // Auto-register on platforms after first meaningful profile write.
+      // Inject contextual actions after profile-writing actions.
       if (
         (route.action === 'heartbeat' || route.action === 'update_me') &&
         result.data?.agent
       ) {
-        const agent = result.data.agent as Record<string, unknown>;
-        if (
-          typeof agent.handle === 'string' &&
-          typeof agent.near_account_id === 'string' &&
-          shouldAutoRegisterPlatforms(agent)
-        ) {
-          tryAutoRegisterPlatforms(
-            agent as {
-              handle: string;
-              near_account_id: string;
-              [k: string]: unknown;
-            },
-            walletKey,
-          ).catch((err) =>
-            console.error('[platforms] auto-register failed:', err),
-          );
-        }
+        const actions = agentActions(
+          result.data.agent as Record<string, unknown>,
+        );
+        if (actions.length > 0) result.data.actions = actions;
       }
 
       return successJson(result.data);

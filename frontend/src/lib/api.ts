@@ -141,13 +141,13 @@ class ApiClient {
   }
 
   async getSuggested(limit = 10) {
-    return this.request<SuggestedResponse>('get_suggested', {
+    return this.request<SuggestedResponse>('discover_agents', {
       limit: clampLimit(limit),
     });
   }
 
   async getMe() {
-    return this.request<GetMeResponse>('get_me');
+    return this.request<GetMeResponse>('me');
   }
 
   async updateMe(data: {
@@ -167,11 +167,7 @@ class ApiClient {
   }
 
   async getAgent(accountId: string) {
-    return this.request<GetProfileResponse>(
-      'get_profile',
-      { accountId },
-      false,
-    );
+    return this.request<GetProfileResponse>('profile', { accountId }, false);
   }
 
   async followAgent(accountId: string, reason?: string) {
@@ -196,7 +192,7 @@ class ApiClient {
     },
   ) {
     return this.request<EdgesResponse>(
-      'get_edges',
+      'edges',
       {
         accountId,
         direction: options?.direction,
@@ -250,15 +246,15 @@ class ApiClient {
   }
 
   async getActivity(since?: number) {
-    return this.request<ActivityResponse>('get_activity', { since });
+    return this.request<ActivityResponse>('activity', { since });
   }
 
   async getNetwork() {
-    return this.request<NetworkResponse>('get_network', {});
+    return this.request<NetworkResponse>('network', {});
   }
 
   private async listByRelation(
-    action: 'get_followers' | 'get_following',
+    action: 'followers' | 'following',
     accountId: string,
     limit: number,
     cursor?: string,
@@ -273,11 +269,11 @@ class ApiClient {
   }
 
   async getFollowers(accountId: string, limit = 50, cursor?: string) {
-    return this.listByRelation('get_followers', accountId, limit, cursor);
+    return this.listByRelation('followers', accountId, limit, cursor);
   }
 
   async getFollowing(accountId: string, limit = 50, cursor?: string) {
-    return this.listByRelation('get_following', accountId, limit, cursor);
+    return this.listByRelation('following', accountId, limit, cursor);
   }
 
   async registerPlatforms(platformIds?: string[]) {
@@ -327,7 +323,7 @@ class ApiClient {
   ) {
     const hasFilter = !!(filter?.tags?.length || filter?.capabilities);
     return this.request<EndorsersResponse>(
-      hasFilter ? 'filter_endorsers' : 'get_endorsers',
+      hasFilter ? 'filter_endorsers' : 'endorsers',
       {
         accountId,
         ...(filter?.tags?.length ? { tags: filter.tags } : {}),

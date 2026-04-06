@@ -54,6 +54,38 @@ export async function kvGetAgent(
 }
 
 /**
+ * Generic paginated POST against FastData KV.
+ * Callers provide the URL and base body; this handles page_token iteration,
+ * optional result-count capping, and the fetch loop.
+ */
+async function kvPaginate(
+  url: string,
+  baseBody: Record<string, unknown>,
+  limit?: number,
+): Promise<KvEntry[]> {
+  const all: KvEntry[] = [];
+  let pageToken: string | undefined;
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const body = pageToken ? { ...baseBody, page_token: pageToken } : baseBody;
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      10_000,
+    );
+    if (!res.ok) break;
+    const data = (await res.json()) as KvListResponse;
+    all.push(...(data.entries ?? []));
+    if (!data.page_token || (limit !== undefined && all.length >= limit)) break;
+    pageToken = data.page_token;
+  }
+  return limit !== undefined ? all.slice(0, limit) : all;
+}
+
+/**
  * Prefix scan for a known agent's keys.
  * Example: kvListAgent("abc.near", "graph/follow/") → all of abc's follows.
  */
@@ -65,27 +97,7 @@ export async function kvListAgent(
   const url = `${FASTDATA_URL}/v0/latest/${NAMESPACE}/${accountId}`;
   const body: Record<string, unknown> = { key_prefix: prefix };
   if (limit !== undefined) body.limit = limit;
-
-  const all: KvEntry[] = [];
-  let pageToken: string | undefined;
-  for (let i = 0; i < MAX_PAGES; i++) {
-    const pageBody = pageToken ? { ...body, page_token: pageToken } : body;
-    const res = await fetchWithTimeout(
-      url,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(pageBody),
-      },
-      10_000,
-    );
-    if (!res.ok) break;
-    const data = (await res.json()) as KvListResponse;
-    all.push(...(data.entries ?? []));
-    if (!data.page_token || (limit !== undefined && all.length >= limit)) break;
-    pageToken = data.page_token;
-  }
-  return limit !== undefined ? all.slice(0, limit) : all;
+  return kvPaginate(url, body, limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -98,27 +110,10 @@ export async function kvListAgent(
  * Example: kvGetAll("graph/follow/bob") → all agents who follow bob.
  */
 export async function kvGetAll(key: string): Promise<KvEntry[]> {
-  const all: KvEntry[] = [];
-  let pageToken: string | undefined;
-  for (let i = 0; i < MAX_PAGES; i++) {
-    const body: Record<string, unknown> = { key, limit: PAGE_SIZE };
-    if (pageToken) body.page_token = pageToken;
-    const res = await fetchWithTimeout(
-      `${FASTDATA_URL}/v0/latest/${NAMESPACE}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      },
-      10_000,
-    );
-    if (!res.ok) break;
-    const data = (await res.json()) as KvListResponse;
-    all.push(...(data.entries ?? []));
-    if (!data.page_token) break;
-    pageToken = data.page_token;
-  }
-  return all;
+  return kvPaginate(`${FASTDATA_URL}/v0/latest/${NAMESPACE}`, {
+    key,
+    limit: PAGE_SIZE,
+  });
 }
 
 /**
@@ -129,31 +124,11 @@ export async function kvListAll(
   prefix: string,
   limit?: number,
 ): Promise<KvEntry[]> {
-  const all: KvEntry[] = [];
-  let pageToken: string | undefined;
-  const pageLimit = limit ?? PAGE_SIZE;
-  for (let i = 0; i < MAX_PAGES; i++) {
-    const body: Record<string, unknown> = {
-      key_prefix: prefix,
-      limit: pageLimit,
-    };
-    if (pageToken) body.page_token = pageToken;
-    const res = await fetchWithTimeout(
-      `${FASTDATA_URL}/v0/latest/${NAMESPACE}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      },
-      10_000,
-    );
-    if (!res.ok) break;
-    const data = (await res.json()) as KvListResponse;
-    all.push(...(data.entries ?? []));
-    if (!data.page_token || (limit !== undefined && all.length >= limit)) break;
-    pageToken = data.page_token;
-  }
-  return limit !== undefined ? all.slice(0, limit) : all;
+  return kvPaginate(
+    `${FASTDATA_URL}/v0/latest/${NAMESPACE}`,
+    { key_prefix: prefix, limit: limit ?? PAGE_SIZE },
+    limit,
+  );
 }
 
 // ---------------------------------------------------------------------------

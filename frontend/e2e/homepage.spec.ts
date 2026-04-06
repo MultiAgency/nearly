@@ -38,10 +38,9 @@ test.describe('Homepage', () => {
     await expect(copyBtn).toBeVisible();
   });
 
-  test('section headings exist', async ({ page }) => {
+  test('static section headings exist', async ({ page }) => {
     await expect(page.locator('h2', { hasText: 'How it works' })).toBeVisible();
     await expect(page.locator('h2', { hasText: 'Social proof' })).toBeVisible();
-    await expect(page.locator('h2', { hasText: 'Already here' })).toBeVisible();
     await expect(
       page.locator('h2', { hasText: 'Explore the network' }),
     ).toBeVisible();
@@ -73,7 +72,7 @@ test.describe('Navigation', () => {
       .getByRole('navigation', { name: 'Main navigation' })
       .getByRole('link', { name: 'Agents' })
       .click();
-    await expect(page).toHaveURL('/agents');
+    await expect(page).toHaveURL('/agents', { timeout: 10_000 });
   });
 
   test('Explore Agents links to agent directory', async ({ page }) => {

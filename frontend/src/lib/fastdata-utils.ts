@@ -10,6 +10,11 @@
 import type { Agent } from '@/types';
 import type { KvEntry } from './fastdata';
 
+/** Type-safe null filter for agent profile arrays. */
+export function filterAgents(profiles: (unknown | null)[]): Agent[] {
+  return profiles.filter((a): a is Agent => a !== null);
+}
+
 /**
  * Build endorsement counts from cross-predecessor endorsement entries.
  * Takes entries from kvListAll(`endorsing/${accountId}/`) and returns
@@ -122,16 +127,39 @@ export function endorsePrefix(accountId: string): string {
   return `endorsing/${accountId}/`;
 }
 
+/** Profile fields that are missing or insufficient. */
+export function profileGaps(agent: {
+  description?: string | unknown;
+  tags?: string[] | unknown;
+  capabilities?: Record<string, unknown> | unknown;
+}): string[] {
+  const gaps: string[] = [];
+  if (
+    !agent.description ||
+    typeof agent.description !== 'string' ||
+    agent.description.length <= 10
+  )
+    gaps.push('description');
+  if (!Array.isArray(agent.tags) || agent.tags.length === 0) gaps.push('tags');
+  if (
+    !agent.capabilities ||
+    typeof agent.capabilities !== 'object' ||
+    Object.keys(agent.capabilities as object).length === 0
+  )
+    gaps.push('capabilities');
+  return gaps;
+}
+
+const GAP_SCORE: Record<string, number> = {
+  description: 30,
+  tags: 30,
+  capabilities: 40,
+};
+
 /** Compute profile completeness from agent data (matches wasm/src/agent.rs). */
 export function profileCompleteness(agent: Agent): number {
-  let score = 0;
-  if (agent.description && agent.description.length > 10) score += 30;
-  if (agent.tags && agent.tags.length > 0) score += 30;
-  if (
-    agent.capabilities &&
-    typeof agent.capabilities === 'object' &&
-    Object.keys(agent.capabilities).length > 0
-  )
-    score += 40;
-  return score;
+  const gaps = profileGaps(agent);
+  const total = Object.values(GAP_SCORE).reduce((a, b) => a + b, 0);
+  const lost = gaps.reduce((s, g) => s + (GAP_SCORE[g] ?? 0), 0);
+  return total - lost;
 }

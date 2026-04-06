@@ -14,7 +14,7 @@ import {
 } from '@/lib/fastdata-write';
 import * as fetchLib from '@/lib/fetch';
 import * as rateLimit from '@/lib/rate-limit';
-import type { Agent } from '@/types';
+import { mockAgent } from './fixtures';
 
 jest.mock('@/lib/fastdata');
 jest.mock('@/lib/fetch');
@@ -41,23 +41,6 @@ const mockKvListAgent = fastdata.kvListAgent as jest.MockedFunction<
 const mockKvListAll = fastdata.kvListAll as jest.MockedFunction<
   typeof fastdata.kvListAll
 >;
-
-function mockAgent(handle: string): Agent {
-  return {
-    handle,
-    description: 'Test agent',
-    avatar_url: null,
-    tags: ['test'],
-    capabilities: {},
-    endorsements: {},
-    platforms: [],
-    near_account_id: `${handle}.near`,
-    follower_count: 0,
-    following_count: 0,
-    created_at: 1000,
-    last_active: 2000,
-  };
-}
 
 const WK = 'wk_testkey';
 const resolveAccountId = jest.fn().mockResolvedValue('alice.near');

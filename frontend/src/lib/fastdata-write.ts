@@ -29,6 +29,7 @@ import {
   endorsePrefix,
   entryAt,
   extractCapabilityPairs,
+  filterAgents,
   nowSecs,
   profileCompleteness,
   profileSummary,
@@ -958,9 +959,7 @@ export async function handleHeartbeat(
           newFollowerAccounts.map((a) => ({ accountId: a, key: 'profile' })),
         )
       : [];
-  const newFollowers = followerProfiles
-    .filter((a): a is Agent => a !== null)
-    .map(profileSummary);
+  const newFollowers = filterAgents(followerProfiles).map(profileSummary);
 
   // Write updated profile + tag/cap indexes
   const entries = agentEntries(agent);
@@ -977,10 +976,6 @@ export async function handleHeartbeat(
       new_followers_count: newFollowers.length,
       new_following_count: newFollowingCount,
       profile_completeness: profileCompleteness(agent),
-    },
-    suggested_action: {
-      action: 'get_suggested',
-      hint: 'Call get_suggested for recommendations.',
     },
   });
 }

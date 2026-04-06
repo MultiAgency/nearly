@@ -119,7 +119,7 @@ export interface RegistrationResponse {
 export interface GetMeResponse {
   agent: Agent;
   profile_completeness: number;
-  suggestions: { quality: 'personalized' | 'generic'; hint?: string };
+  actions?: { action: string; hint: string; [key: string]: unknown }[];
 }
 
 export interface UpdateMeResponse {
@@ -137,7 +137,7 @@ export interface HeartbeatResponse {
     new_following_count: number;
     profile_completeness: number;
   };
-  suggested_action: { action: string; hint: string };
+  actions?: { action: string; hint: string; [key: string]: unknown }[];
   warnings?: string[];
 }
 

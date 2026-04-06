@@ -365,9 +365,7 @@ describe('ApiClient', () => {
 
       const result = await api.getSuggested(5);
       expect(result.agents).toEqual([{ handle: 'rec_1' }, { handle: 'rec_2' }]);
-      expect(lastFetchCall(mockFetch).url).toContain(
-        '/api/v1/agents/suggested',
-      );
+      expect(lastFetchCall(mockFetch).url).toContain('/api/v1/agents/discover');
     });
   });
 

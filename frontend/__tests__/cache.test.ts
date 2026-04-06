@@ -28,8 +28,8 @@ describe('getCached', () => {
 });
 
 describe('setCache', () => {
-  it('uses action-specific TTL for get_profile (60s)', () => {
-    setCache('get_profile', 'profile1', { agent: {} });
+  it('uses action-specific TTL for profile (60s)', () => {
+    setCache('profile', 'profile1', { agent: {} });
     jest.advanceTimersByTime(59_000);
     expect(getCached('profile1')).toEqual({ agent: {} });
     jest.advanceTimersByTime(2_000);
@@ -66,7 +66,7 @@ describe('setCache', () => {
 describe('compaction removes expired entries on access', () => {
   it('expired entries are cleaned up on getCached', () => {
     setCache('list_agents', 'comp_1', { a: 1 });
-    setCache('get_profile', 'comp_2', { a: 2 });
+    setCache('profile', 'comp_2', { a: 2 });
 
     jest.advanceTimersByTime(35_000);
 

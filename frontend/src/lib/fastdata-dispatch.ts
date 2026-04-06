@@ -22,6 +22,7 @@ import {
   endorsePrefix,
   entryAt,
   extractCapabilityPairs,
+  filterAgents,
   nowSecs,
   profileCompleteness,
   profileSummary,
@@ -75,7 +76,7 @@ export async function dispatchFastData(
     switch (action) {
       case 'health':
         return { data: await handleHealth() };
-      case 'get_profile':
+      case 'profile':
         return await handleGetProfile(body);
       case 'list_tags':
         return { data: await handleListTags() };
@@ -83,22 +84,22 @@ export async function dispatchFastData(
         return { data: await handleListCapabilities() };
       case 'list_agents':
         return await handleListAgents(body);
-      case 'get_followers':
+      case 'followers':
         return await handleGetFollowers(body);
-      case 'get_following':
+      case 'following':
         return await handleGetFollowing(body);
-      case 'get_me':
+      case 'me':
         return await handleGetMe(body);
-      case 'get_suggested':
+      case 'discover_agents':
         return await handleGetSuggested(body, null);
-      case 'get_edges':
+      case 'edges':
         return await handleGetEdges(body);
-      case 'get_endorsers':
+      case 'endorsers':
       case 'filter_endorsers':
         return await handleGetEndorsers(body);
-      case 'get_activity':
+      case 'activity':
         return await handleGetActivity(body);
-      case 'get_network':
+      case 'network':
         return await handleGetNetwork(body);
       default:
         return { error: `Unsupported action: ${action}` };
@@ -203,13 +204,11 @@ async function handleListAgents(
     const profiles = await kvMultiAgent(
       accountIds.map((a) => ({ accountId: a, key: 'profile' })),
     );
-    allAgents = profiles.filter((a): a is Agent => a !== null);
+    allAgents = filterAgents(profiles);
   } else {
     // Unfiltered: enumerate all agents via profile key.
     const entries = await kvGetAll('profile');
-    allAgents = entries
-      .map((e) => e.value as Agent | null)
-      .filter((a): a is Agent => a !== null);
+    allAgents = filterAgents(entries.map((e) => e.value as Agent | null));
   }
 
   // Sort by requested field from profile data.
@@ -279,7 +278,7 @@ async function handleGetFollowers(
   const profiles = await kvMultiAgent(
     page.map((a) => ({ accountId: a, key: 'profile' })),
   );
-  const agents = profiles.filter((a): a is Agent => a !== null);
+  const agents = filterAgents(profiles);
 
   return {
     data: {
@@ -318,7 +317,7 @@ async function handleGetFollowing(
     page.length > 0
       ? await kvMultiAgent(page.map((a) => ({ accountId: a, key: 'profile' })))
       : [];
-  const agents = profiles.filter((a): a is Agent => a !== null);
+  const agents = filterAgents(profiles);
 
   return {
     data: {
@@ -349,9 +348,6 @@ async function handleGetMe(
     data: {
       agent,
       profile_completeness: profileCompleteness(agent),
-      suggestions: {
-        quality: agent.tags?.length > 0 ? 'personalized' : 'generic',
-      },
     },
   };
 }
@@ -405,9 +401,9 @@ export async function handleGetSuggested(
 
   // Candidates: all agents, excluding already-followed.
   const allEntries = await kvGetAll('profile');
-  const allAgents = allEntries
-    .map((e) => e.value as Agent | null)
-    .filter((a): a is Agent => a !== null);
+  const allAgents = filterAgents(
+    allEntries.map((e) => e.value as Agent | null),
+  );
   const candidates = allAgents.filter((a) => !followSet.has(a.near_account_id));
 
   // Score each candidate: shared tags first, then follower count.
@@ -576,7 +572,7 @@ async function handleGetEndorsers(
 
   // Build a lookup map: accountId → profile summary.
   const profileMap = new Map<string, ReturnType<typeof profileSummary>>();
-  const agentProfiles = profiles.filter((a): a is Agent => a !== null);
+  const agentProfiles = filterAgents(profiles);
   for (const p of agentProfiles) {
     profileMap.set(p.near_account_id, profileSummary(p));
   }
@@ -672,9 +668,7 @@ async function handleGetActivity(
           newFollowerAccounts.map((a) => ({ accountId: a, key: 'profile' })),
         )
       : [];
-  const newFollowers = followerProfiles
-    .filter((a): a is Agent => a !== null)
-    .map(profileSummary);
+  const newFollowers = filterAgents(followerProfiles).map(profileSummary);
 
   const followingProfiles =
     newFollowingAccountIds.length > 0
@@ -685,9 +679,7 @@ async function handleGetActivity(
           })),
         )
       : [];
-  const newFollowing = followingProfiles
-    .filter((a): a is Agent => a !== null)
-    .map(profileSummary);
+  const newFollowing = filterAgents(followingProfiles).map(profileSummary);
 
   return {
     data: {

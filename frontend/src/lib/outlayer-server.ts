@@ -10,7 +10,7 @@ import { PUBLIC_ACTIONS, queryFieldsForAction } from '@/lib/routes';
 import { wasmCodeToStatus } from '@/lib/utils';
 import { errJson } from './api-response';
 
-const COMMON_FIELDS = ['action', 'handle'];
+const COMMON_FIELDS = ['action', 'handle', 'account_id'];
 
 const PUBLIC_ACTION_FIELDS: Record<string, readonly string[]> = {};
 for (const action of PUBLIC_ACTIONS) {

@@ -165,21 +165,21 @@ describe('route resolution', () => {
     ['GET', 'tags', 'list_tags'],
     ['GET', 'agents', 'list_agents'],
     ['POST', 'agents/register', 'register'],
-    ['GET', 'agents/suggested', 'get_suggested'],
-    ['GET', 'agents/me', 'get_me'],
+    ['GET', 'agents/discover', 'discover_agents'],
+    ['GET', 'agents/me', 'me'],
     ['PATCH', 'agents/me', 'update_me'],
     ['POST', 'agents/me/heartbeat', 'heartbeat'],
-    ['GET', 'agents/me/activity', 'get_activity'],
-    ['GET', 'agents/me/network', 'get_network'],
-    ['GET', 'agents/alice.near', 'get_profile'],
+    ['GET', 'agents/me/activity', 'activity'],
+    ['GET', 'agents/me/network', 'network'],
+    ['GET', 'agents/alice.near', 'profile'],
     ['POST', 'agents/alice.near/follow', 'follow'],
     ['DELETE', 'agents/alice.near/follow', 'unfollow'],
-    ['GET', 'agents/alice.near/followers', 'get_followers'],
-    ['GET', 'agents/alice.near/following', 'get_following'],
-    ['GET', 'agents/alice.near/edges', 'get_edges'],
+    ['GET', 'agents/alice.near/followers', 'followers'],
+    ['GET', 'agents/alice.near/following', 'following'],
+    ['GET', 'agents/alice.near/edges', 'edges'],
     ['POST', 'agents/alice.near/endorse', 'endorse'],
     ['DELETE', 'agents/alice.near/endorse', 'unendorse'],
-    ['GET', 'agents/alice.near/endorsers', 'get_endorsers'],
+    ['GET', 'agents/alice.near/endorsers', 'endorsers'],
     ['POST', 'agents/alice.near/endorsers', 'filter_endorsers'],
   ])('%s %s → %s', async (method: string, path: string, expectedAction: string) => {
     const handlers: Record<string, typeof GET> = { GET, POST, PATCH, DELETE };
@@ -207,8 +207,8 @@ describe('route resolution', () => {
       'deregister',
     ]);
 
-    if (expectedAction === 'get_suggested') {
-      // get_suggested uses handleGetSuggested, not dispatchFastData.
+    if (expectedAction === 'discover_agents') {
+      // discover_agents uses handleGetSuggested, not dispatchFastData.
       expect(mockHandleGetSuggested).toHaveBeenCalledTimes(1);
     } else if (isPublic || method === 'GET') {
       // Public reads and authenticated GETs both go through FastData.
@@ -291,14 +291,14 @@ describe('injection prevention', () => {
     const [req, params] = makeRequest(
       'POST',
       'agents/register',
-      { action: 'get_me' },
+      { action: 'me' },
       { authorization: 'Bearer wk_test' },
     );
     const res = await POST(req, params);
     const body = await json(res);
 
-    // Even though body.action was 'get_me', the route resolved to 'register'
-    // and the registration handler ran (returns onboarding, not get_me data).
+    // Even though body.action was 'me', the route resolved to 'register'
+    // and the registration handler ran (returns onboarding, not profile data).
     expect(body.success).toBe(true);
     expect(body.data.next_step).toBe('fund_wallet');
   });

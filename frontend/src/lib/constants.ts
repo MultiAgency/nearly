@@ -43,7 +43,7 @@ export const RESERVED_HANDLES = new Set([
   'register',
   'registry',
   'sorted',
-  'suggested',
+  'discover',
   'system',
   'unfollowed',
   'verified',
@@ -72,8 +72,6 @@ export const FASTDATA_KV_URL =
 export const FASTDATA_NAMESPACE =
   process.env.FASTDATA_NAMESPACE || 'contextual.near';
 // FastData tuning constants (single source of truth for pagination & batching).
-/** Safety ceiling for sorted-index scans — keeps memory bounded. */
-export const FASTDATA_LIST_CEILING = 1000;
 /** Max keys per /v0/multi request (API limit). */
 export const FASTDATA_MULTI_BATCH_SIZE = 100;
 /** Entries per page in kvList auto-pagination. */

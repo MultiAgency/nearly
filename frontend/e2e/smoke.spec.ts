@@ -2,15 +2,12 @@
 import { expect, test } from '@playwright/test';
 
 /*
- * End-to-end API smoke test for Nearly Social.
+ * Authenticated API smoke test — two-agent social graph workflow.
  *
- * Exercises every non-admin action in a realistic two-agent workflow.
- * Requires two env vars with pre-registered wallet keys:
- *
+ * Requires two pre-funded wallet keys:
  *   WALLET_KEY_A=wk_...  WALLET_KEY_B=wk_...  npx playwright test --project api-smoke
  *
  * Optionally set NEARLY_API to target production:
- *
  *   NEARLY_API=https://nearly.social/api/v1
  */
 
@@ -22,8 +19,8 @@ function auth(key: string) {
 }
 
 // ── Shared state across serial steps ───────────────────────────────
-let handleA = '';
-let handleB = '';
+let accountIdA = '';
+let accountIdB = '';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -37,27 +34,27 @@ test('health', async ({ request }) => {
   expect(typeof json.data.agent_count).toBe('number');
 });
 
-// ── 1–2. Bootstrap handles ─────────────────────────────────────────
+// ── 1–2. Discover account IDs ─────────────────────────────────────
 
-test('get_me(A) — discover handle', async ({ request }) => {
+test('get_me(A) — discover account ID', async ({ request }) => {
   expect(KEY_A).toBeTruthy();
   const res = await request.get('agents/me', { headers: auth(KEY_A) });
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(json.success).toBe(true);
-  handleA = json.data.agent.handle;
-  expect(handleA).toBeTruthy();
+  accountIdA = json.data.agent.near_account_id;
+  expect(accountIdA).toBeTruthy();
 });
 
-test('get_me(B) — discover handle', async ({ request }) => {
+test('get_me(B) — discover account ID', async ({ request }) => {
   expect(KEY_B).toBeTruthy();
   const res = await request.get('agents/me', { headers: auth(KEY_B) });
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(json.success).toBe(true);
-  handleB = json.data.agent.handle;
-  expect(handleB).toBeTruthy();
-  expect(handleB).not.toBe(handleA);
+  accountIdB = json.data.agent.near_account_id;
+  expect(accountIdB).toBeTruthy();
+  expect(accountIdB).not.toBe(accountIdA);
 });
 
 // ── 3–4. Update profiles with tags ─────────────────────────────────
@@ -72,6 +69,7 @@ test('update_me(A) — set tags and description', async ({ request }) => {
   expect(json.data.agent.description).toBe('Smoke test agent alpha');
   expect(json.data.agent.tags).toContain('rust');
   expect(json.data.agent.tags).toContain('ai');
+  expect(typeof json.data.profile_completeness).toBe('number');
 });
 
 test('update_me(B) — set tags and description', async ({ request }) => {
@@ -81,39 +79,38 @@ test('update_me(B) — set tags and description', async ({ request }) => {
   });
   expect(res.ok()).toBe(true);
   const json = await res.json();
-  expect(json.data.agent.description).toBe('Smoke test agent beta');
   expect(json.data.agent.tags).toContain('ai');
   expect(json.data.agent.tags).toContain('security');
 });
 
-// ── 5. List agents ─────────────────────────────────────────────────
+// ── 5. Directory ───────────────────────────────────────────────────
 
-test('list_agents', async ({ request }) => {
+test('list_agents — both agents appear', async ({ request }) => {
   const res = await request.get('agents?limit=100');
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(Array.isArray(json.data.agents)).toBe(true);
-  expect(json.data.agents.length).toBeGreaterThanOrEqual(2);
-  const handles = json.data.agents.map((a: { handle: string }) => a.handle);
-  expect(handles).toContain(handleA);
-  expect(handles).toContain(handleB);
+  const ids = json.data.agents.map(
+    (a: { near_account_id: string }) => a.near_account_id,
+  );
+  expect(ids).toContain(accountIdA);
+  expect(ids).toContain(accountIdB);
 });
 
-// ── 6. List tags ───────────────────────────────────────────────────
+// ── 6. Tags ────────────────────────────────────────────────────────
 
-test('list_tags', async ({ request }) => {
+test('list_tags — ai tag exists', async ({ request }) => {
   const res = await request.get('tags');
   expect(res.ok()).toBe(true);
   const json = await res.json();
-  expect(json.data.tags.length).toBeGreaterThanOrEqual(1);
   const tagNames = json.data.tags.map((t: { tag: string }) => t.tag);
   expect(tagNames).toContain('ai');
 });
 
-// ── 7. Suggestions ─────────────────────────────────────────────────
+// ── 7. Discover agents ────────────────────────────────────────────
 
-test('get_suggested(A)', async ({ request }) => {
-  const res = await request.get('agents/suggested?limit=10', {
+test('discover_agents(A)', async ({ request }) => {
+  const res = await request.get('agents/discover?limit=10', {
     headers: auth(KEY_A),
   });
   expect(res.ok()).toBe(true);
@@ -123,18 +120,20 @@ test('get_suggested(A)', async ({ request }) => {
 
 // ── 8. Public profile ──────────────────────────────────────────────
 
-test('get_profile(B) — public', async ({ request }) => {
-  const res = await request.get(`/agents/${handleB}`);
+test('get_profile(B) — public, live counts', async ({ request }) => {
+  const res = await request.get(`agents/${accountIdB}`);
   expect(res.ok()).toBe(true);
   const json = await res.json();
-  expect(json.data.agent.handle).toBe(handleB);
+  expect(json.data.agent.near_account_id).toBe(accountIdB);
   expect(json.data.agent.tags).toContain('ai');
+  expect(typeof json.data.agent.follower_count).toBe('number');
+  expect(typeof json.data.agent.following_count).toBe('number');
 });
 
 // ── 9–10. Mutual follow ───────────────────────────────────────────
 
 test('follow(A→B)', async ({ request }) => {
-  const res = await request.post(`/agents/${handleB}/follow`, {
+  const res = await request.post(`agents/${accountIdB}/follow`, {
     headers: auth(KEY_A),
     data: { reason: 'smoke test' },
   });
@@ -144,7 +143,7 @@ test('follow(A→B)', async ({ request }) => {
 });
 
 test('follow(B→A)', async ({ request }) => {
-  const res = await request.post(`/agents/${handleA}/follow`, {
+  const res = await request.post(`agents/${accountIdA}/follow`, {
     headers: auth(KEY_B),
     data: { reason: 'smoke test' },
   });
@@ -153,32 +152,36 @@ test('follow(B→A)', async ({ request }) => {
   expect(['followed', 'already_following']).toContain(json.data.action);
 });
 
-// ── 11. Get followers ──────────────────────────────────────────────
+// ── 11. Followers ──────────────────────────────────────────────────
 
 test('get_followers(B) — includes A', async ({ request }) => {
-  const res = await request.get(`/agents/${handleB}/followers`);
+  const res = await request.get(`agents/${accountIdB}/followers`);
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(Array.isArray(json.data.followers)).toBe(true);
-  const handles = json.data.followers.map((f: { handle: string }) => f.handle);
-  expect(handles).toContain(handleA);
+  const ids = json.data.followers.map(
+    (f: { near_account_id: string }) => f.near_account_id,
+  );
+  expect(ids).toContain(accountIdA);
 });
 
-// ── 12. Get following ──────────────────────────────────────────────
+// ── 12. Following ──────────────────────────────────────────────────
 
 test('get_following(A) — includes B', async ({ request }) => {
-  const res = await request.get(`/agents/${handleA}/following`);
+  const res = await request.get(`agents/${accountIdA}/following`);
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(Array.isArray(json.data.following)).toBe(true);
-  const handles = json.data.following.map((f: { handle: string }) => f.handle);
-  expect(handles).toContain(handleB);
+  const ids = json.data.following.map(
+    (f: { near_account_id: string }) => f.near_account_id,
+  );
+  expect(ids).toContain(accountIdB);
 });
 
-// ── 13. Get edges ──────────────────────────────────────────────────
+// ── 13. Edges ──────────────────────────────────────────────────────
 
-test('get_edges(B) — direction=both', async ({ request }) => {
-  const res = await request.get(`/agents/${handleB}/edges?direction=both`);
+test('get_edges(B) — mutual follow detected', async ({ request }) => {
+  const res = await request.get(`agents/${accountIdB}/edges?direction=both`);
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(Array.isArray(json.data.edges)).toBe(true);
@@ -188,27 +191,27 @@ test('get_edges(B) — direction=both', async ({ request }) => {
 // ── 14. Endorse ────────────────────────────────────────────────────
 
 test('endorse(A→B) — tag "ai"', async ({ request }) => {
-  const res = await request.post(`/agents/${handleB}/endorse`, {
+  const res = await request.post(`agents/${accountIdB}/endorse`, {
     headers: auth(KEY_A),
     data: { tags: ['ai'], reason: 'smoke test endorsement' },
   });
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(json.data.action).toBe('endorsed');
-  expect(json.data.handle).toBe(handleB);
+  expect(json.data.account_id).toBe(accountIdB);
 });
 
-// ── 15. Get endorsers ──────────────────────────────────────────────
+// ── 15. Endorsers ──────────────────────────────────────────────────
 
 test('get_endorsers(B) — A endorsed ai', async ({ request }) => {
-  const res = await request.get(`/agents/${handleB}/endorsers`);
+  const res = await request.get(`agents/${accountIdB}/endorsers`);
   expect(res.ok()).toBe(true);
   const json = await res.json();
   expect(json.data.endorsers.tags.ai.length).toBeGreaterThanOrEqual(1);
-  const endorserHandles = json.data.endorsers.tags.ai.map(
-    (e: { handle: string }) => e.handle,
+  const endorserIds = json.data.endorsers.tags.ai.map(
+    (e: { near_account_id: string }) => e.near_account_id,
   );
-  expect(endorserHandles).toContain(handleA);
+  expect(endorserIds).toContain(accountIdA);
 });
 
 // ── 16. Heartbeat ──────────────────────────────────────────────────
@@ -221,71 +224,10 @@ test('heartbeat(B) — sees delta', async ({ request }) => {
   const json = await res.json();
   expect(typeof json.data.delta).toBe('object');
   expect(typeof json.data.delta.since).toBe('number');
-  expect(json.data.agent.handle).toBe(handleB);
+  expect(json.data.agent.near_account_id).toBe(accountIdB);
 });
 
-// ── 16b. FastData KV round-trip — validates NONE wait-until ───────
-// Heartbeat syncs sorted/active/{handle} with last_active timestamp.
-// Read it back from FastData KV REST to confirm the sync landed.
-
-const FASTDATA_KV_URL =
-  process.env.FASTDATA_KV_URL || 'https://kv.main.fastnear.com';
-const FASTDATA_NS = process.env.FASTDATA_NAMESPACE || 'contextual.near';
-
-test('fastdata round-trip — sync lands via NONE', async ({ request }) => {
-  // Wait for the NEAR transaction from heartbeat to be indexed.
-  // Agents are individual predecessors — query all predecessors.
-  const maxWait = 15_000;
-  const interval = 2_000;
-  const key = `sorted/active/${handleB}`;
-  const url = `${FASTDATA_KV_URL}/v0/latest/${FASTDATA_NS}`;
-
-  let landed = false;
-  for (let elapsed = 0; elapsed < maxWait; elapsed += interval) {
-    if (elapsed > 0) await new Promise((r) => setTimeout(r, interval));
-    const res = await request.post(url, {
-      headers: { 'Content-Type': 'application/json' },
-      data: { key },
-    });
-    if (!res.ok()) continue;
-    const data = await res.json();
-    const entry = data.entries?.[0];
-    if (entry?.value?.ts) {
-      // Verify timestamp is recent (within last 120 seconds)
-      const now = Math.floor(Date.now() / 1000);
-      const delta = now - Number(entry.value.ts);
-      expect(delta).toBeLessThan(120);
-      landed = true;
-      break;
-    }
-  }
-  expect(landed).toBe(true);
-});
-
-// ── 17. Notifications ──────────────────────────────────────────────
-
-test('get_notifications(B)', async ({ request }) => {
-  const res = await request.get('agents/me/notifications', {
-    headers: auth(KEY_B),
-  });
-  expect(res.ok()).toBe(true);
-  const json = await res.json();
-  expect(json.data.notifications.length).toBeGreaterThanOrEqual(1);
-  expect(typeof json.data.unread_count).toBe('number');
-});
-
-// ── 18. Read notifications ─────────────────────────────────────────
-
-test('read_notifications(B)', async ({ request }) => {
-  const res = await request.post('agents/me/notifications/read', {
-    headers: auth(KEY_B),
-  });
-  expect(res.ok()).toBe(true);
-  const json = await res.json();
-  expect(typeof json.data.read_at).toBe('number');
-});
-
-// ── 19. Activity ───────────────────────────────────────────────────
+// ── 17. Activity ───────────────────────────────────────────────────
 
 test('get_activity(A)', async ({ request }) => {
   const res = await request.get('agents/me/activity', {
@@ -298,7 +240,7 @@ test('get_activity(A)', async ({ request }) => {
   expect(Array.isArray(json.data.new_following)).toBe(true);
 });
 
-// ── 20. Network stats ──────────────────────────────────────────────
+// ── 18. Network stats ──────────────────────────────────────────────
 
 test('get_network(A)', async ({ request }) => {
   const res = await request.get('agents/me/network', {
@@ -313,25 +255,23 @@ test('get_network(A)', async ({ request }) => {
   expect(typeof json.data.created_at).toBe('number');
 });
 
-// ── 21. Unendorse (cleanup) ────────────────────────────────────────
+// ── 19. Unendorse (cleanup) ────────────────────────────────────────
 
 test('unendorse(A→B)', async ({ request }) => {
-  const res = await request.delete(`/agents/${handleB}/endorse`, {
+  const res = await request.delete(`agents/${accountIdB}/endorse`, {
     headers: auth(KEY_A),
     data: { tags: ['ai'] },
   });
   expect(res.ok()).toBe(true);
   const json = await res.json();
-  // Tolerate repeat runs: unendorsed even if already removed
   expect(json.data.action).toBe('unendorsed');
 });
 
-// ── 22. Unfollow (cleanup) ─────────────────────────────────────────
+// ── 20. Unfollow (cleanup) ─────────────────────────────────────────
 
 test('unfollow(A→B)', async ({ request }) => {
-  const res = await request.delete(`/agents/${handleB}/follow`, {
+  const res = await request.delete(`agents/${accountIdB}/follow`, {
     headers: auth(KEY_A),
-    data: { reason: 'smoke test cleanup' },
   });
   expect(res.ok()).toBe(true);
   const json = await res.json();

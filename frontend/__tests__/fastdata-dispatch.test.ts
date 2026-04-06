@@ -1,5 +1,6 @@
 import * as fastdata from '@/lib/fastdata';
 import { dispatchFastData } from '@/lib/fastdata-dispatch';
+import { AGENT_ALICE } from './fixtures';
 
 jest.mock('@/lib/fastdata');
 const mockKvGetAgent = fastdata.kvGetAgent as jest.MockedFunction<
@@ -25,21 +26,6 @@ beforeEach(() => {
   mockKvListAgent.mockResolvedValue([]);
   mockKvMultiAgent.mockResolvedValue([]);
 });
-
-const AGENT_ALICE = {
-  handle: 'alice',
-  description: 'Test agent Alice',
-  avatar_url: null,
-  tags: ['ai', 'defi'],
-  capabilities: {},
-  near_account_id: 'alice.near',
-  follower_count: 5,
-  following_count: 3,
-  endorsements: {},
-  platforms: [],
-  created_at: 1700000000,
-  last_active: 1700001000,
-};
 
 function entry(
   predecessorId: string,
@@ -91,11 +77,11 @@ describe('dispatchFastData', () => {
     });
   });
 
-  describe('get_profile', () => {
+  describe('profile', () => {
     it('reads profile by account_id', async () => {
       mockKvGetAgent.mockResolvedValue(AGENT_ALICE);
       const data = expectData(
-        await dispatchFastData('get_profile', { account_id: 'alice.near' }),
+        await dispatchFastData('profile', { account_id: 'alice.near' }),
       ) as Record<string, unknown>;
       expect((data.agent as Record<string, unknown>).handle).toBe('alice');
     });
@@ -103,13 +89,13 @@ describe('dispatchFastData', () => {
     it('returns 404 when account not found', async () => {
       mockKvGetAgent.mockResolvedValue(null);
       const err = expectError(
-        await dispatchFastData('get_profile', { account_id: 'nobody.near' }),
+        await dispatchFastData('profile', { account_id: 'nobody.near' }),
       );
       expect(err).toContain('not found');
     });
 
     it('returns error when account_id is missing', async () => {
-      const err = expectError(await dispatchFastData('get_profile', {}));
+      const err = expectError(await dispatchFastData('profile', {}));
       expect(err).toContain('account_id');
     });
   });
@@ -211,7 +197,7 @@ describe('dispatchFastData', () => {
     });
   });
 
-  describe('get_followers', () => {
+  describe('followers', () => {
     it('returns agents who follow the account', async () => {
       mockKvGetAll.mockResolvedValue([
         entry('bob.near', 'graph/follow/alice.near', { at: 1700000000 }),
@@ -223,7 +209,7 @@ describe('dispatchFastData', () => {
       ]);
 
       const data = expectData(
-        await dispatchFastData('get_followers', {
+        await dispatchFastData('followers', {
           account_id: 'alice.near',
           limit: 25,
         }),
@@ -233,19 +219,19 @@ describe('dispatchFastData', () => {
     });
   });
 
-  describe('get_me', () => {
+  describe('me', () => {
     it('returns profile with computed completeness', async () => {
       mockKvGetAgent.mockResolvedValue(AGENT_ALICE);
 
       const data = expectData(
-        await dispatchFastData('get_me', { account_id: 'alice.near' }),
+        await dispatchFastData('me', { account_id: 'alice.near' }),
       ) as Record<string, unknown>;
       expect((data.agent as Record<string, unknown>).handle).toBe('alice');
       expect(data.profile_completeness).toBe(60); // description >10 chars (30) + tags present (30), capabilities empty (0)
     });
   });
 
-  describe('get_suggested', () => {
+  describe('discover_agents', () => {
     it('returns scored suggestions excluding self and followed', async () => {
       const bob = {
         ...AGENT_ALICE,
@@ -261,7 +247,7 @@ describe('dispatchFastData', () => {
       ]);
 
       const data = expectData(
-        await dispatchFastData('get_suggested', {
+        await dispatchFastData('discover_agents', {
           account_id: 'alice.near',
           limit: 10,
         }),
@@ -278,7 +264,7 @@ describe('dispatchFastData', () => {
     it('returns error on fetch failure', async () => {
       mockKvGetAgent.mockRejectedValue(new Error('network error'));
       const err = expectError(
-        await dispatchFastData('get_profile', { account_id: 'alice.near' }),
+        await dispatchFastData('profile', { account_id: 'alice.near' }),
       );
       expect(err).toContain('network error');
     });

@@ -44,6 +44,53 @@ export function mockWasmErrorResponse(
   };
 }
 
+export const STUB_AGENT = {
+  handle: 'test_bot',
+  description: 'A test agent',
+  avatar_url: null,
+  tags: ['ai'],
+  capabilities: {},
+  endorsements: {},
+  platforms: [],
+  near_account_id: 'test.near',
+  follower_count: 5,
+  following_count: 3,
+  created_at: 1700000000,
+  last_active: 1700001000,
+};
+
+export const AGENT_ALICE = {
+  handle: 'alice',
+  description: 'Test agent Alice',
+  avatar_url: null,
+  tags: ['ai', 'defi'],
+  capabilities: {},
+  near_account_id: 'alice.near',
+  follower_count: 5,
+  following_count: 3,
+  endorsements: {},
+  platforms: [],
+  created_at: 1700000000,
+  last_active: 1700001000,
+};
+
+export function mockAgent(handle: string) {
+  return {
+    handle,
+    description: 'Test agent',
+    avatar_url: null,
+    tags: ['test'],
+    capabilities: {},
+    endorsements: {},
+    platforms: [],
+    near_account_id: `${handle}.near`,
+    follower_count: 0,
+    following_count: 0,
+    created_at: 1000,
+    last_active: 2000,
+  };
+}
+
 export function lastFetchCall(mockFetch: jest.Mock) {
   const calls = mockFetch.mock.calls;
   if (calls.length === 0) throw new Error('No fetch calls recorded');
