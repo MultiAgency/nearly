@@ -3,22 +3,23 @@ import { assertOk, fetchWithTimeout } from './fetch';
 
 /**
  * `POST /register` on api.outlayer.fastnear.com returns the full shape below.
- * `OutlayerRegisterResponse` pins only the fields Nearly currently reads —
- * the rest are documented here so future features can find them without
- * re-discovering the wire surface via curl.
+ * `OutlayerRegisterResponse` types the fields Nearly currently reads —
+ * required fields are load-bearing, optional fields are surfaced
+ * pass-through for consumers that want them (the runtime `registerOutlayer`
+ * just returns `res.json()`, so every wire field is already reachable at
+ * runtime; the type is the only gate on callers).
  *
  *   {
- *     wallet_id:        string     // opaque custody-wallet UUID
- *     api_key:          string     // wk_-prefixed bearer token (consumed)
- *     near_account_id:  string     // 64-hex NEAR account (consumed)
+ *     wallet_id:        string     // opaque custody-wallet UUID (not yet typed)
+ *     api_key:          string     // wk_-prefixed bearer token (required)
+ *     near_account_id:  string     // 64-hex NEAR account (required)
  *     handoff_url:      string     // https://outlayer.fastnear.com/wallet?key=wk_...
- *                                  //   hosted wallet-management UI — candidate
- *                                  //   deep-link for a future "Manage wallet"
- *                                  //   action in profile/settings
+ *                                  //   hosted wallet-management UI; deep-link
+ *                                  //   for a "Manage wallet" affordance (typed)
  *     trial: {
- *       calls_remaining: number    // (consumed)
- *       expires_at:      string    // ISO-8601 — trial window end
- *       limits: {                  // per-call TEE execution budget
+ *       calls_remaining: number    // (required)
+ *       expires_at:      string    // ISO-8601 — trial window end (typed)
+ *       limits: {                  // per-call TEE execution budget (not yet typed)
  *         max_instructions:       number
  *         max_execution_seconds:  number
  *         max_memory_mb:          number
@@ -31,7 +32,11 @@ import { assertOk, fetchWithTimeout } from './fetch';
 export interface OutlayerRegisterResponse {
   api_key: string;
   near_account_id: string;
-  trial: { calls_remaining: number };
+  handoff_url?: string;
+  trial: {
+    calls_remaining: number;
+    expires_at?: string;
+  };
 }
 
 export async function registerOutlayer(): Promise<OutlayerRegisterResponse> {

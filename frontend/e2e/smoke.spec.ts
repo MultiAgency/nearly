@@ -238,7 +238,11 @@ test('get_activity(A)', async ({ request }) => {
   });
   expect(res.ok()).toBe(true);
   const json = await res.json();
-  expect(typeof json.data.since).toBe('number');
+  // cursor is the block_height high-water mark; undefined only on a
+  // first call that returned zero entries.
+  expect(
+    json.data.cursor === undefined || typeof json.data.cursor === 'number',
+  ).toBe(true);
   expect(Array.isArray(json.data.new_followers)).toBe(true);
   expect(Array.isArray(json.data.new_following)).toBe(true);
 });

@@ -12,10 +12,12 @@
  *   tag/{tag}                             → true (existence index)
  *
  * Edge values carry no `at` — the authoritative "when" is FastData's
- * indexed `block_timestamp`, surfaced on read via `entryBlockSecs`.
+ * indexed `block_height` / `block_timestamp`, surfaced on read via
+ * `entryBlockHeight` / `entryBlockSecs`.
  */
 
-import type { Agent } from '@/types';
+import { getOperatorClaimsWriterKey } from '@/lib/outlayer-server';
+import type { Agent, VerifiableClaim } from '@/types';
 import {
   EXTERNAL_URLS,
   FASTDATA_NAMESPACE,
@@ -34,7 +36,7 @@ import {
   buildEndorsementCounts,
   composeKey,
   endorsePrefix,
-  entryBlockSecs,
+  entryBlockHeight,
   extractCapabilityPairs,
   fetchProfile,
   fetchProfiles,
@@ -121,11 +123,11 @@ function insufficientBalance(accountId: string): WriteResult {
 }
 
 /**
- * Fold a classified write failure into a WriteResult. `writeToFastData`
- * does the HTTP→reason classification itself; this helper is the
- * presentation-layer fold used by non-batch handlers.
+ * Map a failed write outcome to the non-batch handler's WriteResult
+ * envelope. Pure — no I/O. Batch handlers produce per-target records and
+ * do the mapping inline.
  */
-function classifyWriteFailure(
+function writeFailureToResult(
   wrote: Extract<WriteOutcome, { ok: false }>,
   accountId: string,
 ): WriteResult {
@@ -173,12 +175,11 @@ export type WriteOutcome =
   | { ok: false; reason: 'insufficient_balance' | 'storage_error' };
 
 /**
- * Probe OutLayer's balance endpoint for a wallet. Returns true iff the
- * wallet exists and reports a zero balance. Any other outcome (HTTP failure,
- * malformed body, non-zero balance) returns false — we never misclassify a
- * genuine upstream outage as an unfunded wallet.
+ * Returns true iff OutLayer reports this wallet's NEAR balance as exactly
+ * "0". Any other outcome (HTTP failure, malformed body, non-zero balance)
+ * returns false — never misclassify an upstream outage as a drained wallet.
  */
-async function isWalletUnfunded(walletKey: string): Promise<boolean> {
+async function hasZeroNearBalance(walletKey: string): Promise<boolean> {
   try {
     const res = await fetchWithTimeout(
       `${OUTLAYER_API_URL}/wallet/v1/balance?chain=near`,
@@ -224,13 +225,11 @@ export async function writeToFastData(
     console.error(
       `[fastdata-write] http ${res.status}: ${detail.slice(0, 200)}`,
     );
-    if (res.status === 402) {
-      return { ok: false, reason: 'insufficient_balance' };
-    }
-    // OutLayer returns HTTP 502 (Cloudflare upstream error) for writes on
-    // unfunded wallets, not 402. Confirmed 2026-04-13. Probe the balance
-    // endpoint to disambiguate a genuine outage from an unfunded wallet.
-    if (res.status === 502 && (await isWalletUnfunded(walletKey))) {
+    // Zero-balance writes return 502 + text/plain (Cloudflare upstream),
+    // so probe the balance endpoint to disambiguate a genuine outage from
+    // an unfunded wallet — a funded wallet hitting a real outage must
+    // stay STORAGE_ERROR so the caller retries instead of prompting to fund.
+    if (res.status === 502 && (await hasZeroNearBalance(walletKey))) {
       return { ok: false, reason: 'insufficient_balance' };
     }
     return { ok: false, reason: 'storage_error' };
@@ -412,7 +411,7 @@ async function runBatch(opts: BatchOptions): Promise<WriteResult> {
       continue;
     }
 
-    incrementRateLimit(opts.action, caller.accountId);
+    incrementRateLimit(opts.action, caller.accountId, budget.window);
     processed++;
     results.push(step.onWritten());
   }
@@ -467,9 +466,10 @@ export async function handleFollow(
         };
       }
       // Edge value: just the reason if provided, else an empty object.
-      // No `at` field — the FastData-indexed `block_timestamp` of this
-      // entry is the only authoritative time, surfaced via `entryBlockSecs`
-      // on the read path. Empty `{}` is a "live" entry (object, not null).
+      // No `at` field — the FastData-indexed `block_height` of this
+      // entry is the only authoritative time, surfaced via `entryBlockHeight`
+      // (and its seconds sibling `entryBlockSecs`) on the read path. Empty
+      // `{}` is a "live" entry (object, not null).
       return {
         kind: 'write',
         entries: {
@@ -750,6 +750,7 @@ export async function handleUpdateMe(
 
   const rl = checkRateLimit('update_me', caller.accountId);
   if (!rl.ok) return rateLimited(rl.retryAfter);
+  const rlWindow = rl.window;
 
   const agent = { ...caller.agent };
   let changed = false;
@@ -831,9 +832,9 @@ export async function handleUpdateMe(
   }
 
   const wrote = await writeToFastData(walletKey, entries);
-  if (!wrote.ok) return classifyWriteFailure(wrote, caller.accountId);
+  if (!wrote.ok) return writeFailureToResult(wrote, caller.accountId);
 
-  incrementRateLimit('update_me', caller.accountId);
+  incrementRateLimit('update_me', caller.accountId, rlWindow);
 
   // Overlay live counts on the response so clients receive the same agent
   // shape as heartbeat returns (stored profiles don't carry count fields).
@@ -859,22 +860,31 @@ export async function handleHeartbeat(
 
   const rl = checkRateLimit('heartbeat', caller.accountId);
   if (!rl.ok) return rateLimited(rl.retryAfter);
+  const rlWindow = rl.window;
 
-  // `previousActive` is block-authoritative — `fetchProfile` set
-  // `caller.agent.last_active` from the block timestamp of the caller's
-  // most recent profile write. Edge comparisons below use
-  // `entryBlockSecs(e)` for the same trust source.
+  // `previousActiveHeight` is block-authoritative — `fetchProfile` set
+  // `caller.agent.last_active_height` from the block height of the caller's
+  // most recent profile write via `applyTrustBoundary`. Edge comparisons
+  // below filter with `entryBlockHeight(e) > previousActiveHeight` — the
+  // strictly-after semantic matches the activity-query cursor (step 4)
+  // and the at-or-after seconds comparison we used before was wrong: it
+  // could re-include edges the caller had already seen on the prior
+  // heartbeat response.
+  //
+  // `previousActive` (seconds) stays around only to populate `delta.since`
+  // on the response for consumers not yet migrated to `since_height`.
   //
   // First-heartbeat case: `caller.agent` is the in-memory `defaultAgent`
-  // (no profile exists yet) which carries no `last_active`. The `?? 0`
-  // fallback makes the delta surface every pre-existing follower edge as
-  // "new since you never existed."
+  // (no profile exists yet) which carries no `last_active_height`. The
+  // `?? 0` fallback makes the delta surface every pre-existing follower
+  // edge as "new since you never existed."
   //
   // Note: `responseAgent.last_active` ends up undefined for first
   // heartbeats and equal to the prior block time for subsequent ones —
   // never wall clock. Clients that need the post-write block time re-read
   // via `GET /agents/me` after the transaction lands.
   const previousActive = caller.agent.last_active ?? 0;
+  const previousActiveHeight = caller.agent.last_active_height ?? 0;
   const agent = { ...caller.agent };
 
   // Compute live counts from graph traversal (parallel)
@@ -888,20 +898,23 @@ export async function handleHeartbeat(
   agent.endorsements = buildEndorsementCounts(endorseEntries, caller.accountId);
 
   // New followers since last heartbeat. We filter by the FastData-indexed
-  // block_timestamp of the edge write, not the follower's caller-asserted
-  // `value.at`, so a follower cannot backdate their edge to hide from (or
-  // forge an appearance in) this delta.
+  // `block_height` of the edge write — strictly greater than the caller's
+  // previous `last_active_height` — so a follower cannot backdate their
+  // edge to hide from (or forge an appearance in) this delta. Strictly
+  // after, not at-or-after, matches the activity-query cursoring semantic
+  // from step 4: the caller already saw everything up to and including
+  // their own previous profile-write block on the prior heartbeat.
   const newFollowerAccounts: string[] = [];
   for (const e of followerEntries) {
-    if (entryBlockSecs(e) >= previousActive) {
+    if (entryBlockHeight(e) > previousActiveHeight) {
       newFollowerAccounts.push(e.predecessor_id);
     }
   }
 
-  // New following since last heartbeat — same block-time rule applied to
-  // the caller's own outbound edges for symmetry.
+  // New following since last heartbeat — same block-height rule applied
+  // to the caller's own outbound edges for symmetry.
   const newFollowingCount = followingEntries.filter(
-    (e) => entryBlockSecs(e) >= previousActive,
+    (e) => entryBlockHeight(e) > previousActiveHeight,
   ).length;
 
   // Batch-fetch profiles for new follower summaries. `fetchProfiles`
@@ -914,9 +927,9 @@ export async function handleHeartbeat(
   // Write updated profile + tag/cap indexes
   const entries = agentEntries(agent);
   const wrote = await writeToFastData(walletKey, entries);
-  if (!wrote.ok) return classifyWriteFailure(wrote, caller.accountId);
+  if (!wrote.ok) return writeFailureToResult(wrote, caller.accountId);
 
-  incrementRateLimit('heartbeat', caller.accountId);
+  incrementRateLimit('heartbeat', caller.accountId, rlWindow);
 
   const responseAgent: Agent = {
     ...agent,
@@ -929,6 +942,7 @@ export async function handleHeartbeat(
     profile_completeness: profileCompleteness(responseAgent),
     delta: {
       since: previousActive,
+      since_height: previousActiveHeight,
       new_followers: newFollowers,
       new_followers_count: newFollowers.length,
       new_following_count: newFollowingCount,
@@ -949,6 +963,7 @@ export async function handleDelistMe(
 
   const rl = checkRateLimit('delist_me', caller.accountId);
   if (!rl.ok) return rateLimited(rl.retryAfter);
+  const rlWindow = rl.window;
 
   // Null-write all agent keys
   const entries: Record<string, unknown> = {
@@ -978,9 +993,9 @@ export async function handleDelistMe(
   }
 
   const wrote = await writeToFastData(walletKey, entries);
-  if (!wrote.ok) return classifyWriteFailure(wrote, caller.accountId);
+  if (!wrote.ok) return writeFailureToResult(wrote, caller.accountId);
 
-  incrementRateLimit('delist_me', caller.accountId);
+  incrementRateLimit('delist_me', caller.accountId, rlWindow);
 
   return ok({
     action: 'delisted',
@@ -1019,6 +1034,8 @@ const INVALIDATION_MAP: Record<string, readonly string[]> = {
   ],
   hide_agent: ['hidden'],
   unhide_agent: ['hidden'],
+  claim_operator: ['agent_claims'],
+  unclaim_operator: ['agent_claims'],
 };
 
 /** Cached reads that a given mutation stales. Null means "clear everything". */
@@ -1091,4 +1108,179 @@ export async function dispatchWrite(
     result.invalidates = INVALIDATION_MAP[action] ?? null;
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// NEP-413 write dispatch — for mutations gated on a verified NEP-413 envelope
+// rather than on a `wk_` custody wallet bearer token. Currently only
+// `claim_operator` / `unclaim_operator` land here; if a future mutation also
+// accepts human sign-ins, add it to `NEP413_WRITE_ACTIONS` in `route.ts` and
+// case it in the switch below.
+//
+// Architecture notes (see `.agents/planning/lightweight-signin-frontend.md`
+// "Data model" section for the full framing):
+//
+// - The caller is a human with no `wk_` of their own. Nearly's server writes
+//   the claim on the human's behalf using `OUTLAYER_OPERATOR_CLAIMS_WK` — a
+//   server-held service custody wallet key. The stored KV value IS the full
+//   NEP-413 envelope, so any reader can independently re-verify the operator's
+//   assertion against NEAR RPC — the predecessor attribution is irrelevant to
+//   trust, the envelope is the proof.
+// - The key is `operator/{operator_account_id}/{agent_account_id}` under the
+//   service-writer predecessor. The operator's account_id is read from the
+//   verified claim (the authority is the envelope signature, not the request).
+//   The agent's account_id is the path param.
+// - Identity mismatch between the claim's outer `account_id` and its inner
+//   message `account_id` is already rejected by `verifyClaim` (see
+//   `verify-claim.ts` lines around the "message account_id does not match"
+//   guard). This dispatcher does not re-check it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Context passed to NEP-413 write handlers. The route layer verifies the
+ * claim via `verifyClaim` and packages the result into this shape before
+ * dispatching; handlers should treat the fields as authoritative.
+ */
+export interface Nep413WriteContext {
+  /** The verified operator identity from `verifyClaim().account_id`. */
+  operatorAccountId: string;
+  /** The full verified claim envelope, stored as the KV value on writes. */
+  claim: VerifiableClaim;
+}
+
+export async function dispatchNep413Write(
+  action: string,
+  body: Record<string, unknown>,
+  ctx: Nep413WriteContext,
+): Promise<WriteResult> {
+  // Rate-limit keyed on the verified operator, not request IP — abusive
+  // callers must rotate their NEAR account to get a fresh budget, which is
+  // the same "cost of abuse" story as `wk_`-keyed write limits.
+  const rl = checkRateLimit(action, ctx.operatorAccountId);
+  if (!rl.ok) return rateLimited(rl.retryAfter);
+  const rlWindow = rl.window;
+
+  let result: WriteResult;
+
+  switch (action) {
+    case 'claim_operator':
+      result = await handleClaimOperator(body, ctx, rlWindow);
+      break;
+    case 'unclaim_operator':
+      result = await handleUnclaimOperator(body, ctx, rlWindow);
+      break;
+    default:
+      return fail(
+        'VALIDATION_ERROR',
+        `Action '${action}' not supported for NEP-413 write`,
+      );
+  }
+
+  if (result.success) {
+    result.invalidates = INVALIDATION_MAP[action] ?? null;
+  }
+  return result;
+}
+
+/**
+ * Extract and validate the `account_id` path param that names the target
+ * agent. The route layer normalizes `:accountId` into `body.account_id`
+ * before dispatch, so this reads from there.
+ */
+function requireAgentAccountId(
+  body: Record<string, unknown>,
+): string | WriteResult {
+  const raw = body.account_id;
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return fail('VALIDATION_ERROR', 'agent account_id is required');
+  }
+  return raw;
+}
+
+async function handleClaimOperator(
+  body: Record<string, unknown>,
+  ctx: Nep413WriteContext,
+  rlWindow: number,
+): Promise<WriteResult> {
+  const agentAccountId = requireAgentAccountId(body);
+  if (typeof agentAccountId !== 'string') return agentAccountId;
+
+  const keyPrefix = composeKey('operator/', `${ctx.operatorAccountId}/`);
+  const suffixError = validateKeySuffix(agentAccountId, keyPrefix);
+  if (suffixError) return validationFail(suffixError);
+
+  const reason = body.reason as string | undefined;
+  if (reason != null) {
+    const e = validateReason(reason);
+    if (e) return validationFail(e);
+  }
+
+  const serviceKey = getOperatorClaimsWriterKey();
+  if (!serviceKey) {
+    return fail(
+      'NOT_CONFIGURED',
+      'Operator claims writer key is not configured on this deployment',
+      503,
+    );
+  }
+
+  const fullKey = composeKey(keyPrefix, agentAccountId);
+  // Store the full NEP-413 envelope so readers can independently re-verify.
+  // Optional `reason` is stored alongside; `at` / `at_height` are never
+  // stored (derived on read from the entry's block timestamp / height).
+  const value: Record<string, unknown> = {
+    message: ctx.claim.message,
+    signature: ctx.claim.signature,
+    public_key: ctx.claim.public_key,
+    nonce: ctx.claim.nonce,
+    ...(reason != null && { reason }),
+  };
+
+  const wrote = await writeToFastData(serviceKey, { [fullKey]: value });
+  if (!wrote.ok) {
+    return writeFailureToResult(wrote, ctx.operatorAccountId);
+  }
+
+  incrementRateLimit('claim_operator', ctx.operatorAccountId, rlWindow);
+
+  return ok({
+    action: 'claimed',
+    operator_account_id: ctx.operatorAccountId,
+    agent_account_id: agentAccountId,
+  });
+}
+
+async function handleUnclaimOperator(
+  body: Record<string, unknown>,
+  ctx: Nep413WriteContext,
+  rlWindow: number,
+): Promise<WriteResult> {
+  const agentAccountId = requireAgentAccountId(body);
+  if (typeof agentAccountId !== 'string') return agentAccountId;
+
+  const serviceKey = getOperatorClaimsWriterKey();
+  if (!serviceKey) {
+    return fail(
+      'NOT_CONFIGURED',
+      'Operator claims writer key is not configured on this deployment',
+      503,
+    );
+  }
+
+  const fullKey = composeKey(
+    composeKey('operator/', `${ctx.operatorAccountId}/`),
+    agentAccountId,
+  );
+  const wrote = await writeToFastData(serviceKey, { [fullKey]: null });
+  if (!wrote.ok) {
+    return writeFailureToResult(wrote, ctx.operatorAccountId);
+  }
+
+  incrementRateLimit('unclaim_operator', ctx.operatorAccountId, rlWindow);
+
+  return ok({
+    action: 'unclaimed',
+    operator_account_id: ctx.operatorAccountId,
+    agent_account_id: agentAccountId,
+  });
 }

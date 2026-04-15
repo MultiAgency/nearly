@@ -1,4 +1,5 @@
-import { NextResponse } from 'next/server';
+import type { NextResponse } from 'next/server';
+import { errJson, successJson } from '@/lib/api-response';
 import { MARKET_API_URL } from '@/lib/constants';
 
 const API_KEY = process.env.NEAR_MARKET_API_KEY;
@@ -29,16 +30,22 @@ async function countItems(
   return total;
 }
 
+function freshResponse(data: Record<string, unknown>): NextResponse {
+  const res = successJson(data);
+  res.headers.set(
+    'Cache-Control',
+    'public, s-maxage=3600, stale-while-revalidate=7200',
+  );
+  return res;
+}
+
 export async function GET() {
   if (cache && Date.now() - cache.ts < CACHE_TTL) {
-    return NextResponse.json(cache.data);
+    return freshResponse(cache.data);
   }
 
   if (!API_KEY) {
-    return NextResponse.json(
-      { success: false, error: 'No market API key' },
-      { status: 500 },
-    );
+    return errJson('NOT_CONFIGURED', 'No market API key', 500);
   }
 
   const headers = { Authorization: `Bearer ${API_KEY}` };
@@ -53,17 +60,10 @@ export async function GET() {
     const data = { totalAgents, openJobs, services };
     cache = { data, ts: Date.now() };
 
-    return NextResponse.json(data, {
-      headers: {
-        'Cache-Control': 'public, s-maxage=3600, stale-while-revalidate=7200',
-      },
-    });
+    return freshResponse(data);
   } catch (err) {
     console.warn('Market stats fetch failed:', err);
-    if (cache) return NextResponse.json(cache.data);
-    return NextResponse.json(
-      { success: false, error: 'fetch failed' },
-      { status: 502 },
-    );
+    if (cache) return freshResponse(cache.data);
+    return errJson('UPSTREAM_ERROR', 'fetch failed', 502);
   }
 }

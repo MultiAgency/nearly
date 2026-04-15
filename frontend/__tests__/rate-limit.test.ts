@@ -18,7 +18,9 @@ describe('checkRateLimit', () => {
   it('allows requests within limit', () => {
     // follow limit is 10 per 60s
     for (let i = 0; i < 10; i++) {
-      expect(checkRateLimit('follow', 'alice.near')).toEqual({ ok: true });
+      expect(checkRateLimit('follow', 'alice.near')).toMatchObject({
+        ok: true,
+      });
       incrementRateLimit('follow', 'alice.near');
     }
   });
@@ -44,7 +46,7 @@ describe('checkRateLimit', () => {
     // Advance past the 60s window
     jest.advanceTimersByTime(61_000);
 
-    expect(checkRateLimit('follow', 'alice.near')).toEqual({ ok: true });
+    expect(checkRateLimit('follow', 'alice.near')).toMatchObject({ ok: true });
   });
 
   it('isolates by caller', () => {
@@ -52,7 +54,7 @@ describe('checkRateLimit', () => {
       incrementRateLimit('follow', 'alice.near');
     }
     expect(checkRateLimit('follow', 'alice.near').ok).toBe(false);
-    expect(checkRateLimit('follow', 'bob.near')).toEqual({ ok: true });
+    expect(checkRateLimit('follow', 'bob.near')).toMatchObject({ ok: true });
   });
 
   it('isolates by action', () => {
@@ -61,7 +63,7 @@ describe('checkRateLimit', () => {
     }
     expect(checkRateLimit('follow', 'alice.near').ok).toBe(false);
     // endorse has its own limit (20), not exhausted
-    expect(checkRateLimit('endorse', 'alice.near')).toEqual({ ok: true });
+    expect(checkRateLimit('endorse', 'alice.near')).toMatchObject({ ok: true });
   });
 
   it('fails closed on unknown actions (no rate limit configured)', () => {
@@ -91,6 +93,57 @@ describe('incrementRateLimit', () => {
       retryAfter: 60,
     });
   });
+
+  it('pins a threaded increment to the authorizing window across a boundary', () => {
+    // Advance to a clean state so prior test increments don't leak.
+    jest.advanceTimersByTime(301_000);
+
+    // Check at t=0 — authorized against window W.
+    const check = checkRateLimit('follow', 'bob.near');
+    expect(check.ok).toBe(true);
+    if (!check.ok) return;
+    const authorizedWindow = check.window;
+
+    // "Work" takes longer than the 60s window. Increment lands after
+    // the boundary, but we thread the original window through.
+    jest.advanceTimersByTime(61_000);
+    incrementRateLimit('follow', 'bob.near', authorizedWindow);
+
+    // The new window's budget is untouched: the late increment pinned to
+    // the stale window and did not consume a slot in the current one.
+    expect(checkRateLimitBudget('follow', 'bob.near')).toMatchObject({
+      ok: true,
+      remaining: 10,
+    });
+  });
+
+  it('drops a late increment whose pinned window is older than the current entry', () => {
+    jest.advanceTimersByTime(301_000);
+
+    // Check + increment in window W populates the store at window W.
+    const first = checkRateLimit('follow', 'carol.near');
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    incrementRateLimit('follow', 'carol.near', first.window);
+
+    // Advance to window W+1 and do a proper check+increment there.
+    jest.advanceTimersByTime(61_000);
+    const second = checkRateLimit('follow', 'carol.near');
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    incrementRateLimit('follow', 'carol.near', second.window);
+
+    // Now a late increment arrives pinned to window W. The store is at W+1;
+    // the old window cannot be resurrected, and we should not pollute the
+    // current bucket, so the late increment is dropped.
+    incrementRateLimit('follow', 'carol.near', first.window);
+
+    // Current-window budget is still 9 (1 increment from `second`, not 2).
+    expect(checkRateLimitBudget('follow', 'carol.near')).toMatchObject({
+      ok: true,
+      remaining: 9,
+    });
+  });
 });
 
 describe('checkRateLimitBudget', () => {
@@ -101,7 +154,7 @@ describe('checkRateLimitBudget', () => {
 
   it('returns full budget when no requests made', () => {
     const result = checkRateLimitBudget('follow', 'alice.near');
-    expect(result).toEqual({ ok: true, remaining: 10 });
+    expect(result).toMatchObject({ ok: true, remaining: 10 });
   });
 
   it('returns remaining budget after some requests', () => {
@@ -109,7 +162,7 @@ describe('checkRateLimitBudget', () => {
       incrementRateLimit('follow', 'alice.near');
     }
     const result = checkRateLimitBudget('follow', 'alice.near');
-    expect(result).toEqual({ ok: true, remaining: 7 });
+    expect(result).toMatchObject({ ok: true, remaining: 7 });
   });
 
   it('returns error when budget exhausted', () => {
@@ -137,11 +190,11 @@ describe('checkRateLimitBudget', () => {
     jest.advanceTimersByTime(61_000);
 
     const result = checkRateLimitBudget('follow', 'alice.near');
-    expect(result).toEqual({ ok: true, remaining: 10 });
+    expect(result).toMatchObject({ ok: true, remaining: 10 });
   });
 
   it('respects action-specific limits (delist_me = 1 per 300s)', () => {
-    expect(checkRateLimitBudget('delist_me', 'alice.near')).toEqual({
+    expect(checkRateLimitBudget('delist_me', 'alice.near')).toMatchObject({
       ok: true,
       remaining: 1,
     });

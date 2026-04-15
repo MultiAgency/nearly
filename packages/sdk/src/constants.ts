@@ -3,11 +3,39 @@ export const DEFAULT_OUTLAYER_URL = 'https://api.outlayer.fastnear.com';
 export const DEFAULT_NAMESPACE = 'contextual.near';
 export const DEFAULT_TIMEOUT_MS = 10_000;
 
+/**
+ * Default WASM project coordinates on OutLayer. The owner/project pair
+ * routes `/call/{owner}/{project}` to the Nearly WASM deployment. Matches
+ * the `hack.near/nearly` defaults in `frontend/src/lib/constants.ts`
+ * (2026-04-15). Overridable per-client via `NearlyClientConfig.wasmOwner` /
+ * `wasmProject` for staging or fork deployments.
+ */
+export const DEFAULT_WASM_OWNER = 'hack.near';
+export const DEFAULT_WASM_PROJECT = 'nearly';
+
 export const FASTDATA_PAGE_SIZE = 200;
 export const FASTDATA_MAX_PAGES = 50;
 
 export const LIMITS = {
   REASON_MAX: 280,
+  AGENT_NAME_MAX: 50,
+  DESCRIPTION_MAX: 500,
+  IMAGE_URL_MAX: 512,
+  CAPABILITIES_MAX: 4096,
+  MAX_TAGS: 10,
+  MAX_TAG_LEN: 30,
+  MAX_CAPABILITY_DEPTH: 4,
+  /** FastData KV enforces 1024 bytes for the full composed key. */
+  FASTDATA_MAX_KEY_BYTES: 1024,
+  /** Max key_suffixes per endorse/unendorse call. */
+  MAX_KEY_SUFFIXES: 20,
+  /**
+   * Max length for a sub-agent `seed` string passed to
+   * `NearlyClient.deriveSubAgent`. OutLayer does not document a seed
+   * length limit — 256 is a caller-sanity cap to catch "whole JSON blob
+   * passed as seed" bugs. Can be relaxed if a real use case hits it.
+   */
+  SEED_MAX: 256,
 } as const;
 
 export const RATE_LIMITS: Record<
@@ -15,7 +43,12 @@ export const RATE_LIMITS: Record<
   { limit: number; windowSecs: number }
 > = {
   follow: { limit: 10, windowSecs: 60 },
+  unfollow: { limit: 10, windowSecs: 60 },
   heartbeat: { limit: 5, windowSecs: 60 },
+  update_me: { limit: 10, windowSecs: 60 },
+  endorse: { limit: 20, windowSecs: 60 },
+  unendorse: { limit: 20, windowSecs: 60 },
+  delist_me: { limit: 1, windowSecs: 300 },
 };
 
 export const WRITE_GAS = '30000000000000';

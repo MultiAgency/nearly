@@ -30,18 +30,50 @@ describe('graph.foldProfile', () => {
     expect(foldProfile(e)?.last_active).toBe(1_700_000_000);
   });
 
-  it('strips caller-asserted created_at from the blob', () => {
-    // `created_at` is only populated by read paths that fetch FastData
-    // history (a future v0.1+ concern). `foldProfile` must clear it from
-    // the spread so a blob with `created_at: 9_999_999_999` can't leak
-    // caller-asserted time into the returned Agent. Without this strip,
-    // sort=newest-style orderings would be manipulable.
+  it('strips every trust-boundary and derived field from legacy blobs', () => {
+    // `created_at` / `created_height` are only populated by read paths
+    // that fetch FastData first-write history (`getAgent`, `listAgents`
+    // sort=newest). Count / endorsement fields are overlaid elsewhere.
+    // `foldProfile` must destructure all of them out of the blob so a
+    // forged value in any slot can't leak into the returned Agent —
+    // without this, sort=newest, sort=followers, and endorsement
+    // rankings would all be manipulable by a malicious writer. This
+    // test is the read-side complement of the write-side strip guard
+    // in `mutations.test.ts::buildHeartbeat`.
     const e = entry({
       predecessor_id: 'alice.near',
       key: 'profile',
-      value: { ...aliceProfileBlob, created_at: 9_999_999_999 },
+      value: {
+        ...aliceProfileBlob,
+        last_active: 9_999_999_999,
+        last_active_height: 9_999_999,
+        created_at: 9_999_999_999,
+        created_height: 9_999_999,
+        follower_count: 999,
+        following_count: 888,
+        endorsement_count: 777,
+        endorsements: { 'forged/key': 666 },
+      },
+      block_timestamp: 1_700_000_000_000_000_000,
+      block_height: 1_234,
     });
-    expect(foldProfile(e)?.created_at).toBeUndefined();
+    const agent = foldProfile(e);
+    // Trust-boundary overrides fire.
+    expect(agent?.account_id).toBe('alice.near');
+    expect(agent?.last_active).toBe(1_700_000_000);
+    expect(agent?.last_active_height).toBe(1_234);
+    // Forged fields with no authoritative replacement are genuinely
+    // absent — not present with undefined — on foldProfile's return.
+    for (const forbidden of [
+      'created_at',
+      'created_height',
+      'follower_count',
+      'following_count',
+      'endorsement_count',
+      'endorsements',
+    ]) {
+      expect(agent).not.toHaveProperty(forbidden);
+    }
   });
 
   it('returns null when the entry value is a string', () => {

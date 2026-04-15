@@ -3,6 +3,10 @@
  *
  * Resets on cold start — acceptable because this is defense-in-depth,
  * not the security boundary.
+ *
+ * Window threading: check returns the window it authorized against;
+ * increment pins to that window so a boundary crossing between check and
+ * increment can't silently move the count into a fresh budget.
  */
 
 interface WindowEntry {
@@ -23,6 +27,10 @@ const LIMITS: Record<string, { limit: number; windowSecs: number }> = {
   update_me: { limit: 10, windowSecs: 60 },
   heartbeat: { limit: 5, windowSecs: 60 },
   delist_me: { limit: 1, windowSecs: 300 },
+  // Operator-claim writes are NEP-413 auth'd (no `wk_`), so the rate-limit
+  // key is the verified operator's account_id, not the request IP.
+  claim_operator: { limit: 5, windowSecs: 60 },
+  unclaim_operator: { limit: 5, windowSecs: 60 },
   verify_claim: { limit: 60, windowSecs: 60 },
   hidden_list: { limit: 120, windowSecs: 60 },
   list_platforms: { limit: 120, windowSecs: 60 },
@@ -31,7 +39,7 @@ const LIMITS: Record<string, { limit: number; windowSecs: number }> = {
 export function checkRateLimit(
   action: string,
   callerHandle: string,
-): { ok: true } | { ok: false; retryAfter: number } {
+): { ok: true; window: number } | { ok: false; retryAfter: number } {
   const config = LIMITS[action];
   if (!config) return { ok: false, retryAfter: 60 };
 
@@ -50,7 +58,7 @@ export function checkRateLimit(
   const entry = store.get(key);
 
   if (!entry || entry.window !== window) {
-    return { ok: true };
+    return { ok: true, window };
   }
 
   if (entry.count >= config.limit) {
@@ -58,37 +66,57 @@ export function checkRateLimit(
     return { ok: false, retryAfter };
   }
 
-  return { ok: true };
+  return { ok: true, window };
 }
 
 /**
  * Increment rate limit counter without checking.
  * Used after successful mutation to count it against the budget.
+ *
+ * Pass the `window` returned by the authorizing check to pin the increment
+ * to that bucket. Without it, the increment recomputes the window from the
+ * current time and can drift across a boundary.
  */
-export function incrementRateLimit(action: string, callerHandle: string): void {
+export function incrementRateLimit(
+  action: string,
+  callerHandle: string,
+  window?: number,
+): void {
   const config = LIMITS[action];
   if (!config) return;
 
   const now = Math.floor(Date.now() / 1000);
-  const window = Math.floor(now / config.windowSecs);
+  const targetWindow = window ?? Math.floor(now / config.windowSecs);
   const key = `${action}:${callerHandle}`;
   const entry = store.get(key);
 
-  if (!entry || entry.window !== window) {
-    store.set(key, { window, count: 1 });
-  } else {
-    entry.count++;
+  if (!entry) {
+    store.set(key, { window: targetWindow, count: 1 });
+    return;
   }
+  if (entry.window === targetWindow) {
+    entry.count++;
+    return;
+  }
+  if (entry.window < targetWindow) {
+    store.set(key, { window: targetWindow, count: 1 });
+    return;
+  }
+  // entry.window > targetWindow: a late increment for an old window whose
+  // entry has already been replaced. The request happened, but its budget is
+  // stale — dropping it is safer than double-counting in the current bucket.
 }
 
 /**
  * Check remaining budget for batch operations.
- * Returns remaining count or error with retryAfter.
+ * Returns remaining count + the authorizing window, or error with retryAfter.
  */
 export function checkRateLimitBudget(
   action: string,
   callerHandle: string,
-): { ok: true; remaining: number } | { ok: false; retryAfter: number } {
+):
+  | { ok: true; remaining: number; window: number }
+  | { ok: false; retryAfter: number } {
   const config = LIMITS[action];
   if (!config) return { ok: false, retryAfter: 60 };
 
@@ -98,7 +126,7 @@ export function checkRateLimitBudget(
   const entry = store.get(key);
 
   if (!entry || entry.window !== window) {
-    return { ok: true, remaining: config.limit };
+    return { ok: true, remaining: config.limit, window };
   }
 
   if (entry.count >= config.limit) {
@@ -106,5 +134,5 @@ export function checkRateLimitBudget(
     return { ok: false, retryAfter };
   }
 
-  return { ok: true, remaining: config.limit - entry.count };
+  return { ok: true, remaining: config.limit - entry.count, window };
 }

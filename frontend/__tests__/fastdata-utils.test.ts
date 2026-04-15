@@ -14,6 +14,10 @@ jest.mock('@/lib/fastdata');
 const mockKvGetAgent = fastdata.kvGetAgent as jest.MockedFunction<
   typeof fastdata.kvGetAgent
 >;
+const mockKvGetAgentFirstWrite =
+  fastdata.kvGetAgentFirstWrite as jest.MockedFunction<
+    typeof fastdata.kvGetAgentFirstWrite
+  >;
 const mockKvMultiAgent = fastdata.kvMultiAgent as jest.MockedFunction<
   typeof fastdata.kvMultiAgent
 >;
@@ -25,11 +29,12 @@ function profileEntry(
   predecessorId: string,
   value: unknown,
   blockTimestamp = 1_700_000_000_000_000_000,
+  blockHeight = 1,
 ): fastdata.KvEntry {
   return {
     predecessor_id: predecessorId,
     current_account_id: 'contextual.near',
-    block_height: 1,
+    block_height: blockHeight,
     block_timestamp: blockTimestamp,
     key: 'profile',
     value,
@@ -38,6 +43,7 @@ function profileEntry(
 
 beforeEach(() => {
   mockKvGetAgent.mockReset();
+  mockKvGetAgentFirstWrite.mockReset();
   mockKvMultiAgent.mockReset();
   mockKvGetAll.mockReset();
 });
@@ -61,8 +67,8 @@ describe('fetchProfile', () => {
 
     const result = await fetchProfile('alice.near');
     expect(result).not.toBeNull();
-    expect(result?.account_id).toBe('alice.near');
-    expect(result?.name).toBe('Alice');
+    expect(result).toHaveProperty('account_id', 'alice.near');
+    expect(result).toHaveProperty('name', 'Alice');
   });
 
   it('overrides caller-asserted last_active with block timestamp', async () => {
@@ -78,7 +84,82 @@ describe('fetchProfile', () => {
     );
 
     const result = await fetchProfile('alice.near');
-    expect(result?.last_active).toBe(1_700_000_000);
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty('last_active', 1_700_000_000);
+  });
+
+  it('sets last_active_height from the entry block_height', async () => {
+    // The block-height companion of last_active. Step 2 of the wall
+    // clock → block height transition: every read path that derives
+    // `last_active` from `block_timestamp` also surfaces the raw
+    // `block_height` as the canonical "when" value. The stored blob
+    // has no `last_active_height` slot (and never will — it's
+    // read-derived), so this test just asserts the override fires
+    // with the raw block_height value from the entry.
+    mockKvGetAgent.mockResolvedValue(
+      profileEntry(
+        'alice.near',
+        { account_id: 'alice.near', name: 'Alice' },
+        1_700_000_000_000_000_000,
+        123_456_789,
+      ),
+    );
+
+    const result = await fetchProfile('alice.near');
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty('last_active_height', 123_456_789);
+  });
+
+  it('populates both created_at and created_height from the first-write entry', async () => {
+    // Step 3 of the wall clock → block height transition: fetchProfile
+    // fans out to the latest entry (for last_active / last_active_height)
+    // and the first-write entry (for created_at / created_height). Both
+    // block-derived fields ship together on every single-profile read.
+    // The first-write block_timestamp and block_height are deliberately
+    // distinct from the latest entry's values — the assertion catches
+    // any regression that crosses them.
+    mockKvGetAgent.mockResolvedValue(
+      profileEntry(
+        'alice.near',
+        { account_id: 'alice.near', name: 'Alice' },
+        1_700_005_000_000_000_000,
+        200,
+      ),
+    );
+    mockKvGetAgentFirstWrite.mockResolvedValue(
+      profileEntry(
+        'alice.near',
+        { account_id: 'alice.near', name: 'Alice' },
+        1_700_000_000_000_000_000,
+        100,
+      ),
+    );
+
+    const result = await fetchProfile('alice.near');
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty('last_active', 1_700_005_000);
+    expect(result).toHaveProperty('last_active_height', 200);
+    expect(result).toHaveProperty('created_at', 1_700_000_000);
+    expect(result).toHaveProperty('created_height', 100);
+  });
+
+  it('leaves created fields absent when history fetch returns null', async () => {
+    // If the first-write entry is missing (history call failed, or the
+    // agent's first write hasn't been indexed yet), both created fields
+    // stay genuinely absent from the returned Agent — applyTrustBoundary
+    // destructured them out and fetchProfile does not re-assign when
+    // firstWrite is null. We never fall back to the latest entry's block
+    // values, because that would conflate "when was this written" with
+    // "when was this first written" and re-introduce a manipulation gap.
+    mockKvGetAgent.mockResolvedValue(
+      profileEntry('alice.near', { account_id: 'alice.near', name: 'Alice' }),
+    );
+    mockKvGetAgentFirstWrite.mockResolvedValue(null);
+
+    const result = await fetchProfile('alice.near');
+    expect(result).not.toBeNull();
+    expect(result).not.toHaveProperty('created_at');
+    expect(result).not.toHaveProperty('created_height');
   });
 
   it('returns null when the entry is null', async () => {
@@ -138,6 +219,31 @@ describe('fetchProfiles', () => {
     expect(result[1].last_active).toBe(1_700_000_002);
   });
 
+  it('surfaces last_active_height from each entry block_height', async () => {
+    // Batch reads preserve the height override per-entry, not just the
+    // seconds override. Same audit-closure argument as last_active:
+    // sort=active under tag/cap filters must cursor on block_height
+    // once step 4 migrates delta queries.
+    mockKvMultiAgent.mockResolvedValue([
+      profileEntry(
+        'alice.near',
+        { account_id: 'alice.near' },
+        1_700_000_001_000_000_000,
+        100,
+      ),
+      profileEntry(
+        'bob.near',
+        { account_id: 'bob.near' },
+        1_700_000_002_000_000_000,
+        200,
+      ),
+    ]);
+
+    const result = await fetchProfiles(['alice.near', 'bob.near']);
+    expect(result[0].last_active_height).toBe(100);
+    expect(result[1].last_active_height).toBe(200);
+  });
+
   it('drops null entries without shifting the remaining indices', async () => {
     mockKvMultiAgent.mockResolvedValue([
       profileEntry('alice.near', { account_id: 'whatever', name: 'A' }),
@@ -160,6 +266,60 @@ describe('fetchProfiles', () => {
     const result = await fetchProfiles([]);
     expect(result).toEqual([]);
     expect(mockKvMultiAgent).not.toHaveBeenCalled();
+  });
+
+  it('strips every trust-boundary and derived field from legacy blobs', async () => {
+    // List paths don't overlay live counts or join history — whatever
+    // applyTrustBoundary returns is what callers see. A legacy blob
+    // written before the write-side strippers landed could carry forged
+    // values in any of the eight trust-boundary-owned fields; this test
+    // is the read-side complement of the `agentEntries` strip guard in
+    // `fastdata-write.test.ts` and ensures those forged values never
+    // surface from a bulk read.
+    mockKvMultiAgent.mockResolvedValue([
+      profileEntry(
+        'alice.near',
+        {
+          account_id: 'imposter.near',
+          name: 'Alice',
+          description: 'Real Alice',
+          image: null,
+          tags: ['ai'],
+          capabilities: {},
+          last_active: 9_999_999_999,
+          last_active_height: 9_999_999,
+          created_at: 9_999_999_999,
+          created_height: 9_999_999,
+          follower_count: 999,
+          following_count: 888,
+          endorsement_count: 777,
+          endorsements: { 'forged/key': 666 },
+        },
+        1_700_000_000_000_000_000,
+        1_234,
+      ),
+    ]);
+
+    const [agent] = await fetchProfiles(['alice.near']);
+
+    // Trust-boundary overrides fire — account_id from predecessor,
+    // last_active / last_active_height from the entry's block fields.
+    expect(agent.account_id).toBe('alice.near');
+    expect(agent.last_active).toBe(1_700_000_000);
+    expect(agent.last_active_height).toBe(1_234);
+    // Forged fields with no authoritative replacement are genuinely
+    // absent — not present with undefined — on list paths that don't
+    // re-populate from a history map or overlay live counts.
+    expect(agent).not.toHaveProperty('created_at');
+    expect(agent).not.toHaveProperty('created_height');
+    expect(agent).not.toHaveProperty('follower_count');
+    expect(agent).not.toHaveProperty('following_count');
+    expect(agent).not.toHaveProperty('endorsement_count');
+    expect(agent).not.toHaveProperty('endorsements');
+    // Canonical self-authored content is preserved.
+    expect(agent.name).toBe('Alice');
+    expect(agent.description).toBe('Real Alice');
+    expect(agent.tags).toEqual(['ai']);
   });
 });
 
@@ -188,6 +348,19 @@ describe('fetchAllProfiles', () => {
     ]);
     const result = await fetchAllProfiles();
     expect(result[0].last_active).toBe(1_700_000_000);
+  });
+
+  it('surfaces last_active_height from the entry block_height', async () => {
+    mockKvGetAll.mockResolvedValue([
+      profileEntry(
+        'alice.near',
+        { account_id: 'alice.near' },
+        1_700_000_000_000_000_000,
+        42_000,
+      ),
+    ]);
+    const result = await fetchAllProfiles();
+    expect(result[0].last_active_height).toBe(42_000);
   });
 
   it('strips caller-asserted created_at from blobs (history is the only source)', async () => {

@@ -51,52 +51,30 @@ export type VerifyClaimResponse = VerifyClaimSuccess | VerifyClaimFailure;
 // Core domain types
 // ---------------------------------------------------------------------------
 
-export interface AgentCapabilities {
-  skills?: string[];
-  [key: string]: unknown;
-}
+// Single source of truth for shared domain types is `@nearly/sdk`. The frontend
+// re-exports them (type-only — no runtime coupling) so route handlers, React
+// components, and the SDK stay on the same definitions.
+import type {
+  Agent,
+  AgentCapabilities,
+  AgentSummary,
+  CapabilityCount,
+  Edge,
+  EndorserEntry,
+  KvEntry,
+  TagCount,
+} from '@nearly/sdk';
 
-export interface Agent {
-  name: string | null;
-  description: string;
-  image: string | null;
-  tags: string[];
-  capabilities: AgentCapabilities;
-  endorsements?: Record<string, number>;
-  endorsement_count?: number;
-  account_id: string;
-  follower_count?: number;
-  following_count?: number;
-  /**
-   * Block-authoritative seconds-since-epoch of the FIRST profile write
-   * for this account, derived from FastData's `/v0/history` endpoint.
-   * Optional: undefined for in-memory defaults (no read has populated
-   * it yet) and for handlers that don't fetch history. Always block
-   * time when present — no caller-asserted fallback. Never written to
-   * the stored blob.
-   */
-  created_at?: number;
-  /**
-   * Block-authoritative seconds-since-epoch of the MOST RECENT profile
-   * write, derived from `entry.block_timestamp / 1e9` on every read path
-   * via `applyTrustBoundary`. Optional: undefined for in-memory defaults
-   * (the first-heartbeat caller's profile hasn't been read back yet),
-   * and not written into stored blobs (writers strip it via `agentEntries`,
-   * readers always derive it from block timestamps). Never wall clock.
-   */
-  last_active?: number;
-}
-
-interface AgentSummary {
-  account_id: string;
-  name: string | null;
-  description: string;
-  image: string | null;
-}
-
-export interface Edge extends Agent {
-  direction: 'incoming' | 'outgoing' | 'mutual';
-}
+export type {
+  Agent,
+  AgentCapabilities,
+  AgentSummary,
+  CapabilityCount,
+  Edge,
+  EndorserEntry,
+  KvEntry,
+  TagCount,
+};
 
 export interface SuggestedAgent extends Agent {
   reason?: string;
@@ -180,6 +158,14 @@ export interface HeartbeatResponse {
   profile_completeness: number;
   delta: {
     since: number;
+    /**
+     * Block-height companion of `since`. The block height of the caller's
+     * previous profile write (or 0 on first heartbeat). Consumers should
+     * prefer `since_height` when cursoring across heartbeats — step 4 of
+     * the wall-clock → block-height transition migrates the delta-query
+     * contract to cursor on block height exclusively.
+     */
+    since_height: number;
     new_followers: AgentSummary[];
     new_followers_count: number;
     new_following_count: number;
@@ -246,16 +232,6 @@ export interface UnendorseResponse {
   }[];
 }
 
-export interface EndorserEntry {
-  account_id: string;
-  name?: string | null;
-  description?: string;
-  image?: string | null;
-  reason?: string;
-  content_hash?: string;
-  at?: number;
-}
-
 export interface EndorsersResponse {
   account_id: string;
   endorsers: Record<string, EndorserEntry[]>;
@@ -264,6 +240,44 @@ export interface EndorsersResponse {
 export interface DelistMeResponse {
   action: 'delisted';
   account_id: string;
+}
+
+/**
+ * One operator's claim on an agent, as returned by `/agents/{id}/claims`.
+ * Carries both display fields (for UI rendering) and the full NEP-413
+ * envelope (for independent re-verification by any reader). The envelope
+ * is the canonical proof — `account_id` / `name` / `description` / `image`
+ * are display companions for the agent profile's "Verified operator"
+ * badge, and are null/empty when the operator hasn't bootstrapped a
+ * profile yet (claims can land before heartbeats).
+ */
+export interface OperatorClaimEntry {
+  account_id: string;
+  name: string | null;
+  description: string;
+  image: string | null;
+  /** NEP-413 inner-message JSON, signed verbatim by the operator's wallet. */
+  message: string;
+  signature: string;
+  public_key: string;
+  nonce: string;
+  /** Optional free-text annotation the operator attached at claim time. */
+  reason?: string;
+  /** Block-authoritative seconds-since-epoch — display companion of `at_height`. */
+  at?: number;
+  /** Block-authoritative block height — canonical cursor for ordering. */
+  at_height?: number;
+}
+
+export interface AgentClaimsResponse {
+  account_id: string;
+  operators: OperatorClaimEntry[];
+}
+
+export interface ClaimOperatorResult {
+  action: 'claimed' | 'unclaimed';
+  operator_account_id: string;
+  agent_account_id: string;
 }
 
 export interface TagsResponse {

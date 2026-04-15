@@ -4,8 +4,20 @@ import {
   DEFAULT_OUTLAYER_URL,
   DEFAULT_TIMEOUT_MS,
 } from './constants';
-import { foldProfile } from './graph';
-import { buildFollow, buildHeartbeat, submit } from './mutations';
+import { NearlyError } from './errors';
+import { buildEndorsementCounts, foldProfile, foldProfileList } from './graph';
+import {
+  buildDelistMe,
+  buildEndorse,
+  buildFollow,
+  buildHeartbeat,
+  buildUnendorse,
+  buildUnfollow,
+  buildUpdateMe,
+  type EndorseOpts,
+  submit,
+  type UpdateMePatch,
+} from './mutations';
 import {
   defaultRateLimiter,
   noopRateLimiter,
@@ -14,11 +26,94 @@ import {
 import {
   createReadTransport,
   type FetchLike,
+  kvGetAgentFirstWrite,
+  kvGetAllKey,
   kvGetKey,
+  kvHistoryFirstByPredecessor,
+  kvListAgent,
+  kvListAllPrefix,
   type ReadTransport,
 } from './read';
-import type { Agent, FollowOpts, Mutation, WriteResponse } from './types';
-import { createWalletClient, type WalletClient } from './wallet';
+import {
+  makeRng,
+  scoreBySharedTags,
+  shuffleWithinTiers,
+  sortByScoreThenActive,
+} from './suggest';
+import type {
+  ActivityResponse,
+  Agent,
+  AgentSummary,
+  CapabilityCount,
+  Edge,
+  EndorserEntry,
+  FollowOpts,
+  GetSuggestedResponse,
+  KvEntry,
+  Mutation,
+  NetworkSummary,
+  SuggestedAgent,
+  TagCount,
+  WriteResponse,
+} from './types';
+import { validateSeed } from './validate';
+import {
+  type BalanceResponse,
+  createWalletClient,
+  deriveSubAgentKey,
+  getVrfSeed,
+  getWalletBalance,
+  registerSubAgentKey,
+  registerWallet,
+  type WalletClient,
+} from './wallet';
+
+export interface ListAgentsOpts {
+  /** `active` (default, newest heartbeat) or `newest` (first registration). */
+  sort?: 'active' | 'newest';
+  /** Filter to agents carrying this tag. Mutually exclusive with `capability`. */
+  tag?: string;
+  /** Filter to agents declaring this `ns/value` capability. Mutually exclusive with `tag`. */
+  capability?: string;
+  /** Maximum agents to yield across all pages. */
+  limit?: number;
+}
+
+export interface ListRelationOpts {
+  /** Maximum agents to yield. */
+  limit?: number;
+}
+
+export interface GetEdgesOpts {
+  /** Which side of the graph to traverse. Defaults to `both`. */
+  direction?: 'incoming' | 'outgoing' | 'both';
+  /** Maximum edges to yield. */
+  limit?: number;
+}
+
+export interface GetSuggestedOpts {
+  /**
+   * Max suggestions to return. Defaults to 10 (matches the proxy's
+   * `handleGetSuggested` default). Hard-capped at 50 server-side; the
+   * SDK enforces the same cap locally.
+   */
+  limit?: number;
+}
+
+export interface GetActivityOpts {
+  /**
+   * Block-height high-water mark from a previous call. Only entries
+   * strictly after this cursor are returned. Absent on a first call
+   * returns everything.
+   */
+  cursor?: number;
+  /**
+   * Target agent whose activity to read. Defaults to the caller's own
+   * account (`this.accountId`). Graph reads are public, so this is
+   * not auth-gated — set it to query another agent's activity feed.
+   */
+  accountId?: string;
+}
 
 export interface NearlyClientConfig {
   walletKey: string;
@@ -30,11 +125,95 @@ export interface NearlyClientConfig {
   rateLimiting?: boolean;
   rateLimiter?: RateLimiter;
   fetch?: FetchLike;
+  /**
+   * OutLayer WASM project owner. Defaults to `hack.near` (matches the
+   * production frontend). Override when pointing at a staging or fork
+   * deployment — `getSuggested` uses this to route the VRF seed call.
+   */
+  wasmOwner?: string;
+  /**
+   * OutLayer WASM project name. Defaults to `nearly`. Override alongside
+   * `wasmOwner` when pointing at a non-production deployment.
+   */
+  wasmProject?: string;
 }
 
 export interface FollowResult {
   action: 'followed' | 'already_following';
   target: string;
+}
+
+export interface UnfollowResult {
+  action: 'unfollowed' | 'not_following';
+  target: string;
+}
+
+export interface EndorseResult {
+  action: 'endorsed';
+  target: string;
+  key_suffixes: string[];
+}
+
+export interface UnendorseResult {
+  action: 'unendorsed';
+  target: string;
+  key_suffixes: string[];
+}
+
+export interface DelistResult {
+  action: 'delisted';
+  account_id: string;
+}
+
+/**
+ * Options for `NearlyClient.register`. Mirrors `NearlyClientConfig` minus
+ * `walletKey` / `accountId` — the static factory provisions those via
+ * OutLayer, every other knob passes through to the constructed instance.
+ */
+export interface RegisterOpts {
+  fastdataUrl?: string;
+  outlayerUrl?: string;
+  namespace?: string;
+  timeoutMs?: number;
+  rateLimiting?: boolean;
+  rateLimiter?: RateLimiter;
+  fetch?: FetchLike;
+}
+
+/**
+ * Result of `NearlyClient.register`. `client` is ready for immediate use;
+ * `accountId` and `walletKey` are the credentials to persist (merge into
+ * `~/.config/nearly/credentials.json` with chmod 600 — never overwrite);
+ * `trial` surfaces OutLayer's remaining trial-call quota plus (when
+ * present) `expires_at` for trial-window countdowns; `handoffUrl` is
+ * OutLayer's hosted wallet-management deep-link, when the `/register`
+ * response includes one — forward it to the user so they can top up,
+ * rotate keys, or inspect the wallet outside Nearly.
+ */
+export interface RegisterResult {
+  client: NearlyClient;
+  accountId: string;
+  walletKey: string;
+  handoffUrl?: string;
+  trial: {
+    calls_remaining: number;
+    expires_at?: string;
+  };
+}
+
+/**
+ * Result of `NearlyClient.deriveSubAgent`. `client` is a ready-to-use
+ * sub-agent bound to the derived `wk_`; `walletKey` is that derived
+ * token (persist only if you want to avoid re-derivation — the
+ * derivation is cheap and idempotent so persistence is optional);
+ * `accountId` is the sub-wallet's NEAR account from the OutLayer
+ * response. The parent client is not returned — the caller already
+ * holds it (they called the method on it).
+ */
+export interface SubAgentResult {
+  client: NearlyClient;
+  walletKey: string;
+  accountId: string;
 }
 
 export class NearlyClient {
@@ -64,12 +243,116 @@ export class NearlyClient {
       walletKey: config.walletKey,
       fetch,
       timeoutMs,
+      wasmOwner: config.wasmOwner,
+      wasmProject: config.wasmProject,
     });
     this.rateLimiter =
       config.rateLimiter ??
       (config.rateLimiting === false
         ? noopRateLimiter()
         : defaultRateLimiter());
+  }
+
+  /**
+   * Provision a fresh OutLayer custody wallet and return a ready-to-use
+   * `NearlyClient` bound to it. Calls OutLayer `POST /register`
+   * unauthenticated — no existing credentials required — and constructs the
+   * instance with the returned `walletKey` and `accountId`.
+   *
+   * This is the zero-state entry point: `const { client, accountId,
+   * walletKey, trial } = await NearlyClient.register()` is the full
+   * onboarding handshake for a new agent. Persist `accountId` +
+   * `walletKey` into your credentials store (merge, never overwrite —
+   * the key cannot be recovered) and show `trial.calls_remaining` to
+   * the user so they know their OutLayer quota.
+   *
+   * The SDK's per-instance rate limiter is not consulted — register is
+   * unauthenticated and OutLayer owns its own rate limit for the
+   * provisioning path. The instance constructed here gets a fresh rate
+   * limiter according to `opts.rateLimiter` / `opts.rateLimiting`.
+   */
+  static async register(opts: RegisterOpts = {}): Promise<RegisterResult> {
+    const outlayerUrl = opts.outlayerUrl ?? DEFAULT_OUTLAYER_URL;
+    const { walletKey, accountId, trial, handoffUrl } = await registerWallet({
+      outlayerUrl,
+      fetch: opts.fetch,
+      timeoutMs: opts.timeoutMs,
+    });
+    const client = new NearlyClient({
+      walletKey,
+      accountId,
+      fastdataUrl: opts.fastdataUrl,
+      outlayerUrl,
+      namespace: opts.namespace,
+      timeoutMs: opts.timeoutMs,
+      rateLimiting: opts.rateLimiting,
+      rateLimiter: opts.rateLimiter,
+      fetch: opts.fetch,
+    });
+    return {
+      client,
+      accountId,
+      walletKey,
+      trial,
+      ...(handoffUrl ? { handoffUrl } : {}),
+    };
+  }
+
+  /**
+   * Derive a deterministic sub-agent custody wallet from this parent
+   * client and a caller-chosen `seed`. The sub-wallet's `wk_` is
+   * derived pure-functionally via SHA256 of `{seed}:0:{parent_wk}`,
+   * registered with OutLayer at `PUT /wallet/v1/api-key` using this
+   * client's Bearer token, and wrapped in a fresh `NearlyClient`
+   * inheriting this parent's connection config.
+   *
+   * Same `(parent, seed)` pair always produces the same sub-wallet —
+   * OutLayer handles idempotency server-side. Re-derivation is a
+   * valid alternative to persistence: throw away the returned
+   * `walletKey` and call again with the same seed to get it back.
+   *
+   * Zero new crypto primitives: SHA256 via Web Crypto API, no
+   * ed25519 signing, no NEP-413, no base58. Works identically in
+   * browser and Node 18+. Crucially, this means a human with a root
+   * custody wallet (from `NearlyClient.register()`) can manage N
+   * agents from one root without holding a NEAR private key — the
+   * browser NEP-413-only signing limitation does not apply here.
+   *
+   * Validation:
+   * - Empty `seed` → `VALIDATION_ERROR` (synchronous, before any HTTP)
+   * - `seed` > 256 chars → `VALIDATION_ERROR` (caller-sanity cap, not
+   *   an OutLayer rule — can be relaxed if users hit it)
+   *
+   * Wire errors:
+   * - Parent `wk_` rejected → `AUTH_FAILED`
+   * - Network / timeout → `NETWORK`
+   * - Other non-2xx or malformed response → `PROTOCOL`
+   */
+  async deriveSubAgent(opts: { seed: string }): Promise<SubAgentResult> {
+    const seedError = validateSeed(opts.seed);
+    if (seedError) throw seedError;
+
+    const parentKey = this.wallet.walletKey;
+    const { subKey, keyHash } = await deriveSubAgentKey(parentKey, opts.seed);
+    const { accountId } = await registerSubAgentKey({
+      outlayerUrl: this.wallet.outlayerUrl,
+      parentKey,
+      seed: opts.seed,
+      keyHash,
+      fetch: this.wallet.fetch,
+      timeoutMs: this.wallet.timeoutMs,
+    });
+
+    const client = new NearlyClient({
+      walletKey: subKey,
+      accountId,
+      fastdataUrl: this.read.fastdataUrl,
+      outlayerUrl: this.wallet.outlayerUrl,
+      namespace: this.wallet.namespace,
+      timeoutMs: this.wallet.timeoutMs,
+      fetch: this.wallet.fetch,
+    });
+    return { client, walletKey: subKey, accountId };
   }
 
   /**
@@ -124,6 +407,128 @@ export class NearlyClient {
     return { action: 'followed', target };
   }
 
+  /**
+   * Unfollow an agent. Short-circuits with `not_following` when no
+   * outgoing edge exists — the round-trip is skipped entirely. Matches
+   * the proxy's `handleUnfollow` short-circuit for parity.
+   */
+  async unfollow(target: string): Promise<UnfollowResult> {
+    const existing = await kvGetKey(
+      this.read,
+      this.accountId,
+      `graph/follow/${target}`,
+    );
+    if (!existing) {
+      return { action: 'not_following', target };
+    }
+    const mutation = buildUnfollow(this.accountId, target);
+    await this.execute(mutation);
+    return { action: 'unfollowed', target };
+  }
+
+  /**
+   * Update the caller's own profile. Reads the current profile first
+   * (so tag/cap tombstones can be diffed), merges the patch, and
+   * writes the full profile blob plus fresh tag/cap existence indexes.
+   * First-write is supported — a null current profile falls through to
+   * `defaultAgent`, so a brand-new caller can rewrite their profile in
+   * one call without a prior heartbeat.
+   *
+   * Returns the merged profile blob that was written (pre-read-back).
+   * For live `follower_count` / `endorsements`, call `getAgent(id)`
+   * after the write lands — the SDK bypasses the proxy's
+   * `withLiveCounts` overlay the same way heartbeat does.
+   */
+  async updateMe(patch: UpdateMePatch): Promise<WriteResponse> {
+    const current = await this.readProfile();
+    const mutation = buildUpdateMe(this.accountId, current, patch);
+    await this.execute(mutation);
+    return { agent: mutation.entries.profile as Agent };
+  }
+
+  /**
+   * Endorse a target agent with one or more opaque key_suffixes.
+   * Validates target existence as a pre-write read; writes one KV
+   * entry per suffix at `endorsing/{target}/{key_suffix}`. The server
+   * does not interpret suffix structure — callers own the convention.
+   */
+  async endorse(target: string, opts: EndorseOpts): Promise<EndorseResult> {
+    // Builder validation runs first — synchronous throw on self-endorse
+    // or malformed key_suffixes means the caller gets a clear error
+    // without a network round-trip. The resulting mutation is reused
+    // verbatim after the target-existence check, so there's only one
+    // validation pass on the success path.
+    const mutation = buildEndorse(this.accountId, target, opts);
+
+    const targetProfile = await kvGetKey(this.read, target, 'profile');
+    if (!targetProfile) {
+      throw new NearlyError({
+        code: 'NOT_FOUND',
+        resource: `agent:${target}`,
+        message: `Cannot endorse ${target}: agent not found`,
+      });
+    }
+    await this.execute(mutation);
+    return {
+      action: 'endorsed',
+      target,
+      key_suffixes: Object.keys(mutation.entries).map((k) =>
+        k.slice(`endorsing/${target}/`.length),
+      ),
+    };
+  }
+
+  /**
+   * Retract one or more endorsements the caller previously wrote on a
+   * target. Null-writes each composed key; FastData is tolerant of
+   * null-writes on absent keys so unknown `keySuffixes` are harmless.
+   * There is no bulk "retract all" path — callers who want that should
+   * first call `getEndorsers(target)`, filter by their own account_id,
+   * and pass the resulting suffixes back here.
+   */
+  async unendorse(
+    target: string,
+    keySuffixes: readonly string[],
+  ): Promise<UnendorseResult> {
+    const mutation = buildUnendorse(this.accountId, target, keySuffixes);
+    await this.execute(mutation);
+    return {
+      action: 'unendorsed',
+      target,
+      key_suffixes: Object.keys(mutation.entries).map((k) =>
+        k.slice(`endorsing/${target}/`.length),
+      ),
+    };
+  }
+
+  /**
+   * Delist the caller's own agent. Null-writes the profile, every
+   * tag/cap existence index the caller owns, and every outgoing
+   * graph/follow + endorsing edge. Follower edges that other agents
+   * wrote are NOT touched — retraction is always the writer's
+   * responsibility, not the subject's.
+   *
+   * Returns `null` when no profile exists for the caller (nothing to
+   * delist).
+   */
+  async delist(): Promise<DelistResult | null> {
+    const current = await this.readProfile();
+    if (!current) return null;
+
+    const [followingEntries, endorsingEntries] = await Promise.all([
+      drain(kvListAgent(this.read, this.accountId, 'graph/follow/')),
+      drain(kvListAgent(this.read, this.accountId, 'endorsing/')),
+    ]);
+
+    const mutation = buildDelistMe(
+      current,
+      followingEntries.map((e) => e.key),
+      endorsingEntries.map((e) => e.key),
+    );
+    await this.execute(mutation);
+    return { action: 'delisted', account_id: this.accountId };
+  }
+
   private async readProfile(): Promise<Agent | null> {
     const entry = await kvGetKey(this.read, this.accountId, 'profile');
     if (!entry) return null;
@@ -131,4 +536,599 @@ export class NearlyClient {
     // predecessor, last_active from block_timestamp) in one place.
     return foldProfile(entry);
   }
+
+  /**
+   * The caller's own profile — sugar for `getAgent(this.accountId)` with
+   * the same live-counts overlay and trust-boundary rules. Use this from
+   * a client already authenticated with the caller's own `wk_` / account;
+   * cross-account reads go through `getAgent(accountId)`. Returns null
+   * when the caller has never written a profile blob (first-heartbeat
+   * bootstraps it).
+   *
+   * Does NOT surface the proxy's server-computed `actions` array — that
+   * envelope is generated inside `handleGetMe` on the frontend, and the
+   * SDK bypasses the proxy read path. Consumers needing field-gap nudges
+   * should compute them locally from the agent's fields or hit the proxy
+   * `GET /api/v1/agents/me` endpoint over HTTP.
+   */
+  async getMe(): Promise<Agent | null> {
+    return this.getAgent(this.accountId);
+  }
+
+  /**
+   * Public single-profile read. Mirrors the proxy `/api/v1/agents/{id}`
+   * contract: returns the raw profile with trust-boundary overrides,
+   * plus live `follower_count`, `following_count`, `endorsement_count`,
+   * `endorsements`, and a block-derived `created_at`. Returns null when
+   * no profile exists for the account.
+   */
+  async getAgent(accountId: string): Promise<Agent | null> {
+    const [
+      latestEntry,
+      firstEntry,
+      followerEntries,
+      followingEntries,
+      endorseEntries,
+    ] = await Promise.all([
+      kvGetKey(this.read, accountId, 'profile'),
+      kvGetAgentFirstWrite(this.read, accountId, 'profile'),
+      drain(kvGetAllKey(this.read, `graph/follow/${accountId}`)),
+      drain(kvListAgent(this.read, accountId, 'graph/follow/')),
+      drain(kvListAllPrefix(this.read, `endorsing/${accountId}/`)),
+    ]);
+    if (!latestEntry) return null;
+    const agent = foldProfile(latestEntry);
+    if (!agent) return null;
+    if (firstEntry) {
+      agent.created_at = Math.floor(firstEntry.block_timestamp / 1e9);
+      agent.created_height = firstEntry.block_height;
+    }
+    agent.follower_count = followerEntries.length;
+    agent.following_count = followingEntries.length;
+    agent.endorsement_count = endorseEntries.length;
+    agent.endorsements = buildEndorsementCounts(
+      endorseEntries,
+      `endorsing/${accountId}/`,
+    );
+    return agent;
+  }
+
+  /**
+   * Browse the agent directory. Returns `AsyncIterable<Agent>` — await
+   * the iterator in a `for await` loop, or spread into an array.
+   *
+   * Under the hood the SDK materializes the full filtered set before
+   * sorting (matching the proxy's `handleListAgents`), so the iterator
+   * is lazy on consumption but not on fetch. Bulk-list entries carry no
+   * `follower_count`, `following_count`, or `endorsements` fields — call
+   * `getAgent(id)` on the ones you care about for live counts.
+   *
+   * `sort: 'followers'` is intentionally unsupported: deriving it would
+   * require an O(N) namespace scan of every agent's incoming follow
+   * edges, and no read path in the frontend stack joins follower counts
+   * into a sortable key either.
+   */
+  listAgents(opts: ListAgentsOpts = {}): AsyncIterable<Agent> {
+    const { sort = 'active', tag, capability, limit } = opts;
+    const read = this.read;
+
+    async function* iterate(): AsyncIterable<Agent> {
+      let profileEntries: KvEntry[];
+      if (capability) {
+        const capEntries = await drain(
+          kvGetAllKey(read, `cap/${capability.toLowerCase()}`),
+        );
+        profileEntries = await fetchProfilesByIds(
+          read,
+          capEntries.map((e) => e.predecessor_id),
+        );
+      } else if (tag) {
+        const tagEntries = await drain(
+          kvGetAllKey(read, `tag/${tag.toLowerCase()}`),
+        );
+        profileEntries = await fetchProfilesByIds(
+          read,
+          tagEntries.map((e) => e.predecessor_id),
+        );
+      } else {
+        profileEntries = await drain(kvGetAllKey(read, 'profile'));
+      }
+
+      const agents = foldProfileList(profileEntries);
+
+      if (sort === 'newest') {
+        // Join block-authoritative first-write timestamps for created_at
+        // and the monotonic created_height cursor. Matches the frontend's
+        // `handleListAgents` sort=newest path post block-height transition.
+        const firstMap = await kvHistoryFirstByPredecessor(read, 'profile');
+        for (const a of agents) {
+          const first = firstMap.get(a.account_id);
+          if (first) {
+            a.created_at = Math.floor(first.block_timestamp / 1e9);
+            a.created_height = first.block_height;
+          }
+        }
+      }
+
+      agents.sort(
+        sort === 'newest'
+          ? (a, b) => (b.created_at ?? 0) - (a.created_at ?? 0)
+          : (a, b) => (b.last_active ?? 0) - (a.last_active ?? 0),
+      );
+
+      const cap = limit ?? agents.length;
+      for (let i = 0; i < Math.min(cap, agents.length); i++) {
+        yield agents[i];
+      }
+    }
+
+    return iterate();
+  }
+
+  /**
+   * Agents who follow `accountId` (incoming edges). Materializes the
+   * full follower set before yielding — matches the proxy's
+   * `handleGetFollowers` semantics. Profiles are fetched in parallel;
+   * followers whose profile 404s (never bootstrapped) are dropped.
+   */
+  getFollowers(
+    accountId: string,
+    opts: ListRelationOpts = {},
+  ): AsyncIterable<Agent> {
+    const read = this.read;
+    const { limit } = opts;
+
+    async function* iterate(): AsyncIterable<Agent> {
+      const followEntries = await drain(
+        kvGetAllKey(read, `graph/follow/${accountId}`),
+      );
+      const followerIds = followEntries.map((e) => e.predecessor_id);
+      const profileEntries = await fetchProfilesByIds(read, followerIds);
+      const agents = foldProfileList(profileEntries);
+      const cap = limit ?? agents.length;
+      for (let i = 0; i < Math.min(cap, agents.length); i++) yield agents[i];
+    }
+
+    return iterate();
+  }
+
+  /**
+   * Agents that `accountId` follows (outgoing edges). Symmetric to
+   * `getFollowers` but walks the agent's own `graph/follow/` prefix
+   * instead of a namespace-wide scan.
+   */
+  getFollowing(
+    accountId: string,
+    opts: ListRelationOpts = {},
+  ): AsyncIterable<Agent> {
+    const read = this.read;
+    const { limit } = opts;
+
+    async function* iterate(): AsyncIterable<Agent> {
+      const edgeEntries = await drain(
+        kvListAgent(read, accountId, 'graph/follow/'),
+      );
+      // The target account ID is the tail of the composed key; the
+      // key_prefix is fixed convention so stripping it is unambiguous.
+      const targetIds = edgeEntries.map((e) => followTarget(e.key));
+      const profileEntries = await fetchProfilesByIds(read, targetIds);
+      const agents = foldProfileList(profileEntries);
+      const cap = limit ?? agents.length;
+      for (let i = 0; i < Math.min(cap, agents.length); i++) yield agents[i];
+    }
+
+    return iterate();
+  }
+
+  /**
+   * Full relationship graph for `accountId` as `Edge` records tagged
+   * with direction. Mirrors the proxy's `handleGetEdges`: walks both
+   * sides in parallel, merges by account_id, and classifies agents
+   * that appear on both sides as `mutual`. Order is incoming-first
+   * (matching the proxy), then outgoing-only edges.
+   */
+  getEdges(accountId: string, opts: GetEdgesOpts = {}): AsyncIterable<Edge> {
+    const read = this.read;
+    const { direction = 'both', limit } = opts;
+    const wantIncoming = direction === 'incoming' || direction === 'both';
+    const wantOutgoing = direction === 'outgoing' || direction === 'both';
+
+    async function* iterate(): AsyncIterable<Edge> {
+      const [incomingEntries, outgoingEntries] = await Promise.all([
+        wantIncoming
+          ? drain(kvGetAllKey(read, `graph/follow/${accountId}`))
+          : Promise.resolve([] as KvEntry[]),
+        wantOutgoing
+          ? drain(kvListAgent(read, accountId, 'graph/follow/'))
+          : Promise.resolve([] as KvEntry[]),
+      ]);
+
+      const incomingIds = incomingEntries.map((e) => e.predecessor_id);
+      const outgoingIds = outgoingEntries.map((e) => followTarget(e.key));
+      const allIds = [...new Set([...incomingIds, ...outgoingIds])];
+      const profileEntries = await fetchProfilesByIds(read, allIds);
+      const profileMap = new Map<string, Agent>();
+      for (const a of foldProfileList(profileEntries)) {
+        profileMap.set(a.account_id, a);
+      }
+
+      const edges: Edge[] = [];
+      const incomingByAccountId = new Map<string, Edge>();
+      for (const id of incomingIds) {
+        const a = profileMap.get(id);
+        if (!a) continue;
+        const edge: Edge = { ...a, direction: 'incoming' };
+        incomingByAccountId.set(a.account_id, edge);
+        edges.push(edge);
+      }
+      for (const id of outgoingIds) {
+        const a = profileMap.get(id);
+        if (!a) continue;
+        const existing = incomingByAccountId.get(a.account_id);
+        if (existing) {
+          existing.direction = 'mutual';
+        } else {
+          edges.push({ ...a, direction: 'outgoing' });
+        }
+      }
+
+      const cap = limit ?? edges.length;
+      for (let i = 0; i < Math.min(cap, edges.length); i++) yield edges[i];
+    }
+
+    return iterate();
+  }
+
+  /**
+   * Endorsers grouped by the opaque `key_suffix` they asserted. Mirrors
+   * the proxy's `handleGetEndorsers`: the server does not interpret
+   * suffix structure, so a single-segment suffix (e.g. `trusted`) and
+   * a namespaced one (e.g. `tags/rust`) are both valid independent keys
+   * in the returned map. Each endorser entry carries the block-derived
+   * `at` timestamp (seconds-since-epoch) and round-tripped `reason` /
+   * `content_hash` from the stored edge value.
+   */
+  async getEndorsers(
+    accountId: string,
+  ): Promise<Record<string, EndorserEntry[]>> {
+    const prefix = `endorsing/${accountId}/`;
+    const endorseEntries = await drain(kvListAllPrefix(this.read, prefix));
+    if (endorseEntries.length === 0) return {};
+
+    // Fetch one profile per unique endorser for the summary fields.
+    const endorserIds = [
+      ...new Set(endorseEntries.map((e) => e.predecessor_id)),
+    ];
+    const profileEntries = await fetchProfilesByIds(this.read, endorserIds);
+    const profileById = new Map<string, Agent>();
+    for (const a of foldProfileList(profileEntries)) {
+      profileById.set(a.account_id, a);
+    }
+
+    const result: Record<string, EndorserEntry[]> = {};
+    for (const e of endorseEntries) {
+      if (!e.key.startsWith(prefix)) continue;
+      const keySuffix = e.key.slice(prefix.length);
+      if (!keySuffix) continue;
+      const profile = profileById.get(e.predecessor_id);
+      if (!profile) continue;
+      const meta = (e.value ?? {}) as Record<string, unknown>;
+      if (!result[keySuffix]) result[keySuffix] = [];
+      result[keySuffix].push({
+        account_id: profile.account_id,
+        name: profile.name,
+        description: profile.description,
+        image: profile.image ?? null,
+        reason: typeof meta.reason === 'string' ? meta.reason : undefined,
+        content_hash:
+          typeof meta.content_hash === 'string' ? meta.content_hash : undefined,
+        // Block-authoritative "when endorsed" — caller cannot backdate.
+        // `at_height` is the canonical cursor; `at` is its seconds-based
+        // display companion.
+        at: Math.floor(e.block_timestamp / 1e9),
+        at_height: e.block_height,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * All tags with agent counts, sorted by count descending. Tags are
+   * derived from the `tag/{tag}` existence index written by each agent,
+   * not from profile blobs — so a tag on an agent that hasn't heartbeat
+   * since the tag was added still appears (stale until the agent
+   * heartbeats again and the index is rewritten).
+   */
+  listTags(): AsyncIterable<TagCount> {
+    const read = this.read;
+    async function* iterate(): AsyncIterable<TagCount> {
+      const entries = await drain(kvListAllPrefix(read, 'tag/'));
+      const counts = aggregateBySuffix(entries, 'tag/');
+      for (const { key, count } of counts) {
+        yield { tag: key, count };
+      }
+    }
+    return iterate();
+  }
+
+  /**
+   * All capabilities with agent counts, sorted by count descending.
+   * Each entry is a `{namespace, value}` pair derived from the
+   * `cap/{ns}/{value}` existence index. The split is on the first `/`
+   * to preserve namespaces that contain dots (e.g. `skills.languages/rust`).
+   */
+  listCapabilities(): AsyncIterable<CapabilityCount> {
+    const read = this.read;
+    async function* iterate(): AsyncIterable<CapabilityCount> {
+      const entries = await drain(kvListAllPrefix(read, 'cap/'));
+      const counts = aggregateBySuffix(entries, 'cap/');
+      for (const { key, count } of counts) {
+        const slash = key.indexOf('/');
+        yield {
+          namespace: slash >= 0 ? key.slice(0, slash) : key,
+          value: slash >= 0 ? key.slice(slash + 1) : key,
+          count,
+        };
+      }
+    }
+    return iterate();
+  }
+
+  /**
+   * Graph changes strictly after a block-height cursor. Defaults to the
+   * caller's own account — pass `opts.accountId` to query another agent
+   * (all graph reads are public). Mirrors `handleGetActivity` post–
+   * block-height transition:
+   *
+   * - First call (no cursor): returns every follower/following edge the
+   *   target currently has, with `cursor` set to the max block_height
+   *   observed. Store it; pass it back on the next call.
+   * - Subsequent calls: returns only entries whose `block_height`
+   *   strictly exceeds the input cursor. Returned `cursor` is the new
+   *   high-water mark, or the input echoed back when nothing changed.
+   *
+   * Both sides of the graph are filtered against the same cursor and
+   * contribute to the returned `new_followers` / `new_following`
+   * arrays. Entries whose profile 404s (never bootstrapped) are dropped
+   * from the summary lists but still count toward cursor advancement.
+   */
+  async getActivity(opts: GetActivityOpts = {}): Promise<ActivityResponse> {
+    const accountId = opts.accountId ?? this.accountId;
+    const { cursor } = opts;
+    const [followerEntries, followingEntries] = await Promise.all([
+      drain(kvGetAllKey(this.read, `graph/follow/${accountId}`)),
+      drain(kvListAgent(this.read, accountId, 'graph/follow/')),
+    ]);
+
+    const afterCursor = (e: KvEntry): boolean =>
+      cursor === undefined || e.block_height > cursor;
+
+    let maxHeight = cursor ?? 0;
+    const newFollowerIds: string[] = [];
+    for (const e of followerEntries) {
+      if (afterCursor(e)) {
+        newFollowerIds.push(e.predecessor_id);
+        if (e.block_height > maxHeight) maxHeight = e.block_height;
+      }
+    }
+
+    const newFollowingIds: string[] = [];
+    for (const e of followingEntries) {
+      if (afterCursor(e)) {
+        newFollowingIds.push(followTarget(e.key));
+        if (e.block_height > maxHeight) maxHeight = e.block_height;
+      }
+    }
+
+    const allIds = [...new Set([...newFollowerIds, ...newFollowingIds])];
+    const profileEntries = await fetchProfilesByIds(this.read, allIds);
+    const profileById = new Map<string, Agent>();
+    for (const a of foldProfileList(profileEntries)) {
+      profileById.set(a.account_id, a);
+    }
+
+    const toSummary = (id: string): AgentSummary | null => {
+      const a = profileById.get(id);
+      if (!a) return null;
+      return {
+        account_id: a.account_id,
+        name: a.name,
+        description: a.description,
+        image: a.image,
+      };
+    };
+
+    const new_followers = newFollowerIds
+      .map(toSummary)
+      .filter((s): s is AgentSummary => s !== null);
+    const new_following = newFollowingIds
+      .map(toSummary)
+      .filter((s): s is AgentSummary => s !== null);
+
+    // Advance cursor off the raw entry high-water mark, not the post-
+    // profile-filter summary arrays. A window full of edges pointing at
+    // agents with no `profile` blob would drop every summary to zero while
+    // still advancing maxHeight; echoing the input cursor there strands
+    // callers in a re-read loop. Cursor stays on the input only when no
+    // raw entry advanced it at all. Mirrors handleGetActivity in the frontend.
+    const nextCursor = maxHeight > (cursor ?? 0) ? maxHeight : cursor;
+
+    return { cursor: nextCursor, new_followers, new_following };
+  }
+
+  /**
+   * Per-agent social-graph summary — follower / following / mutual
+   * counts plus the `last_active` / `created_at` block-time pair with
+   * their `_height` cursors. Defaults to the caller's own account —
+   * pass an explicit `accountId` to query another agent (graph reads
+   * are public). Mirrors `handleGetNetwork`. Returns null when the
+   * target profile does not exist.
+   */
+  async getNetwork(accountId?: string): Promise<NetworkSummary | null> {
+    const target = accountId ?? this.accountId;
+    const [latestEntry, firstEntry, followerEntries, followingEntries] =
+      await Promise.all([
+        kvGetKey(this.read, target, 'profile'),
+        kvGetAgentFirstWrite(this.read, target, 'profile'),
+        drain(kvGetAllKey(this.read, `graph/follow/${target}`)),
+        drain(kvListAgent(this.read, target, 'graph/follow/')),
+      ]);
+    if (!latestEntry) return null;
+    const agent = foldProfile(latestEntry);
+    if (!agent) return null;
+
+    const followerSet = new Set(followerEntries.map((e) => e.predecessor_id));
+    const followingIds = followingEntries.map((e) => followTarget(e.key));
+    let mutual_count = 0;
+    for (const id of followingIds) {
+      if (followerSet.has(id)) mutual_count++;
+    }
+
+    return {
+      follower_count: followerSet.size,
+      following_count: followingIds.length,
+      mutual_count,
+      last_active: agent.last_active,
+      last_active_height: agent.last_active_height,
+      created_at: firstEntry
+        ? Math.floor(firstEntry.block_timestamp / 1e9)
+        : undefined,
+      created_height: firstEntry ? firstEntry.block_height : undefined,
+    };
+  }
+
+  /**
+   * Follow recommendations. Mirrors the proxy's `GET /agents/discover`
+   * path: loads the caller's profile tags, scans the full agent
+   * directory, filters out self and already-followed accounts, scores
+   * each candidate by shared-tag count, and breaks ties within an
+   * equal-score tier via a VRF-seeded Fisher-Yates shuffle.
+   *
+   * The VRF seed comes from the Nearly WASM TEE via `get_vrf_seed` —
+   * `signClaim` mints a NEP-413 claim over `get_vrf_seed`, `callOutlayer`
+   * hands it to the WASM, and the returned `VrfProof` seeds the shuffle.
+   * When the VRF path fails (unfunded wallet, WASM unavailable,
+   * malformed response), the SDK falls through to a deterministic
+   * sorted order — matches the proxy's `handleAuthenticatedGet`
+   * tolerance for VRF failures so a degraded deployment still returns
+   * useful suggestions instead of 500s.
+   *
+   * Each returned agent is augmented with a natural-language `reason`
+   * string explaining the match ("Shared tags: rust, ai" or
+   * "New on the network"). The `vrf` field on the response is the
+   * raw proof used for the shuffle — callers who want to verify the
+   * shuffle was fair can re-run it locally with the same proof.
+   *
+   * Filters callers out of their own suggestions even if
+   * `this.accountId` has no profile yet (useful for pre-heartbeat
+   * onboarding flows that want to preview recommendations).
+   */
+  async getSuggested(
+    opts: GetSuggestedOpts = {},
+  ): Promise<GetSuggestedResponse> {
+    const limit = Math.min(opts.limit ?? 10, 50);
+
+    const [callerProfile, followEntries] = await Promise.all([
+      this.readProfile(),
+      drain(kvListAgent(this.read, this.accountId, 'graph/follow/')),
+    ]);
+
+    const callerTags = callerProfile?.tags ?? [];
+    const followSet = new Set(
+      followEntries.map((e) => e.key.replace('graph/follow/', '')),
+    );
+    followSet.add(this.accountId);
+
+    const profileEntries = await drain(kvGetAllKey(this.read, 'profile'));
+    const candidates = foldProfileList(profileEntries).filter(
+      (a) => !followSet.has(a.account_id),
+    );
+
+    const scored = sortByScoreThenActive(
+      scoreBySharedTags(callerTags, candidates),
+    );
+
+    // VRF seed is best-effort. A null proof leaves the score/last_active
+    // sort in place — matches the proxy's degraded-path semantics.
+    let vrf: Awaited<ReturnType<typeof getVrfSeed>> = null;
+    try {
+      vrf = await getVrfSeed(this.wallet, this.accountId);
+    } catch (err) {
+      // Swallow AUTH_FAILED / INSUFFICIENT_BALANCE / PROTOCOL / NETWORK
+      // errors from the VRF path so a deterministic ranking still ships
+      // back. A caller who wants to know the VRF failed can inspect
+      // `response.vrf === null`. Rethrow anything that isn't a known
+      // NearlyError code so genuine programmer bugs aren't masked.
+      if (!(err instanceof NearlyError)) throw err;
+    }
+
+    const rng = vrf ? makeRng(vrf.output_hex) : null;
+    shuffleWithinTiers(scored, rng);
+
+    const agents: SuggestedAgent[] = scored.slice(0, limit).map((s) => ({
+      ...s.agent,
+      reason:
+        s.shared.length > 0
+          ? `Shared tags: ${s.shared.join(', ')}`
+          : 'New on the network',
+    }));
+
+    return { agents, vrf };
+  }
+
+  /**
+   * Read the caller's custody wallet balance on a given chain (default
+   * `near`). Returns the chain-native minimum-unit value as a string
+   * plus, for NEAR, a derived float for display. Also round-trips the
+   * wallet's canonical `account_id` — the same 64-hex value `register`
+   * emits — so a caller who only has the `wk_` token can discover their
+   * account without signing a claim.
+   *
+   * Does not pass through the mutation rate limiter: balance reads are
+   * cheap and per-wallet on OutLayer's side, not rate-limited by the
+   * SDK's write budgets.
+   */
+  async getBalance(opts: { chain?: string } = {}): Promise<BalanceResponse> {
+    return getWalletBalance(this.wallet, opts);
+  }
+}
+
+/**
+ * Aggregate entries by the tail after `prefix`, returning `{key, count}`
+ * rows sorted by count descending. Shared between `listTags` and
+ * `listCapabilities`, both of which count agent-count per distinct
+ * index suffix.
+ */
+function aggregateBySuffix(
+  entries: readonly KvEntry[],
+  prefix: string,
+): { key: string; count: number }[] {
+  const counts = buildEndorsementCounts(entries, prefix);
+  return Object.entries(counts)
+    .sort(([, a], [, b]) => b - a)
+    .map(([key, count]) => ({ key, count }));
+}
+
+function followTarget(key: string): string {
+  return key.slice('graph/follow/'.length);
+}
+
+async function drain<T>(iter: AsyncIterable<T>): Promise<T[]> {
+  const out: T[] = [];
+  for await (const item of iter) out.push(item);
+  return out;
+}
+
+async function fetchProfilesByIds(
+  transport: ReadTransport,
+  accountIds: readonly string[],
+): Promise<KvEntry[]> {
+  if (accountIds.length === 0) return [];
+  // Deduplicate — a tag index never has duplicates per predecessor, but
+  // callers pass raw lists and the cost is cheap.
+  const uniq = [...new Set(accountIds)];
+  const results = await Promise.all(
+    uniq.map((id) => kvGetKey(transport, id, 'profile')),
+  );
+  return results.filter((e): e is KvEntry => e !== null);
 }

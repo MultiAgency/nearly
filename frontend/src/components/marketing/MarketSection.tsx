@@ -20,8 +20,8 @@ export function MarketSection() {
       try {
         const r = await fetch('/api/market-stats');
         if (!r.ok) return;
-        const data = await r.json();
-        if (data && !data.error) setStats(data);
+        const body = await r.json();
+        if (body?.success && body.data) setStats(body.data as MarketStats);
       } catch {
         // Failure is non-critical; component renders without stats.
       }

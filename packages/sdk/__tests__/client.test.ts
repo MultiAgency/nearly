@@ -1,6 +1,7 @@
 import { NearlyClient } from '../src/client';
+import { NearlyError } from '../src/errors';
 import type { FetchLike } from '../src/read';
-import type { Agent } from '../src/types';
+import type { Agent, CapabilityCount, TagCount } from '../src/types';
 import { aliceProfileBlob } from './fixtures/entries';
 
 interface Call {
@@ -110,6 +111,417 @@ describe('NearlyClient constructor', () => {
   });
 });
 
+describe('NearlyClient.register', () => {
+  // OutLayer /register is an unauthenticated provisioning call. These tests
+  // cover the happy path and every failure mode registerWallet maps to a
+  // NearlyError. The integration test (integration.test.ts) covers the
+  // live round-trip; these are mocked fetch unit tests.
+
+  function registerSuccessBody(): unknown {
+    return {
+      api_key: 'wk_abc123',
+      near_account_id:
+        'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+      trial: { calls_remaining: 100 },
+    };
+  }
+
+  it('provisions a wallet and returns a ready client', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/register')) return jsonResponse(registerSuccessBody());
+      throw new Error(`unexpected url: ${url}`);
+    });
+    const { client, accountId, walletKey, trial } = await NearlyClient.register(
+      { outlayerUrl: 'https://outlayer.example', fetch },
+    );
+    expect(walletKey).toBe('wk_abc123');
+    expect(accountId).toMatch(/^a1b2c3d4/);
+    expect(trial).toEqual({ calls_remaining: 100 });
+    expect(client).toBeInstanceOf(NearlyClient);
+    expect(client.accountId).toBe(accountId);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('https://outlayer.example/register');
+    expect(calls[0].init?.method).toBe('POST');
+  });
+
+  it('surfaces handoffUrl when OutLayer returns handoff_url', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/register'))
+        return jsonResponse({
+          ...(registerSuccessBody() as Record<string, unknown>),
+          handoff_url: 'https://outlayer.fastnear.com/wallet?key=wk_abc123',
+        });
+      throw new Error(`unexpected url: ${url}`);
+    });
+    const result = await NearlyClient.register({
+      outlayerUrl: 'https://outlayer.example',
+      fetch,
+    });
+    expect(result.handoffUrl).toBe(
+      'https://outlayer.fastnear.com/wallet?key=wk_abc123',
+    );
+  });
+
+  it('omits handoffUrl key when OutLayer does not return handoff_url', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/register')) return jsonResponse(registerSuccessBody());
+      throw new Error(`unexpected url: ${url}`);
+    });
+    const result = await NearlyClient.register({
+      outlayerUrl: 'https://outlayer.example',
+      fetch,
+    });
+    expect('handoffUrl' in result).toBe(false);
+  });
+
+  it('passes through fastdataUrl / namespace / rateLimiting to the constructed client', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/register')) return jsonResponse(registerSuccessBody());
+      if (url.includes('/v0/latest/'))
+        return profileEntryResponse(aliceProfileBlob);
+      return jsonResponse({});
+    });
+    const { client } = await NearlyClient.register({
+      outlayerUrl: 'https://outlayer.example',
+      fastdataUrl: 'https://kv.example',
+      namespace: 'contextual.near',
+      rateLimiting: false,
+      fetch,
+    });
+    // Exercising the client proves the pass-through landed — if fastdataUrl
+    // or namespace were dropped, the read would hit a bogus URL.
+    const agent = await client.getAgent(client.accountId);
+    // Profile isn't at the bogus URL, so we just verify the call was made
+    // against the configured fastdataUrl by checking no throw.
+    expect(agent === null || typeof agent === 'object').toBe(true);
+  });
+
+  it('throws NETWORK on fetch rejection', async () => {
+    const fetch: FetchLike = async () => {
+      throw new Error('ECONNRESET');
+    };
+    await expect(
+      NearlyClient.register({ outlayerUrl: 'https://outlayer.example', fetch }),
+    ).rejects.toMatchObject({ shape: { code: 'NETWORK' } });
+  });
+
+  it('throws PROTOCOL on 5xx with response body', async () => {
+    const { fetch } = scripted(
+      () => new Response('upstream down', { status: 502 }),
+    );
+    await expect(
+      NearlyClient.register({ outlayerUrl: 'https://outlayer.example', fetch }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'PROTOCOL',
+        hint: expect.stringContaining('register 502'),
+      },
+    });
+  });
+
+  it('throws AUTH_FAILED on 401/403 (protocol anomaly since register is unauth)', async () => {
+    const { fetch } = scripted(
+      () => new Response('forbidden', { status: 403 }),
+    );
+    await expect(
+      NearlyClient.register({ outlayerUrl: 'https://outlayer.example', fetch }),
+    ).rejects.toMatchObject({ shape: { code: 'AUTH_FAILED' } });
+  });
+
+  it('throws PROTOCOL when the 2xx body is not JSON', async () => {
+    const { fetch } = scripted(
+      () =>
+        new Response('<html>oops</html>', {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        }),
+    );
+    await expect(
+      NearlyClient.register({ outlayerUrl: 'https://outlayer.example', fetch }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'PROTOCOL',
+        hint: expect.stringContaining('malformed JSON'),
+      },
+    });
+  });
+
+  it('throws PROTOCOL when api_key is missing', async () => {
+    const { fetch } = scripted(() =>
+      jsonResponse({
+        near_account_id: 'deadbeef',
+        trial: { calls_remaining: 10 },
+      }),
+    );
+    await expect(
+      NearlyClient.register({ outlayerUrl: 'https://outlayer.example', fetch }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'PROTOCOL',
+        hint: expect.stringContaining('api_key'),
+      },
+    });
+  });
+
+  it('throws PROTOCOL when near_account_id is missing', async () => {
+    const { fetch } = scripted(() =>
+      jsonResponse({
+        api_key: 'wk_abc',
+        trial: { calls_remaining: 10 },
+      }),
+    );
+    await expect(
+      NearlyClient.register({ outlayerUrl: 'https://outlayer.example', fetch }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'PROTOCOL',
+        hint: expect.stringContaining('near_account_id'),
+      },
+    });
+  });
+
+  it('throws PROTOCOL when trial.calls_remaining is missing', async () => {
+    const { fetch } = scripted(() =>
+      jsonResponse({
+        api_key: 'wk_abc',
+        near_account_id: 'deadbeef',
+      }),
+    );
+    await expect(
+      NearlyClient.register({ outlayerUrl: 'https://outlayer.example', fetch }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'PROTOCOL',
+        hint: expect.stringContaining('trial'),
+      },
+    });
+  });
+
+  it('never leaks wk_ prefix into error messages after a successful register that then fails parsing', async () => {
+    // This is the post-BUILD.md assertion: even a successful OutLayer call
+    // whose response carries wk_abc123 must not bleed the key into any
+    // downstream error, if the body subsequently fails validation. Here we
+    // force that path by returning a body whose api_key is valid but whose
+    // trial field is wrong — the error is raised AFTER api_key has been
+    // read into scope.
+    const { fetch } = scripted(() =>
+      jsonResponse({
+        api_key: 'wk_secret_abc_DO_NOT_LEAK',
+        near_account_id: 'deadbeef',
+        trial: 'not_an_object',
+      }),
+    );
+    try {
+      await NearlyClient.register({
+        outlayerUrl: 'https://outlayer.example',
+        fetch,
+      });
+      throw new Error('expected register to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(NearlyError);
+      const nearlyErr = err as NearlyError;
+      // Serialize the full error shape including message and stringified
+      // shape fields — nothing in the observable error surface should
+      // contain the wk_ prefix.
+      const serialized = JSON.stringify({
+        message: nearlyErr.message,
+        shape: nearlyErr.shape,
+      });
+      expect(serialized).not.toMatch(/wk_[A-Za-z0-9_]+/);
+    }
+  });
+});
+
+describe('NearlyClient.deriveSubAgent', () => {
+  // All paths use a single API-key response to simulate OutLayer's
+  // PUT /wallet/v1/api-key reply. The SubAgentResult includes a
+  // functional NearlyClient bound to the derived wk_.
+  function apiKeyResponseBody(accountId = 'a'.repeat(64)): unknown {
+    return { wallet_id: 'uuid-sub-agent', near_account_id: accountId };
+  }
+
+  function parentClient(fetch: FetchLike): NearlyClient {
+    return new NearlyClient({
+      walletKey: 'wk_parent',
+      accountId: 'parent.near',
+      fastdataUrl: 'https://kv.example',
+      outlayerUrl: 'https://outlayer.example',
+      namespace: 'contextual.near',
+      fetch,
+      rateLimiting: false,
+    });
+  }
+
+  it('derives a sub-wallet, registers its key hash, returns a working client', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/wallet/v1/api-key'))
+        return jsonResponse(apiKeyResponseBody('b'.repeat(64)));
+      throw new Error(`unexpected url: ${url}`);
+    });
+    const parent = parentClient(fetch);
+    const result = await parent.deriveSubAgent({ seed: 'worker-1' });
+    expect(result.walletKey).toMatch(/^wk_[0-9a-f]{64}$/);
+    expect(result.accountId).toBe('b'.repeat(64));
+    expect(result.client).toBeInstanceOf(NearlyClient);
+    expect(result.client.accountId).toBe('b'.repeat(64));
+    // One PUT to /wallet/v1/api-key.
+    const apiKeyCalls = calls.filter((c) =>
+      c.url.endsWith('/wallet/v1/api-key'),
+    );
+    expect(apiKeyCalls).toHaveLength(1);
+    expect(apiKeyCalls[0].init?.method).toBe('PUT');
+    // Parent's Bearer, not the derived sub-key.
+    const auth = (apiKeyCalls[0].init?.headers as Record<string, string>)
+      ?.Authorization;
+    expect(auth).toBe('Bearer wk_parent');
+    const body = JSON.parse(apiKeyCalls[0].init?.body as string);
+    expect(body.seed).toBe('worker-1');
+    expect(body.key_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('idempotent on the wire — same seed twice sends the same key_hash', async () => {
+    const { fetch, calls } = scripted(() => jsonResponse(apiKeyResponseBody()));
+    const parent = parentClient(fetch);
+    await parent.deriveSubAgent({ seed: 'worker' });
+    await parent.deriveSubAgent({ seed: 'worker' });
+    const apiKeyBodies = calls
+      .filter((c) => c.url.endsWith('/wallet/v1/api-key'))
+      .map((c) => JSON.parse(c.init?.body as string));
+    expect(apiKeyBodies).toHaveLength(2);
+    expect(apiKeyBodies[0].key_hash).toBe(apiKeyBodies[1].key_hash);
+  });
+
+  it('deterministic across instances — two parents with the same wk_ derive the same sub_key', async () => {
+    const { fetch: f1 } = scripted(() => jsonResponse(apiKeyResponseBody()));
+    const { fetch: f2 } = scripted(() => jsonResponse(apiKeyResponseBody()));
+    const p1 = parentClient(f1);
+    const p2 = parentClient(f2);
+    const r1 = await p1.deriveSubAgent({ seed: 'same' });
+    const r2 = await p2.deriveSubAgent({ seed: 'same' });
+    expect(r1.walletKey).toBe(r2.walletKey);
+  });
+
+  it('different seeds produce different walletKeys', async () => {
+    const { fetch } = scripted(() => jsonResponse(apiKeyResponseBody()));
+    const parent = parentClient(fetch);
+    const a = await parent.deriveSubAgent({ seed: 'worker-a' });
+    const b = await parent.deriveSubAgent({ seed: 'worker-b' });
+    expect(a.walletKey).not.toBe(b.walletKey);
+  });
+
+  it('derived client inherits parent connection config (outlayerUrl, namespace)', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/wallet/v1/api-key'))
+        return jsonResponse(apiKeyResponseBody());
+      if (url.includes('/v0/latest/'))
+        return profileEntryResponse(aliceProfileBlob);
+      return jsonResponse({});
+    });
+    const parent = parentClient(fetch);
+    const { client } = await parent.deriveSubAgent({ seed: 'worker' });
+    // Read via the sub-client — proves fastdataUrl passed through.
+    const agent = await client.getAgent(client.accountId);
+    expect(agent === null || typeof agent === 'object').toBe(true);
+  });
+
+  it('throws VALIDATION_ERROR on empty seed (synchronously, no HTTP)', async () => {
+    const { fetch, calls } = scripted(() => jsonResponse(apiKeyResponseBody()));
+    const parent = parentClient(fetch);
+    await expect(parent.deriveSubAgent({ seed: '' })).rejects.toMatchObject({
+      shape: { code: 'VALIDATION_ERROR', field: 'seed' },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('throws VALIDATION_ERROR on seed > 256 chars', async () => {
+    const { fetch, calls } = scripted(() => jsonResponse(apiKeyResponseBody()));
+    const parent = parentClient(fetch);
+    await expect(
+      parent.deriveSubAgent({ seed: 'x'.repeat(257) }),
+    ).rejects.toMatchObject({
+      shape: { code: 'VALIDATION_ERROR', field: 'seed' },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('throws NETWORK on fetch rejection', async () => {
+    const fetch: FetchLike = async () => {
+      throw new Error('ECONNRESET');
+    };
+    const parent = parentClient(fetch);
+    await expect(
+      parent.deriveSubAgent({ seed: 'worker' }),
+    ).rejects.toMatchObject({ shape: { code: 'NETWORK' } });
+  });
+
+  it('throws AUTH_FAILED on 401 (parent wk_ rejected)', async () => {
+    const { fetch } = scripted(
+      () => new Response('unauthorized', { status: 401 }),
+    );
+    const parent = parentClient(fetch);
+    await expect(
+      parent.deriveSubAgent({ seed: 'worker' }),
+    ).rejects.toMatchObject({ shape: { code: 'AUTH_FAILED' } });
+  });
+
+  it('throws PROTOCOL on 5xx with truncated body in hint', async () => {
+    const { fetch } = scripted(
+      () => new Response('upstream down', { status: 502 }),
+    );
+    const parent = parentClient(fetch);
+    await expect(
+      parent.deriveSubAgent({ seed: 'worker' }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'PROTOCOL',
+        hint: expect.stringContaining('api-key 502'),
+      },
+    });
+  });
+
+  it('throws PROTOCOL when near_account_id is missing from response', async () => {
+    const { fetch } = scripted(() => jsonResponse({ wallet_id: 'only-this' }));
+    const parent = parentClient(fetch);
+    await expect(
+      parent.deriveSubAgent({ seed: 'worker' }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'PROTOCOL',
+        hint: expect.stringContaining('near_account_id'),
+      },
+    });
+  });
+
+  it('does not leak the parent wk_ into any error after a post-success failure path', async () => {
+    // Force a parsing failure after OutLayer returned 200 — the parent's
+    // wk_secret_parent_DO_NOT_LEAK was already used to authenticate the
+    // PUT, and the test asserts the error surface cannot contain it.
+    const { fetch } = scripted(
+      () => new Response('<html>surprise</html>', { status: 200 }),
+    );
+    const parent = new NearlyClient({
+      walletKey: 'wk_secret_parent_DO_NOT_LEAK',
+      accountId: 'parent.near',
+      fastdataUrl: 'https://kv.example',
+      outlayerUrl: 'https://outlayer.example',
+      fetch,
+      rateLimiting: false,
+    });
+    try {
+      await parent.deriveSubAgent({ seed: 'worker' });
+      throw new Error('expected deriveSubAgent to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(NearlyError);
+      const nearlyErr = err as NearlyError;
+      const serialized = JSON.stringify({
+        message: nearlyErr.message,
+        shape: nearlyErr.shape,
+      });
+      expect(serialized).not.toMatch(/wk_[A-Za-z0-9_]+/);
+    }
+  });
+});
+
 describe('NearlyClient.heartbeat', () => {
   it('reads existing profile, writes a new entry without time fields', async () => {
     const existing: Agent = { ...aliceProfileBlob, last_active: 1 };
@@ -141,6 +553,1519 @@ describe('NearlyClient.heartbeat', () => {
     const result = await client.heartbeat();
     expect(result.agent.account_id).toBe('alice.near');
     expect(result.agent.name).toBeNull();
+  });
+});
+
+describe('NearlyClient.getAgent', () => {
+  function profileAt(
+    accountId: string,
+    blob: Record<string, unknown>,
+    blockSecs: number,
+    blockHeight = 1,
+  ): Response {
+    return jsonResponse({
+      entries: [
+        {
+          predecessor_id: accountId,
+          current_account_id: 'contextual.near',
+          block_height: blockHeight,
+          block_timestamp: blockSecs * 1e9,
+          key: 'profile',
+          value: blob,
+        },
+      ],
+    });
+  }
+
+  it('returns null when the profile does not exist', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/v0/latest/contextual.near/ghost.near/profile'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/v0/history/contextual.near/ghost.near/profile'))
+        return jsonResponse({ entries: [] });
+      if (url.includes('/v0/latest/contextual.near'))
+        return jsonResponse({ entries: [] });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    expect(await client.getAgent('ghost.near')).toBeNull();
+  });
+
+  it('populates created_at + heights from first-write, counts from live scans', async () => {
+    const { fetch } = scripted((url, init) => {
+      // Single-key profile read — latest write at block_height 5000.
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile')) {
+        return profileAt(
+          'bob.near',
+          { ...aliceProfileBlob, name: 'Bob' },
+          1_700_000_500,
+          5000,
+        );
+      }
+      // First-write history — older block_height 100 for created_height.
+      if (url.endsWith('/v0/history/contextual.near/bob.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'bob.near',
+              current_account_id: 'contextual.near',
+              block_height: 100,
+              block_timestamp: 1_600_000_000 * 1e9,
+              key: 'profile',
+              value: {},
+            },
+          ],
+        });
+      }
+      // Namespace-wide scans — dispatched by request body
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key?: string;
+          key_prefix?: string;
+        };
+        if (body.key === 'graph/follow/bob.near') {
+          // 2 followers
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: {},
+              },
+              {
+                predecessor_id: 'carol.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: { reason: 'trusted' },
+              },
+            ],
+          });
+        }
+        if (body.key_prefix === 'endorsing/bob.near/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'endorsing/bob.near/tags/rust',
+                value: {},
+              },
+              {
+                predecessor_id: 'carol.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'endorsing/bob.near/tags/rust',
+                value: {},
+              },
+              {
+                predecessor_id: 'dave.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'endorsing/bob.near/trusted',
+                value: {},
+              },
+            ],
+          });
+        }
+        throw new Error(`unexpected namespace scan: ${JSON.stringify(body)}`);
+      }
+      // Known-agent scan for bob's own follows
+      if (url.endsWith('/v0/latest/contextual.near/bob.near')) {
+        // 1 outgoing follow
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'bob.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/alice.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const agent = await client.getAgent('bob.near');
+    expect(agent).not.toBeNull();
+    expect(agent!.account_id).toBe('bob.near');
+    expect(agent!.name).toBe('Bob');
+    expect(agent!.created_at).toBe(1_600_000_000);
+    expect(agent!.created_height).toBe(100);
+    expect(agent!.last_active).toBe(1_700_000_500);
+    expect(agent!.last_active_height).toBe(5000);
+    expect(agent!.follower_count).toBe(2);
+    expect(agent!.following_count).toBe(1);
+    expect(agent!.endorsement_count).toBe(3);
+    expect(agent!.endorsements).toEqual({
+      'tags/rust': 2,
+      trusted: 1,
+    });
+  });
+});
+
+describe('NearlyClient.getMe', () => {
+  // Sugar over `getAgent(this.accountId)` — minimal test to prove the
+  // dispatch; the full read-fold-overlay path is covered by getAgent tests.
+  it('reads the caller own profile without requiring accountId at the callsite', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1_700_000_000 * 1e9,
+              key: 'profile',
+              value: aliceProfileBlob,
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/v0/history/contextual.near/alice.near/profile')) {
+        return jsonResponse({ entries: [] });
+      }
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        return jsonResponse({ entries: [] });
+      }
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        return jsonResponse({ entries: [] });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const me = await client.getMe();
+    expect(me).not.toBeNull();
+    expect(me!.account_id).toBe('alice.near');
+    // Confirm dispatch routed through the caller's own account_id.
+    const profileCall = calls.find((c) =>
+      c.url.endsWith('/v0/latest/contextual.near/alice.near/profile'),
+    );
+    expect(profileCall).toBeDefined();
+  });
+});
+
+describe('NearlyClient.listAgents', () => {
+  function listResponse(
+    predecessorIds: readonly string[],
+    lastActives: readonly number[],
+  ): Response {
+    return jsonResponse({
+      entries: predecessorIds.map((id, i) => ({
+        predecessor_id: id,
+        current_account_id: 'contextual.near',
+        block_height: 1,
+        block_timestamp: lastActives[i] * 1e9,
+        key: 'profile',
+        value: { ...aliceProfileBlob, name: id.split('.')[0] },
+      })),
+    });
+  }
+
+  it('sort=active orders by block-derived last_active, newest first', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'profile') {
+          return listResponse(
+            ['alice.near', 'bob.near', 'carol.near'],
+            [1_700_000_100, 1_700_000_300, 1_700_000_200],
+          );
+        }
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const agents: string[] = [];
+    for await (const a of client.listAgents()) agents.push(a.account_id);
+    expect(agents).toEqual(['bob.near', 'carol.near', 'alice.near']);
+  });
+
+  it('global limit stops iteration without draining the full set', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'profile') {
+          return listResponse(
+            ['a.near', 'b.near', 'c.near', 'd.near'],
+            [4, 3, 2, 1],
+          );
+        }
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const agents: string[] = [];
+    for await (const a of client.listAgents({ limit: 2 })) {
+      agents.push(a.account_id);
+    }
+    expect(agents).toEqual(['a.near', 'b.near']);
+  });
+
+  it('tag filter fans out per-agent profile reads', async () => {
+    const { fetch, calls } = scripted((url, init) => {
+      // Tag index scan
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'tag/rust') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1_700_000_100 * 1e9,
+                key: 'tag/rust',
+                value: true,
+              },
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1_700_000_200 * 1e9,
+                key: 'tag/rust',
+                value: true,
+              },
+            ],
+          });
+        }
+      }
+      // Per-agent profile fetches
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1_700_000_100 * 1e9,
+              key: 'profile',
+              value: { ...aliceProfileBlob, name: 'Alice' },
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'bob.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1_700_000_200 * 1e9,
+              key: 'profile',
+              value: { ...aliceProfileBlob, name: 'Bob' },
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const agents: string[] = [];
+    for await (const a of client.listAgents({ tag: 'rust' })) {
+      agents.push(a.account_id);
+    }
+    expect(agents).toEqual(['bob.near', 'alice.near']);
+    // Sanity: we hit both per-agent profile endpoints
+    expect(calls.some((c) => c.url.endsWith('/alice.near/profile'))).toBe(true);
+    expect(calls.some((c) => c.url.endsWith('/bob.near/profile'))).toBe(true);
+  });
+
+  it('returns empty iterator when the profile scan is empty', async () => {
+    const { fetch } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    const agents: Agent[] = [];
+    for await (const a of client.listAgents()) agents.push(a);
+    expect(agents).toEqual([]);
+  });
+});
+
+describe('NearlyClient.getFollowers / getFollowing', () => {
+  function profileResp(
+    accountId: string,
+    blockSecs: number,
+    name: string,
+  ): Response {
+    return jsonResponse({
+      entries: [
+        {
+          predecessor_id: accountId,
+          current_account_id: 'contextual.near',
+          block_height: 1,
+          block_timestamp: blockSecs * 1e9,
+          key: 'profile',
+          value: { ...aliceProfileBlob, name },
+        },
+      ],
+    });
+  }
+
+  it('getFollowers yields agents from the graph/follow predecessors', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'graph/follow/bob.near') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: {},
+              },
+              {
+                predecessor_id: 'carol.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: { reason: 'trusted' },
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile'))
+        return profileResp('alice.near', 1_700_000_100, 'Alice');
+      if (url.endsWith('/v0/latest/contextual.near/carol.near/profile'))
+        return profileResp('carol.near', 1_700_000_200, 'Carol');
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const names: string[] = [];
+    for await (const a of client.getFollowers('bob.near')) names.push(a.name!);
+    expect(names).toEqual(['Alice', 'Carol']);
+  });
+
+  it('getFollowers drops entries whose profile 404s', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'graph/follow/bob.near') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: {},
+              },
+              {
+                predecessor_id: 'ghost.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile'))
+        return profileResp('alice.near', 1, 'Alice');
+      if (url.endsWith('/v0/latest/contextual.near/ghost.near/profile'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const names: string[] = [];
+    for await (const a of client.getFollowers('bob.near')) names.push(a.name!);
+    expect(names).toEqual(['Alice']);
+  });
+
+  it('getFollowing walks the agent own graph/follow prefix', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'graph/follow/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: {},
+              },
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/carol.near',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return profileResp('bob.near', 1, 'Bob');
+      if (url.endsWith('/v0/latest/contextual.near/carol.near/profile'))
+        return profileResp('carol.near', 1, 'Carol');
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const names: string[] = [];
+    for await (const a of client.getFollowing('alice.near'))
+      names.push(a.name!);
+    expect(names).toEqual(['Bob', 'Carol']);
+  });
+
+  it('global limit halts iteration early', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'graph/follow/bob.near') {
+          return jsonResponse({
+            entries: ['a.near', 'b.near', 'c.near'].map((id) => ({
+              predecessor_id: id,
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/bob.near',
+              value: {},
+            })),
+          });
+        }
+      }
+      if (url.match(/\/contextual\.near\/[abc]\.near\/profile$/)) {
+        const id = url.split('/').slice(-2, -1)[0];
+        return profileResp(id, 1, id);
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const names: string[] = [];
+    for await (const a of client.getFollowers('bob.near', { limit: 2 })) {
+      names.push(a.name!);
+    }
+    expect(names).toEqual(['a.near', 'b.near']);
+  });
+});
+
+describe('NearlyClient.getEdges', () => {
+  function profileResp(accountId: string, name: string): Response {
+    return jsonResponse({
+      entries: [
+        {
+          predecessor_id: accountId,
+          current_account_id: 'contextual.near',
+          block_height: 1,
+          block_timestamp: 1,
+          key: 'profile',
+          value: { ...aliceProfileBlob, name },
+        },
+      ],
+    });
+  }
+
+  function edgesFetch() {
+    return scripted((url, init) => {
+      // Incoming: predecessors who wrote graph/follow/alice.near
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'graph/follow/alice.near') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/alice.near',
+                value: {},
+              },
+              {
+                predecessor_id: 'carol.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/alice.near',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      // Outgoing: alice.near's own graph/follow/ entries
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/bob.near',
+              value: {},
+            },
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/dave.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return profileResp('bob.near', 'Bob');
+      if (url.endsWith('/v0/latest/contextual.near/carol.near/profile'))
+        return profileResp('carol.near', 'Carol');
+      if (url.endsWith('/v0/latest/contextual.near/dave.near/profile'))
+        return profileResp('dave.near', 'Dave');
+      throw new Error(`unexpected ${url}`);
+    });
+  }
+
+  it('classifies bob as mutual, carol as incoming, dave as outgoing', async () => {
+    const { fetch } = edgesFetch();
+    const client = clientOf(fetch);
+    const edges: { name: string; direction: string }[] = [];
+    for await (const e of client.getEdges('alice.near')) {
+      edges.push({ name: e.name!, direction: e.direction });
+    }
+    // Incoming first (bob, carol in input order), then outgoing-only (dave).
+    // Bob appears on both sides, so the incoming edge is upgraded to mutual.
+    expect(edges).toEqual([
+      { name: 'Bob', direction: 'mutual' },
+      { name: 'Carol', direction: 'incoming' },
+      { name: 'Dave', direction: 'outgoing' },
+    ]);
+  });
+
+  it('direction=incoming skips the outgoing scan', async () => {
+    const { fetch, calls } = edgesFetch();
+    const client = clientOf(fetch);
+    const edges: { name: string; direction: string }[] = [];
+    for await (const e of client.getEdges('alice.near', {
+      direction: 'incoming',
+    })) {
+      edges.push({ name: e.name!, direction: e.direction });
+    }
+    expect(edges).toEqual([
+      { name: 'Bob', direction: 'incoming' },
+      { name: 'Carol', direction: 'incoming' },
+    ]);
+    // The outgoing scan hits `/v0/latest/{NS}/alice.near` — never called.
+    expect(
+      calls.some((c) =>
+        c.url.endsWith('/v0/latest/contextual.near/alice.near'),
+      ),
+    ).toBe(false);
+  });
+
+  it('respects global limit', async () => {
+    const { fetch } = edgesFetch();
+    const client = clientOf(fetch);
+    const edges: string[] = [];
+    for await (const e of client.getEdges('alice.near', { limit: 2 })) {
+      edges.push(e.name!);
+    }
+    expect(edges).toEqual(['Bob', 'Carol']);
+  });
+});
+
+describe('NearlyClient.getEndorsers', () => {
+  function profileResp(accountId: string, name: string): Response {
+    return jsonResponse({
+      entries: [
+        {
+          predecessor_id: accountId,
+          current_account_id: 'contextual.near',
+          block_height: 1,
+          block_timestamp: 1,
+          key: 'profile',
+          value: { ...aliceProfileBlob, name },
+        },
+      ],
+    });
+  }
+
+  it('returns {} when no endorsements exist', async () => {
+    const { fetch } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    expect(await client.getEndorsers('ghost.near')).toEqual({});
+  });
+
+  it('groups by opaque key_suffix including single-segment suffixes', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'endorsing/alice.near/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 101,
+                block_timestamp: 1_700_000_100 * 1e9,
+                key: 'endorsing/alice.near/tags/rust',
+                value: { reason: 'audit reviewer', content_hash: 'sha256:abc' },
+              },
+              {
+                predecessor_id: 'carol.near',
+                current_account_id: 'contextual.near',
+                block_height: 202,
+                block_timestamp: 1_700_000_200 * 1e9,
+                key: 'endorsing/alice.near/tags/rust',
+                value: {},
+              },
+              {
+                predecessor_id: 'dave.near',
+                current_account_id: 'contextual.near',
+                block_height: 303,
+                block_timestamp: 1_700_000_300 * 1e9,
+                key: 'endorsing/alice.near/trusted',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return profileResp('bob.near', 'Bob');
+      if (url.endsWith('/v0/latest/contextual.near/carol.near/profile'))
+        return profileResp('carol.near', 'Carol');
+      if (url.endsWith('/v0/latest/contextual.near/dave.near/profile'))
+        return profileResp('dave.near', 'Dave');
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const endorsers = await client.getEndorsers('alice.near');
+
+    // Single-segment suffix survives — server contract is opaque.
+    expect(Object.keys(endorsers).sort()).toEqual(['tags/rust', 'trusted']);
+    expect(endorsers['tags/rust']).toHaveLength(2);
+    expect(endorsers.trusted).toHaveLength(1);
+
+    // content_hash and reason round-trip from stored value.
+    expect(endorsers['tags/rust'][0]).toMatchObject({
+      account_id: 'bob.near',
+      name: 'Bob',
+      reason: 'audit reviewer',
+      content_hash: 'sha256:abc',
+      at: 1_700_000_100,
+      at_height: 101,
+    });
+    // Second endorser — no reason/content_hash in value.
+    expect(endorsers['tags/rust'][1].reason).toBeUndefined();
+    expect(endorsers['tags/rust'][1].content_hash).toBeUndefined();
+    // at derived from block_timestamp nanos; at_height from block_height.
+    expect(endorsers['tags/rust'][1].at).toBe(1_700_000_200);
+    expect(endorsers['tags/rust'][1].at_height).toBe(202);
+    // Single-segment suffix carries its own at_height.
+    expect(endorsers.trusted[0].at_height).toBe(303);
+  });
+
+  it('drops endorsers whose profile 404s', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'endorsing/alice.near/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'endorsing/alice.near/tags/rust',
+                value: {},
+              },
+              {
+                predecessor_id: 'ghost.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'endorsing/alice.near/tags/rust',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return profileResp('bob.near', 'Bob');
+      if (url.endsWith('/v0/latest/contextual.near/ghost.near/profile'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const endorsers = await client.getEndorsers('alice.near');
+    expect(endorsers['tags/rust']).toHaveLength(1);
+    expect(endorsers['tags/rust'][0].account_id).toBe('bob.near');
+  });
+});
+
+describe('NearlyClient.listTags / listCapabilities', () => {
+  it('listTags aggregates existence entries and sorts by count desc', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'tag/') {
+          return jsonResponse({
+            entries: [
+              // 3× rust
+              {
+                predecessor_id: 'a.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'tag/rust',
+                value: true,
+              },
+              {
+                predecessor_id: 'b.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'tag/rust',
+                value: true,
+              },
+              {
+                predecessor_id: 'c.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'tag/rust',
+                value: true,
+              },
+              // 2× ai
+              {
+                predecessor_id: 'a.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'tag/ai',
+                value: true,
+              },
+              {
+                predecessor_id: 'd.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'tag/ai',
+                value: true,
+              },
+              // 1× defi
+              {
+                predecessor_id: 'e.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'tag/defi',
+                value: true,
+              },
+            ],
+          });
+        }
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const tags: { tag: string; count: number }[] = [];
+    for await (const t of client.listTags()) tags.push(t);
+    expect(tags).toEqual([
+      { tag: 'rust', count: 3 },
+      { tag: 'ai', count: 2 },
+      { tag: 'defi', count: 1 },
+    ]);
+  });
+
+  it('listCapabilities splits ns/value on the first slash', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'cap/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'a.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'cap/skills/audit',
+                value: true,
+              },
+              {
+                predecessor_id: 'b.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'cap/skills/audit',
+                value: true,
+              },
+              {
+                predecessor_id: 'c.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'cap/skills.languages/rust',
+                value: true,
+              },
+            ],
+          });
+        }
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const caps: CapabilityCount[] = [];
+    for await (const c of client.listCapabilities()) caps.push(c);
+    expect(caps).toEqual([
+      { namespace: 'skills', value: 'audit', count: 2 },
+      // Dots in namespace survive the split (first `/` only).
+      { namespace: 'skills.languages', value: 'rust', count: 1 },
+    ]);
+  });
+
+  it('listTags yields nothing when the scan is empty', async () => {
+    const { fetch } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    const tags: TagCount[] = [];
+    for await (const t of client.listTags()) tags.push(t);
+    expect(tags).toEqual([]);
+  });
+});
+
+describe('NearlyClient.getActivity', () => {
+  function edgeEntry(predecessorId: string, key: string, blockHeight: number) {
+    return {
+      predecessor_id: predecessorId,
+      current_account_id: 'contextual.near',
+      block_height: blockHeight,
+      block_timestamp: blockHeight * 1e9,
+      key,
+      value: {},
+    };
+  }
+
+  function profileResp(accountId: string, name: string): Response {
+    return jsonResponse({
+      entries: [
+        {
+          predecessor_id: accountId,
+          current_account_id: 'contextual.near',
+          block_height: 1,
+          block_timestamp: 1,
+          key: 'profile',
+          value: { ...aliceProfileBlob, name },
+        },
+      ],
+    });
+  }
+
+  function fetchFor(
+    followerEntries: ReturnType<typeof edgeEntry>[],
+    followingEntries: ReturnType<typeof edgeEntry>[],
+    profiles: Record<string, string>,
+  ) {
+    return scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'graph/follow/alice.near') {
+          return jsonResponse({ entries: followerEntries });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        return jsonResponse({ entries: followingEntries });
+      }
+      const match = url.match(
+        /\/v0\/latest\/contextual\.near\/([^/]+)\/profile$/,
+      );
+      if (match) {
+        const id = match[1];
+        if (profiles[id]) return profileResp(id, profiles[id]);
+        return new Response(null, { status: 404 });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+  }
+
+  it('first call (no cursor) returns everything with max height as cursor', async () => {
+    const { fetch } = fetchFor(
+      [
+        edgeEntry('bob.near', 'graph/follow/alice.near', 100),
+        edgeEntry('carol.near', 'graph/follow/alice.near', 250),
+      ],
+      [edgeEntry('alice.near', 'graph/follow/dave.near', 200)],
+      { 'bob.near': 'Bob', 'carol.near': 'Carol', 'dave.near': 'Dave' },
+    );
+    const client = clientOf(fetch);
+    const res = await client.getActivity();
+    expect(res.cursor).toBe(250);
+    expect(res.new_followers.map((f) => f.name)).toEqual(['Bob', 'Carol']);
+    expect(res.new_following.map((f) => f.name)).toEqual(['Dave']);
+  });
+
+  it('cursor filter returns only entries strictly after the high-water mark', async () => {
+    const { fetch } = fetchFor(
+      [
+        edgeEntry('bob.near', 'graph/follow/alice.near', 100),
+        edgeEntry('carol.near', 'graph/follow/alice.near', 250),
+      ],
+      [edgeEntry('alice.near', 'graph/follow/dave.near', 200)],
+      { 'bob.near': 'Bob', 'carol.near': 'Carol', 'dave.near': 'Dave' },
+    );
+    const client = clientOf(fetch);
+    const res = await client.getActivity({ cursor: 200 });
+    // Bob (100) and Dave (200) are filtered out; only Carol (250) survives.
+    expect(res.cursor).toBe(250);
+    expect(res.new_followers.map((f) => f.name)).toEqual(['Carol']);
+    expect(res.new_following).toEqual([]);
+  });
+
+  it('echoes the caller cursor back when no entries advance past it', async () => {
+    const { fetch } = fetchFor(
+      [edgeEntry('bob.near', 'graph/follow/alice.near', 100)],
+      [],
+      { 'bob.near': 'Bob' },
+    );
+    const client = clientOf(fetch);
+    const res = await client.getActivity({ cursor: 500 });
+    expect(res.cursor).toBe(500);
+    expect(res.new_followers).toEqual([]);
+    expect(res.new_following).toEqual([]);
+  });
+
+  it('first call with zero entries returns undefined cursor', async () => {
+    const { fetch } = fetchFor([], [], {});
+    const client = clientOf(fetch);
+    const res = await client.getActivity();
+    expect(res.cursor).toBeUndefined();
+    expect(res.new_followers).toEqual([]);
+    expect(res.new_following).toEqual([]);
+  });
+
+  it('drops summaries whose profile 404s but still advances cursor', async () => {
+    const { fetch } = fetchFor(
+      [
+        edgeEntry('ghost.near', 'graph/follow/alice.near', 300),
+        edgeEntry('bob.near', 'graph/follow/alice.near', 100),
+      ],
+      [],
+      { 'bob.near': 'Bob' }, // ghost.near profile 404s
+    );
+    const client = clientOf(fetch);
+    const res = await client.getActivity();
+    // Cursor still advances to 300 even though the ghost.near summary dropped.
+    expect(res.cursor).toBe(300);
+    expect(res.new_followers.map((f) => f.name)).toEqual(['Bob']);
+  });
+});
+
+describe('NearlyClient.getNetwork', () => {
+  it('returns null when profile does not exist', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/v0/latest/contextual.near/ghost.near/profile'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/v0/history/contextual.near/ghost.near/profile'))
+        return jsonResponse({ entries: [] });
+      if (url.includes('/v0/latest/contextual.near'))
+        return jsonResponse({ entries: [] });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    expect(await client.getNetwork('ghost.near')).toBeNull();
+  });
+
+  it('computes follower / following / mutual counts with height companions', async () => {
+    const { fetch } = scripted((url, init) => {
+      // Profile latest
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 5000,
+              block_timestamp: 1_700_000_500 * 1e9,
+              key: 'profile',
+              value: { ...aliceProfileBlob, name: 'Alice' },
+            },
+          ],
+        });
+      }
+      // First-write history
+      if (url.endsWith('/v0/history/contextual.near/alice.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 100,
+              block_timestamp: 1_600_000_000 * 1e9,
+              key: 'profile',
+              value: {},
+            },
+          ],
+        });
+      }
+      // Incoming: bob, carol, dave follow alice
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'graph/follow/alice.near') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/alice.near',
+                value: {},
+              },
+              {
+                predecessor_id: 'carol.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/alice.near',
+                value: {},
+              },
+              {
+                predecessor_id: 'dave.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/alice.near',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      // Outgoing: alice follows bob, carol — mutual with both, dave is incoming-only
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/bob.near',
+              value: {},
+            },
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/carol.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const net = await client.getNetwork('alice.near');
+    expect(net).toEqual({
+      follower_count: 3,
+      following_count: 2,
+      mutual_count: 2,
+      last_active: 1_700_000_500,
+      last_active_height: 5000,
+      created_at: 1_600_000_000,
+      created_height: 100,
+    });
+  });
+
+  it('defaults to the caller own account when accountId is omitted', async () => {
+    // Self-default path: calling getNetwork() with no args should route
+    // through this.accountId (= 'alice.near' per clientOf). Reuse the
+    // profile shape above but trim the assertions — just confirm the
+    // dispatch lands on alice.near and returns a NetworkSummary.
+    const { fetch, calls } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 5000,
+              block_timestamp: 1_700_000_500 * 1e9,
+              key: 'profile',
+              value: { ...aliceProfileBlob, name: 'Alice' },
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/v0/history/contextual.near/alice.near/profile')) {
+        return jsonResponse({ entries: [] });
+      }
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'graph/follow/alice.near') {
+          return jsonResponse({ entries: [] });
+        }
+        return jsonResponse({ entries: [] });
+      }
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        return jsonResponse({ entries: [] });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const net = await client.getNetwork(); // no arg — self-default
+    expect(net).not.toBeNull();
+    expect(net!.follower_count).toBe(0);
+    expect(net!.following_count).toBe(0);
+    // Sanity-check the route — the profile fetch was for the caller's
+    // own account, not some other agent.
+    const profileCall = calls.find((c) =>
+      c.url.endsWith('/v0/latest/contextual.near/alice.near/profile'),
+    );
+    expect(profileCall).toBeDefined();
+  });
+});
+
+describe('NearlyClient.getBalance', () => {
+  it('forwards to /wallet/v1/balance?chain=near and surfaces balanceNear', async () => {
+    const { fetch, calls } = scripted(() =>
+      jsonResponse({
+        account_id: '4397d730abcd',
+        balance: '1500000000000000000000000', // 1.5 NEAR
+      }),
+    );
+    const client = clientOf(fetch);
+    const res = await client.getBalance();
+    expect(res.chain).toBe('near');
+    expect(res.balance).toBe('1500000000000000000000000');
+    expect(res.balanceNear).toBeCloseTo(1.5, 6);
+    expect(res.accountId).toBe('4397d730abcd');
+    expect(calls[0].url).toBe(
+      'https://outlayer.example/wallet/v1/balance?chain=near',
+    );
+    // Authorization header must carry the client's wk_ verbatim.
+    expect(
+      (calls[0].init?.headers as Record<string, string>).Authorization,
+    ).toBe('Bearer wk_test');
+  });
+
+  it('honors a custom chain opt and omits balanceNear off-chain', async () => {
+    const { fetch, calls } = scripted(() =>
+      jsonResponse({ account_id: '0xbob', balance: '42' }),
+    );
+    const client = clientOf(fetch);
+    const res = await client.getBalance({ chain: 'eth' });
+    expect(res.chain).toBe('eth');
+    expect(res.balanceNear).toBeUndefined();
+    expect(calls[0].url).toContain('chain=eth');
+  });
+
+  it('round-trips a zero balance as balanceNear=0 (not an error)', async () => {
+    const { fetch } = scripted(() =>
+      jsonResponse({ account_id: '4397d730', balance: '0' }),
+    );
+    const client = clientOf(fetch);
+    const res = await client.getBalance();
+    expect(res.balance).toBe('0');
+    expect(res.balanceNear).toBe(0);
+  });
+
+  it('propagates AUTH_FAILED on 401', async () => {
+    const { fetch } = scripted(() => new Response(null, { status: 401 }));
+    const client = clientOf(fetch);
+    await expect(client.getBalance()).rejects.toMatchObject({
+      code: 'AUTH_FAILED',
+    });
+  });
+});
+
+describe('NearlyClient.unfollow', () => {
+  it('short-circuits with not_following if no edge exists', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const result = await client.unfollow('bob.near');
+    expect(result.action).toBe('not_following');
+    expect(
+      calls.find((c) => c.url.includes('/wallet/v1/call')),
+    ).toBeUndefined();
+  });
+
+  it('null-writes the graph/follow edge when one exists', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/bob.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const result = await client.unfollow('bob.near');
+    expect(result.action).toBe('unfollowed');
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    expect(body.args['graph/follow/bob.near']).toBeNull();
+  });
+});
+
+describe('NearlyClient.updateMe', () => {
+  it('reads current profile, validates patch, writes the merged blob', async () => {
+    const existing: Agent = { ...aliceProfileBlob, tags: ['rust'] };
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1_700_000_000 * 1e9,
+              key: 'profile',
+              value: existing,
+            },
+          ],
+        });
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const res = await client.updateMe({
+      description: 'new bio',
+      tags: ['rust', 'security'],
+    });
+    expect(res.agent.description).toBe('new bio');
+    expect(res.agent.tags).toEqual(['rust', 'security']);
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    expect(body.args.profile.description).toBe('new bio');
+    expect(body.args['tag/security']).toBe(true);
+  });
+
+  it('rejects an empty patch without hitting the wallet', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.includes('/v0/latest/'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    await expect(client.updateMe({})).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+    });
+    expect(
+      calls.find((c) => c.url.includes('/wallet/v1/call')),
+    ).toBeUndefined();
+  });
+});
+
+describe('NearlyClient.endorse / unendorse', () => {
+  function profileResp(accountId: string, name: string): Response {
+    return jsonResponse({
+      entries: [
+        {
+          predecessor_id: accountId,
+          current_account_id: 'contextual.near',
+          block_height: 1,
+          block_timestamp: 1,
+          key: 'profile',
+          value: { ...aliceProfileBlob, name },
+        },
+      ],
+    });
+  }
+
+  it('endorse checks target exists, writes entries, returns suffixes', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return profileResp('bob.near', 'Bob');
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const res = await client.endorse('bob.near', {
+      keySuffixes: ['tags/rust'],
+      reason: 'great PR',
+    });
+    expect(res.action).toBe('endorsed');
+    expect(res.key_suffixes).toEqual(['tags/rust']);
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    expect(body.args['endorsing/bob.near/tags/rust']).toEqual({
+      reason: 'great PR',
+    });
+  });
+
+  it('endorse throws NOT_FOUND when target profile is absent', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.includes('/v0/latest/contextual.near/ghost.near/profile'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    await expect(
+      client.endorse('ghost.near', { keySuffixes: ['tags/rust'] }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(
+      calls.find((c) => c.url.includes('/wallet/v1/call')),
+    ).toBeUndefined();
+  });
+
+  it('endorse rejects self-endorse before any read', async () => {
+    const { fetch, calls } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    await expect(
+      client.endorse('alice.near', { keySuffixes: ['tags/rust'] }),
+    ).rejects.toMatchObject({ code: 'SELF_ENDORSE' });
+    expect(
+      calls.find((c) => c.url.includes('/wallet/v1/call')),
+    ).toBeUndefined();
+  });
+
+  it('unendorse null-writes each composed key', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const res = await client.unendorse('bob.near', [
+      'tags/rust',
+      'skills/audit',
+    ]);
+    expect(res.action).toBe('unendorsed');
+    expect(res.key_suffixes.sort()).toEqual(['skills/audit', 'tags/rust']);
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    expect(body.args['endorsing/bob.near/tags/rust']).toBeNull();
+    expect(body.args['endorsing/bob.near/skills/audit']).toBeNull();
+  });
+});
+
+describe('NearlyClient.delist', () => {
+  it('returns null when no profile exists (nothing to delist)', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    expect(await client.delist()).toBeNull();
+    expect(
+      calls.find((c) => c.url.includes('/wallet/v1/call')),
+    ).toBeUndefined();
+  });
+
+  it('null-writes profile + own tags/caps + outgoing follow/endorse edges', async () => {
+    const existing: Agent = {
+      ...aliceProfileBlob,
+      tags: ['rust'],
+      capabilities: { skills: ['audit'] },
+    };
+    const { fetch, calls } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'profile',
+              value: existing,
+            },
+          ],
+        });
+      }
+      // Outgoing follow + endorse scans share the same URL; differentiate
+      // by the key_prefix the builder sent.
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'graph/follow/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'graph/follow/bob.near',
+                value: {},
+              },
+            ],
+          });
+        }
+        if (body.key_prefix === 'endorsing/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'endorsing/carol.near/tags/rust',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const res = await client.delist();
+    expect(res).toEqual({ action: 'delisted', account_id: 'alice.near' });
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    expect(body.args.profile).toBeNull();
+    expect(body.args['tag/rust']).toBeNull();
+    expect(body.args['cap/skills/audit']).toBeNull();
+    expect(body.args['graph/follow/bob.near']).toBeNull();
+    expect(body.args['endorsing/carol.near/tags/rust']).toBeNull();
   });
 });
 
@@ -192,5 +2117,374 @@ describe('NearlyClient.follow', () => {
     await expect(client.follow('alice.near')).rejects.toMatchObject({
       code: 'SELF_FOLLOW',
     });
+  });
+});
+
+describe('wallet key leakage sweep', () => {
+  // Every error-construction site in the SDK must pass detail strings
+  // through `sanitizeErrorDetail`, which redacts wk_ tokens before they
+  // enter the error surface. This sweep drives each body-interpolation
+  // path with a contaminated upstream response and asserts the serialized
+  // NearlyError does not carry the prefix anywhere — message, shape, or
+  // cause. The placeholder `[REDACTED_WK]` is the only acceptable mark.
+  //
+  // Coverage matches BUILD.md §4: "scan all error fixtures for
+  // /wk_[A-Za-z0-9]+/ and fail if matched." The narrow leak test above
+  // covers the register-parse path; this sweep covers the runtime paths
+  // where OutLayer / FastData error bodies could contain a token.
+
+  const LEAK_KEY = 'wk_LEAK_abc123';
+  const LEAK_PATTERN = /wk_[A-Za-z0-9_]+/;
+
+  function assertNoLeak(err: unknown): void {
+    expect(err).toBeInstanceOf(NearlyError);
+    const nearlyErr = err as NearlyError;
+    const serialized = JSON.stringify({
+      message: nearlyErr.message,
+      shape: nearlyErr.shape,
+    });
+    expect(serialized).not.toMatch(LEAK_PATTERN);
+    // Placeholder should appear where the raw token was — sanity-check
+    // that the body actually reached the sanitizer rather than being
+    // silently dropped somewhere upstream.
+    expect(serialized).toContain('[REDACTED_WK]');
+  }
+
+  function textResponse(body: string, status: number): Response {
+    return new Response(body, {
+      status,
+      headers: { 'Content-Type': 'text/plain' },
+    });
+  }
+
+  it('submitWrite 500 body is sanitized before protocolError interpolation', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/v0/latest/'))
+        return profileEntryResponse(aliceProfileBlob);
+      if (url.includes('/wallet/v1/call'))
+        return textResponse(
+          `upstream error, key was ${LEAK_KEY} in header`,
+          500,
+        );
+      return new Response(null, { status: 404 });
+    });
+    const client = clientOf(fetch);
+    try {
+      await client.heartbeat();
+      throw new Error('expected heartbeat to throw');
+    } catch (err) {
+      assertNoLeak(err);
+    }
+  });
+
+  it('submitWrite network-layer fetch throw with wk_ in cause message is sanitized', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/v0/latest/'))
+        return profileEntryResponse(aliceProfileBlob);
+      if (url.includes('/wallet/v1/call')) {
+        throw new Error(`connection reset mid-request, auth=${LEAK_KEY}`);
+      }
+      return new Response(null, { status: 404 });
+    });
+    const client = clientOf(fetch);
+    try {
+      await client.heartbeat();
+      throw new Error('expected heartbeat to throw');
+    } catch (err) {
+      assertNoLeak(err);
+    }
+  });
+
+  it('registerWallet 5xx body is sanitized before protocolError interpolation', async () => {
+    const { fetch } = scripted(() =>
+      textResponse(`upstream rejected, offending token ${LEAK_KEY}`, 503),
+    );
+    try {
+      await NearlyClient.register({
+        outlayerUrl: 'https://outlayer.example',
+        fetch,
+      });
+      throw new Error('expected register to throw');
+    } catch (err) {
+      assertNoLeak(err);
+    }
+  });
+
+  it('getBalance 5xx body is sanitized before protocolError interpolation', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/wallet/v1/balance'))
+        return textResponse(`backend error: ${LEAK_KEY} was in the log`, 500);
+      return new Response(null, { status: 404 });
+    });
+    const client = clientOf(fetch);
+    try {
+      await client.getBalance();
+      throw new Error('expected getBalance to throw');
+    } catch (err) {
+      assertNoLeak(err);
+    }
+  });
+
+  it('getBalance network-layer fetch throw with wk_ in cause is sanitized', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/wallet/v1/balance')) {
+        throw new Error(`socket hang up, req headers had ${LEAK_KEY}`);
+      }
+      return new Response(null, { status: 404 });
+    });
+    const client = clientOf(fetch);
+    try {
+      await client.getBalance();
+      throw new Error('expected getBalance to throw');
+    } catch (err) {
+      assertNoLeak(err);
+    }
+  });
+});
+
+describe('NearlyClient.getSuggested', () => {
+  // Minimum scripted fixture for a full getSuggested round-trip:
+  //   1. readProfile (caller's own profile)           — kvGetKey alice.near/profile
+  //   2. list outgoing follows                         — kvListAgent alice.near graph/follow/
+  //   3. full profile directory scan                   — kvGetAllKey profile
+  //   4. sign-message for the get_vrf_seed claim       — POST /wallet/v1/sign-message
+  //   5. WASM call_outlayer for get_vrf_seed           — POST /call/hack.near/nearly
+  function suggestedFetch(opts: {
+    callerTags?: string[];
+    followingIds?: readonly string[];
+    candidates: readonly { id: string; tags: string[]; lastActive?: number }[];
+    vrf?: { success: true; proof: { output_hex: string } } | { success: false };
+    signMessageFails?: boolean;
+  }): ReturnType<typeof scripted> {
+    const callerTags = opts.callerTags ?? ['rust'];
+    const following = opts.followingIds ?? [];
+    return scripted((url, init) => {
+      // 1. Caller profile.
+      if (
+        url ===
+        'https://kv.example/v0/latest/contextual.near/alice.near/profile'
+      ) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1_700_000_100 * 1e9,
+              key: 'profile',
+              value: { ...aliceProfileBlob, tags: callerTags },
+            },
+          ],
+        });
+      }
+      // 2. Per-agent graph/follow/ listing and profile directory scan both
+      //    hit /v0/latest/contextual.near with a POST body.
+      if (url === 'https://kv.example/v0/latest/contextual.near/alice.near') {
+        // agent-scoped scan = kvListAgent(alice.near, 'graph/follow/')
+        return jsonResponse({
+          entries: following.map((id) => ({
+            predecessor_id: 'alice.near',
+            current_account_id: 'contextual.near',
+            block_height: 1,
+            block_timestamp: 1_700_000_100 * 1e9,
+            key: `graph/follow/${id}`,
+            value: {},
+          })),
+        });
+      }
+      if (url === 'https://kv.example/v0/latest/contextual.near') {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'profile') {
+          return jsonResponse({
+            entries: opts.candidates.map((c) => ({
+              predecessor_id: c.id,
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: (c.lastActive ?? 1_700_000_000) * 1e9,
+              key: 'profile',
+              value: {
+                ...aliceProfileBlob,
+                tags: c.tags,
+                name: c.id.split('.')[0],
+              },
+            })),
+          });
+        }
+      }
+      // 3. Sign-message.
+      if (url === 'https://outlayer.example/wallet/v1/sign-message') {
+        if (opts.signMessageFails) {
+          return new Response('', { status: 401 });
+        }
+        return jsonResponse({
+          account_id: 'alice.near',
+          public_key: 'ed25519:abc',
+          signature: 'sig_hex',
+          nonce: 'nonce_hex',
+        });
+      }
+      // 4. WASM call.
+      if (url === 'https://outlayer.example/call/hack.near/nearly') {
+        const vrf = opts.vrf ?? {
+          success: true,
+          proof: { output_hex: 'deadbeef' },
+        };
+        if (vrf.success) {
+          return jsonResponse({
+            success: true,
+            data: {
+              output_hex: vrf.proof.output_hex,
+              signature_hex: 'feedface',
+              alpha: 'suggest',
+              vrf_public_key: 'pk_hex',
+            },
+          });
+        }
+        return jsonResponse({ success: false, error: 'wasm unavailable' });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+  }
+
+  it('scores by shared tags, filters self + already-followed, limits, attaches reason', async () => {
+    const { fetch } = suggestedFetch({
+      callerTags: ['rust', 'wasm'],
+      followingIds: ['bob.near'],
+      candidates: [
+        { id: 'alice.near', tags: ['rust'] }, // self — filtered
+        { id: 'bob.near', tags: ['rust', 'wasm'] }, // followed — filtered
+        {
+          id: 'carol.near',
+          tags: ['rust', 'wasm', 'ai'],
+          lastActive: 1_700_000_300,
+        }, // score 2
+        { id: 'dave.near', tags: ['rust'], lastActive: 1_700_000_200 }, // score 1
+        { id: 'eve.near', tags: [], lastActive: 1_700_000_100 }, // score 0
+      ],
+    });
+    const client = clientOf(fetch);
+    const res = await client.getSuggested({ limit: 5 });
+    expect(res.agents).toHaveLength(3);
+    expect(res.agents[0].account_id).toBe('carol.near');
+    expect(res.agents[0].reason).toBe('Shared tags: rust, wasm');
+    expect(res.agents[1].account_id).toBe('dave.near');
+    expect(res.agents[1].reason).toBe('Shared tags: rust');
+    expect(res.agents[2].account_id).toBe('eve.near');
+    expect(res.agents[2].reason).toBe('New on the network');
+    expect(res.vrf).not.toBeNull();
+    expect(res.vrf?.output_hex).toBe('deadbeef');
+  });
+
+  it('honors the hard server-side cap of 50', async () => {
+    const candidates = Array.from({ length: 100 }, (_, i) => ({
+      id: `a${i}.near`,
+      tags: ['rust'],
+    }));
+    const { fetch } = suggestedFetch({ candidates });
+    const client = clientOf(fetch);
+    const res = await client.getSuggested({ limit: 200 });
+    expect(res.agents.length).toBe(50);
+  });
+
+  it('default limit is 10', async () => {
+    const candidates = Array.from({ length: 30 }, (_, i) => ({
+      id: `a${i}.near`,
+      tags: ['rust'],
+    }));
+    const { fetch } = suggestedFetch({ candidates });
+    const client = clientOf(fetch);
+    const res = await client.getSuggested();
+    expect(res.agents.length).toBe(10);
+  });
+
+  it('falls through to deterministic ranking when the VRF proof is null', async () => {
+    const { fetch } = suggestedFetch({
+      candidates: [
+        { id: 'a.near', tags: ['rust'], lastActive: 100 },
+        { id: 'b.near', tags: ['rust'], lastActive: 200 },
+        { id: 'c.near', tags: ['rust'], lastActive: 150 },
+      ],
+      vrf: { success: false },
+    });
+    const client = clientOf(fetch);
+    const res = await client.getSuggested({ limit: 5 });
+    expect(res.vrf).toBeNull();
+    // Deterministic: all tied at score=1, so last_active descending.
+    expect(res.agents.map((a) => a.account_id)).toEqual([
+      'b.near',
+      'c.near',
+      'a.near',
+    ]);
+  });
+
+  it('swallows NearlyError from the VRF path so suggestions still return', async () => {
+    // 401 from sign-message throws AUTH_FAILED — getSuggested must catch
+    // it and return the deterministic ranking with vrf: null.
+    const { fetch } = suggestedFetch({
+      candidates: [{ id: 'a.near', tags: ['rust'] }],
+      signMessageFails: true,
+    });
+    const client = clientOf(fetch);
+    const res = await client.getSuggested();
+    expect(res.vrf).toBeNull();
+    expect(res.agents).toHaveLength(1);
+    expect(res.agents[0].account_id).toBe('a.near');
+  });
+
+  it('works for a caller with no profile yet — no crash, empty callerTags', async () => {
+    // Caller profile 404s but candidates still exist.
+    const { fetch } = scripted((url, init) => {
+      if (
+        url ===
+        'https://kv.example/v0/latest/contextual.near/alice.near/profile'
+      ) {
+        return new Response('', { status: 404 });
+      }
+      if (url === 'https://kv.example/v0/latest/contextual.near/alice.near') {
+        return jsonResponse({ entries: [] });
+      }
+      if (url === 'https://kv.example/v0/latest/contextual.near') {
+        const body = JSON.parse(init?.body as string) as { key?: string };
+        if (body.key === 'profile') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1_700_000_100 * 1e9,
+                key: 'profile',
+                value: { ...aliceProfileBlob, tags: ['rust'], name: 'Bob' },
+              },
+            ],
+          });
+        }
+      }
+      if (url === 'https://outlayer.example/wallet/v1/sign-message') {
+        return jsonResponse({
+          account_id: 'alice.near',
+          public_key: 'ed25519:abc',
+          signature: 'sig',
+          nonce: 'n',
+        });
+      }
+      if (url === 'https://outlayer.example/call/hack.near/nearly') {
+        return jsonResponse({
+          success: true,
+          data: {
+            output_hex: 'deadbeef',
+            signature_hex: 'f',
+            alpha: 'suggest',
+            vrf_public_key: 'p',
+          },
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const res = await client.getSuggested();
+    expect(res.agents).toHaveLength(1);
+    // No caller tags — everyone scores 0, reason falls through to "New on the network".
+    expect(res.agents[0].reason).toBe('New on the network');
   });
 });

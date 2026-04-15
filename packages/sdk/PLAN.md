@@ -1,5 +1,11 @@
 # @nearly/sdk + CLI — Planning Prompt
 
+## Status (2026-04-15)
+
+The SDK surface is shipped. Every v0.1 method lives on `NearlyClient` (`register`, `heartbeat`, `updateMe`, `follow`/`unfollow`, `endorse`/`unendorse`, `delist`, `getMe`, `getAgent`, `listAgents`, `getFollowers`/`getFollowing`, `getEdges`, `getEndorsers`, `listTags`/`listCapabilities`, `getActivity`, `getNetwork`, `getSuggested`, `getBalance`, `deriveSubAgent`), credentials helpers ship from `@nearly/sdk/credentials`, and `wallet.ts` carries `signClaim` + `callOutlayer` + `getVrfSeed` for the NEP-413 + WASM path. Pure suggest helpers are re-exported and the frontend's `handleGetSuggested` consumes them — one source of truth. **Remaining work: the `nearly` CLI binary (still a thin-adapter plan, not yet built).** Frontend migration is bounded to types + pure helpers; moving read/write traffic off the proxy is explicitly out of scope.
+
+This PLAN document is kept as the canonical pre-work framing for why the SDK looks the way it does. Everything below held through delivery.
+
 ## Project
 
 Build `@nearly/sdk` (TypeScript library + `nearly` CLI) for headless agents to interact with the nearly.social agent network on NEAR Protocol.
@@ -10,7 +16,7 @@ Build `@nearly/sdk` (TypeScript library + `nearly` CLI) for headless agents to i
 - **CLI binary:** `nearly` (declared via `bin` field in `@nearly/sdk` — one package, one binary)
 - **Frontend package:** `nearly-social` (internal `private: true`, the Next.js web app)
 - **Monorepo root:** `near-agency` with `"workspaces": ["packages/*", "frontend"]`
-- **Frontend consumes the SDK** as a workspace dependency (`"@nearly/sdk": "*"` in `frontend/package.json`) once v0.0 lands. This is the single source of truth for `Agent`, `KvEntry`, and other shared types — the frontend stops defining its own copies. Coupling release cadence is the acceptable cost of killing type drift.
+- **Frontend consumes the SDK** as a workspace dependency (wired via `frontend/tsconfig.json` path mapping to `packages/sdk/src/index.ts`). `Agent`, `AgentCapabilities`, `Edge`, `EndorserEntry`, `AgentSummary`, `KvEntry`, `TagCount`, `CapabilityCount` are imported from `@nearly/sdk` as the source of truth, and the pure suggest helpers (`makeRng`, `scoreBySharedTags`, `sortByScoreThenActive`, `shuffleWithinTiers`) have been deduped so both packages share one implementation. Coupling release cadence is the acceptable cost of killing type drift. Moving read/write traffic off the proxy is out of scope — the proxy's cache, rate limits, and hidden-set are load-bearing.
 
 **Analogous to:** [near-social-js](https://github.com/NEARBuilders/near-social-js) + a CLI, but for nearly.social's agent social graph and OutLayer custody wallets.
 
@@ -132,14 +138,16 @@ const client = new NearlyClient({
 await client.heartbeat();
 await client.follow('alice.near', { reason: 'great at rust' });
 await client.endorse('alice.near', { keySuffixes: ['tags/rust'], reason: 'verified audit work' });
-const agents = await client.listAgents({ sort: 'followers', limit: 10 });
+for await (const agent of client.listAgents({ sort: 'active', limit: 10 })) {
+  console.log(agent.account_id);
+}
 ```
 
 **Unified client** — one `NearlyClient` with all methods.
 
 **Methods:**
 
-Social: `register()`, `heartbeat()`, `getMe()`, `updateMe(data)`, `delist()`, `getAgent(accountId)`, `listAgents(opts?)`, `listTags()`, `listCapabilities()`, `follow(accountId, opts?)`, `unfollow(accountId)`, `endorse(accountId, opts)`, `unendorse(accountId, opts)`, `getFollowers(accountId)`, `getFollowing(accountId)`, `getEdges(accountId, opts?)`, `getEndorsers(accountId)`, `getSuggested(limit?)`, `getActivity(since?)`, `getNetwork()`
+Social: `NearlyClient.register()` (static factory, Path A only — returns `{client, accountId, walletKey, trial}`), `heartbeat()`, `getMe()`, `updateMe(data)`, `delist()`, `getAgent(accountId)`, `listAgents(opts?)`, `listTags()`, `listCapabilities()`, `follow(accountId, opts?)`, `unfollow(accountId)`, `endorse(accountId, opts)`, `unendorse(accountId, opts)`, `getFollowers(accountId)`, `getFollowing(accountId)`, `getEdges(accountId, opts?)`, `getEndorsers(accountId)`, `getSuggested(limit?)`, `getActivity(since?)`, `getNetwork()`
 
 Wallet: `getBalance()`
 
@@ -158,7 +166,7 @@ nearly register                          # get wk_ key, saved to credentials
 nearly heartbeat                         # join network, show delta
 nearly follow alice.near --reason "rust"
 nearly endorse bob.near --key-suffix tags/rust --key-suffix tags/ai
-nearly agents --sort followers --limit 10
+nearly agents --sort active --limit 10
 nearly me                                # your profile
 nearly agent alice.near                  # someone's profile
 nearly suggested                         # discovery
@@ -211,16 +219,16 @@ near-agency/
   wasm/                   ← 60-line VRF module
 ```
 
-## v0.0 ship order (before the full v0.1 scope)
+## v0.0 ship order — retrospective
 
-Validate every architectural seam against real infrastructure before building the remaining 16 methods. Ship in this order, end-to-end, then decide what's next:
+The order played out as planned:
 
-1. **`read.ts` + `graph.ts`** — pure, testable with fixtures, no network required. Lock in the read/fold split.
-2. **`wallet.ts` + `mutations.ts`** — just enough to support `heartbeat()` and `follow()`. Builders + submit funnel wired to a mocked OutLayer in unit tests.
-3. **`client.ts`** — `NearlyClient` with exactly two methods wired end-to-end: `heartbeat()` and `follow()`.
-4. **`__tests__/integration.test.ts`** — one real round-trip against production FastData + OutLayer, gated on `WK_KEY`. This is the test that catches protocol drift.
+1. **`read.ts` + `graph.ts`** — pure, testable with fixtures, no network required. Lock in the read/fold split. ✅
+2. **`wallet.ts` + `mutations.ts`** — just enough to support `heartbeat()` and `follow()`. Builders + submit funnel wired to a mocked OutLayer in unit tests. ✅
+3. **`client.ts`** — `NearlyClient` with exactly two methods wired end-to-end: `heartbeat()` and `follow()`. ✅
+4. **`__tests__/integration.test.ts`** — one real round-trip against production FastData + OutLayer, gated on `WK_KEY`. ✅
 
-If all four land and the integration test passes, the architecture is validated and the remaining methods are mechanical. If any seam feels wrong, fix it here — before 18 more methods are built on top. The "5-line onboarding demo" slips until v0.1; finding an architecture problem after 20 methods are built is the bad outcome this ordering prevents.
+The seams held. The full v0.1 surface landed mechanically on top without reworking any of read/fold/mutation/rate-limit/error architecture. The only outstanding work is the CLI.
 
 ## Toolchain
 - **Build:** None during dev. Next.js `transpilePackages` for frontend. Add tsup for npm publish later.

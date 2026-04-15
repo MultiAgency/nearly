@@ -91,17 +91,35 @@ export async function liveNetworkCounts(
 function applyTrustBoundary(entry: KvEntry): Agent | null {
   const blob = entry.value;
   if (!blob || typeof blob !== 'object' || Array.isArray(blob)) return null;
+  // Destructure-and-rebuild instead of spread-and-override. Every trust-
+  // boundary and derived field is pulled out of the blob so `safe` carries
+  // only canonical self-authored content (name, description, image, tags,
+  // capabilities); the authoritative block-derived values are added back in
+  // the return. `created_at` / `created_height` are NOT added back here —
+  // only read paths that fetch history (`fetchProfile`, `handleListAgents`
+  // with `sort=newest`) repopulate them. Count / endorsement fields are
+  // also stripped: the write side removes them before storage, and any
+  // legacy blob that still carries them would otherwise leak stale values
+  // into list reads that don't overlay live counts. Mirrors the write-side
+  // strip in `agentEntries` and stays symmetric with `foldProfile` in
+  // `@nearly/sdk::graph`.
+  const {
+    account_id: _aid,
+    last_active: _la,
+    last_active_height: _lah,
+    created_at: _ca,
+    created_height: _ch,
+    follower_count: _fc,
+    following_count: _fgc,
+    endorsements: _e,
+    endorsement_count: _ec,
+    ...safe
+  } = blob as Agent;
   return {
-    ...(blob as Agent),
+    ...safe,
     account_id: entry.predecessor_id,
     last_active: entryBlockSecs(entry),
-    // Strip caller-asserted `created_at` from the blob. Only the read path
-    // that fetches history (`fetchProfile`) populates it from the first
-    // write's block_timestamp; list paths (`fetchProfiles`, `fetchAllProfiles`)
-    // leave it undefined unless the caller joins a history map. Without
-    // this strip, legacy profiles written before the audit would surface
-    // their wall-clock `created_at` and re-introduce the manipulability gap.
-    created_at: undefined,
+    last_active_height: entryBlockHeight(entry),
   };
 }
 
@@ -112,13 +130,19 @@ function applyTrustBoundary(entry: KvEntry): Agent | null {
  *
  * Fetches the latest profile entry and the first historical entry in
  * parallel. The latest entry drives `last_active` via the standard
- * trust-boundary override; the first entry drives `created_at` via its
- * own block_timestamp. Both are block-authoritative and ungameable.
- * If the history call fails or returns no entries, `created_at` is
- * left undefined (the caller's stored value is overwritten with
- * undefined too — we intentionally do not fall back to caller-asserted
+ * trust-boundary override; the first entry drives `created_at` /
+ * `created_height` via its own block_timestamp and block_height. All
+ * three are block-authoritative and ungameable. If the history call
+ * fails or returns no entries, `created_at` / `created_height` are
+ * left undefined — we intentionally do not fall back to caller-asserted
  * values, because mixing trust models in one field reintroduces the
- * manipulation gap the audit closed).
+ * manipulation gap the audit closed.
+ *
+ * Count fields (`follower_count`, `following_count`, `endorsements`,
+ * `endorsement_count`) are NOT populated here — `applyTrustBoundary`
+ * strips them and this function does not overlay. Callers that want
+ * live counts must wrap the result with `withLiveCounts` (see
+ * `fastdata-dispatch::handleGetProfile`).
  */
 export async function fetchProfile(accountId: string): Promise<Agent | null> {
   const [latest, firstWrite] = await Promise.all([
@@ -127,8 +151,9 @@ export async function fetchProfile(accountId: string): Promise<Agent | null> {
   ]);
   if (!latest) return null;
   const agent = applyTrustBoundary(latest);
-  if (agent) {
-    agent.created_at = firstWrite ? entryBlockSecs(firstWrite) : undefined;
+  if (agent && firstWrite) {
+    agent.created_at = entryBlockSecs(firstWrite);
+    agent.created_height = entryBlockHeight(firstWrite);
   }
   return agent;
 }
@@ -203,7 +228,9 @@ export function agentEntries(agent: Agent): Record<string, unknown> {
     endorsements: _e,
     endorsement_count: _ec,
     last_active: _la,
+    last_active_height: _lah,
     created_at: _ca,
+    created_height: _ch,
     ...rest
   } = agent;
   const entries: Record<string, unknown> = { profile: rest };
@@ -239,11 +266,6 @@ export function extractCapabilityPairs(caps: unknown): [string, string][] {
   return pairs;
 }
 
-/** Unix timestamp in seconds. */
-export function nowSecs(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
 /** Compose a FastData KV key from a convention-fixed key_prefix and a
  *  variable key_suffix. Every Nearly write path that builds a key passes
  *  through here — grep for `composeKey` to enumerate all key-construction
@@ -275,6 +297,17 @@ export function profileSummary(agent: Agent): {
  */
 export function entryBlockSecs(entry: KvEntry): number {
   return Math.floor(entry.block_timestamp / 1e9);
+}
+
+/**
+ * Block-height companion of `entryBlockSecs`. Returns the integer,
+ * monotonic, tamper-proof block height of the write. This is the
+ * canonical "when" value — seconds are a display convenience derived
+ * from `block_timestamp`, heights are what consumers should compare,
+ * cursor on, and order by.
+ */
+export function entryBlockHeight(entry: KvEntry): number {
+  return entry.block_height;
 }
 
 /** Endorsement KV key prefix for listing all endorsements targeting an account. */

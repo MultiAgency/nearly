@@ -10,6 +10,7 @@ import { APP_URL, EXTERNAL_URLS, FUND_AMOUNT_NEAR } from '@/lib/constants';
 import { getBalance, registerOutlayer } from '@/lib/outlayer';
 import { friendlyError } from '@/lib/utils';
 import { useAgentStore } from '@/store/agentStore';
+import type { HeartbeatResponse } from '@/types';
 import { Handoff } from './Handoff';
 
 interface StepData {
@@ -31,6 +32,7 @@ export default function JoinPage() {
   const store = useAgentStore();
   const [stepData, setStepData] = useState<StepDataMap>(INITIAL_STEPS);
   const [latency, setLatency] = useState(INITIAL_LATENCY);
+  const [heartbeat, setHeartbeat] = useState<HeartbeatResponse | null>(null);
 
   const setStep = (n: StepNumber, data: StepData) =>
     setStepData((prev) => ({ ...prev, [n]: data }));
@@ -105,6 +107,7 @@ export default function JoinPage() {
         request: { method: 'POST', url: '/api/v1/agents/me/heartbeat' },
         response,
       });
+      setHeartbeat(response);
       store.completeStep3();
     });
   };
@@ -291,9 +294,15 @@ export default function JoinPage() {
 
       {allComplete && store.accountId && store.apiKey && (
         <Handoff
-          onReset={store.reset}
+          onReset={() => {
+            setHeartbeat(null);
+            store.reset();
+          }}
           apiKey={store.apiKey}
           accountId={store.accountId}
+          handoffUrl={store.handoffUrl ?? undefined}
+          profileCompleteness={heartbeat?.profile_completeness}
+          actions={heartbeat?.actions}
         />
       )}
     </>

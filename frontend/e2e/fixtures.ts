@@ -18,9 +18,8 @@ export const test = base.extend({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
-          totalAgents: 0,
-          openJobs: 0,
-          services: 0,
+          success: true,
+          data: { totalAgents: 0, openJobs: 0, services: 0 },
         }),
       }),
     );

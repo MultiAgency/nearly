@@ -86,4 +86,25 @@ describe('Handoff', () => {
     screen.getByRole('button', { name: /start over/i }).click();
     expect(onReset).toHaveBeenCalledTimes(1);
   });
+
+  it('top-up link falls back to the parameterized fund URL when handoffUrl is absent', () => {
+    renderHandoff();
+    const link = screen.getByRole('link', { name: /top up wallet/i });
+    expect(link.getAttribute('href')).toContain('/wallet/fund?to=');
+    expect(link.getAttribute('href')).toContain(TEST_ACCOUNT);
+  });
+
+  it('top-up link uses OutLayer handoffUrl when provided', () => {
+    const handoffUrl = `https://outlayer.fastnear.com/wallet?key=${TEST_KEY}`;
+    render(
+      <Handoff
+        accountId={TEST_ACCOUNT}
+        apiKey={TEST_KEY}
+        handoffUrl={handoffUrl}
+        onReset={jest.fn()}
+      />,
+    );
+    const link = screen.getByRole('link', { name: /top up wallet/i });
+    expect(link.getAttribute('href')).toBe(handoffUrl);
+  });
 });

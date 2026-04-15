@@ -104,6 +104,50 @@ export function getOutlayerPaymentKey(): string {
   return key;
 }
 
+/**
+ * Server-held custody wallet key used to write NEP-413-verified operator
+ * claims on behalf of signed-in humans. Scope expansion of the
+ * `OUTLAYER_PAYMENT_KEY` pattern (see CLAUDE.md Architecture bullet on
+ * "server-held operational secrets") — another named operational secret
+ * Nearly's server uses to initiate its own writes. Critically, this is
+ * NOT a user credential: Nearly never holds a human's NEAR private key,
+ * never signs anything the human didn't NEP-413-authorize, and never
+ * derives access from user secrets. The operator-claims writer key only
+ * signs `operator/{operator_account_id}/{agent_account_id}` writes after
+ * the handler has already verified the human's NEP-413 claim envelope.
+ *
+ * Returns an empty string when unset — unlike `getOutlayerPaymentKey`,
+ * this helper does NOT throw in production. The operator-claim write
+ * handler maps the empty return to a 503 `NOT_CONFIGURED` response so
+ * deployments that don't run the Lightweight sign-in feature can leave
+ * the key unset and the rest of the API stays green. Deployments that
+ * DO want the feature enforce the secret's presence at deploy time
+ * (startup health check, config audit, whatever) — not at request time.
+ */
+export function getOperatorClaimsWriterKey(): string {
+  return process.env.OUTLAYER_OPERATOR_CLAIMS_WK || '';
+}
+
+/**
+ * Resolve the NEAR account_id of the operator-claims writer account from its
+ * `wk_` key, memoized. Used by `handleAgentClaims` to pick the predecessor
+ * namespace it scans for operator-claim entries. Returns an empty string
+ * when the writer key is unset — the caller interprets "no writer key
+ * configured" as "no claims can exist yet" and returns an empty list,
+ * keeping the read path live on deployments that haven't enabled the
+ * lightweight sign-in feature.
+ *
+ * The lookup goes through `resolveAccountId` (OutLayer sign-message), which
+ * is cached per-key for the life of the process. One sign-message at boot
+ * is the cost; every subsequent call is a Map lookup.
+ */
+export async function getOperatorClaimsWriterAccount(): Promise<string> {
+  const key = getOperatorClaimsWriterKey();
+  if (!key) return '';
+  const accountId = await resolveAccountId(key);
+  return accountId ?? '';
+}
+
 // Claims can't be cached — NEP-413 nonces are single-use. Account IDs can —
 // they're deterministic per wallet key, so accountCache holds them for the
 // life of the process (cold starts clear it).
@@ -183,13 +227,63 @@ export async function signMessage(
   }
 }
 
+/**
+ * Ask OutLayer's balance endpoint for the caller's `account_id`. `GET
+ * /wallet/v1/balance?chain=near` returns the canonical 64-hex implicit
+ * account in its 2xx body — cheaper than a sign-message round-trip and
+ * spends no TEE budget. Returns null on any upstream/parse failure so
+ * the caller can fall back to sign-message instead of surfacing a
+ * transient outage as a hard identity failure.
+ */
+async function accountIdFromBalance(walletKey: string): Promise<string | null> {
+  let resp: Response;
+  try {
+    resp = await fetchWithTimeout(
+      `${OUTLAYER_API_URL}/wallet/v1/balance?chain=near`,
+      { headers: { Authorization: `Bearer ${walletKey}` } },
+      SIGN_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  if (!resp.ok) return null;
+  const body = (await resp.json().catch(() => null)) as {
+    account_id?: unknown;
+  } | null;
+  if (body && typeof body.account_id === 'string' && body.account_id) {
+    return body.account_id;
+  }
+  return null;
+}
+
 export async function resolveAccountId(
   walletKey: string,
 ): Promise<string | null> {
   const cached = accountCache.get(walletKey);
   if (cached) return cached;
 
-  // Sign a throwaway message just to learn the account_id.
+  // For `wk_` custody wallet keys, prefer the cheap GET
+  // /wallet/v1/balance?chain=near — it returns account_id in its 2xx
+  // body, so a full NEP-413 sign round-trip is unnecessary for identity
+  // discovery. Falls back to sign-message if the balance path fails, so
+  // a transient outage on one endpoint doesn't block identity resolution.
+  //
+  // The wk_ gate exists because `near:` tokens can legitimately reach
+  // this function via the `register_platforms` passthrough path in
+  // route.ts (`near:` is only rejected for DIRECT_WRITE_ACTIONS, not
+  // PASSTHROUGH_WRITE_ACTIONS). `signMessage` is known to accept
+  // `near:` tokens (confirmed 2026-04-04, see CLAUDE.md "Auth" bullet);
+  // whether `/wallet/v1/balance` accepts them is not documented, so we
+  // route `near:` callers straight to the known-good path without
+  // paying an extra failed HTTP round-trip.
+  if (walletKey.startsWith('wk_')) {
+    const fromBalance = await accountIdFromBalance(walletKey);
+    if (fromBalance) {
+      accountCache.set(walletKey, fromBalance);
+      return fromBalance;
+    }
+  }
+
   const msg = JSON.stringify({ action: 'resolve', domain: CLAIM_DOMAIN });
   const result = await signMessage(walletKey, msg);
   if (!result) return null;

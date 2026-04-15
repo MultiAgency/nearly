@@ -8,6 +8,7 @@ import {
   Eye,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Terminal,
   Users,
   Wallet,
@@ -20,17 +21,34 @@ import { Button } from '@/components/ui/button';
 import { useCopyToClipboard } from '@/hooks';
 import { APP_URL, EXTERNAL_URLS } from '@/lib/constants';
 import { PLATFORM_META } from '@/lib/platforms';
+import type { AgentAction } from '@/types';
 import { PlatformConnectionCard } from './PlatformConnectionCard';
 
 interface HandoffProps {
   onReset: () => void;
   apiKey: string;
   accountId: string;
+  /**
+   * OutLayer's hosted wallet-management URL from the `/register` response's
+   * `handoff_url` field. Used for the "Top up wallet" affordance when
+   * present; falls back to the parameterized `EXTERNAL_URLS.OUTLAYER_FUND`
+   * link constructed from `accountId` when absent.
+   */
+  handoffUrl?: string;
+  profileCompleteness?: number;
+  actions?: AgentAction[];
 }
 
 type CopyKey = 'prompt' | 'creds';
 
-export function Handoff({ onReset, apiKey, accountId }: HandoffProps) {
+export function Handoff({
+  onReset,
+  apiKey,
+  accountId,
+  handoffUrl,
+  profileCompleteness,
+  actions,
+}: HandoffProps) {
   const [copied, copy] = useCopyToClipboard();
   const [lastCopied, setLastCopied] = useState<CopyKey | null>(null);
   const [credsRevealed, setCredsRevealed] = useState(false);
@@ -72,8 +90,64 @@ First run: POST /agents/me/heartbeat, then PATCH /agents/me with name, descripti
     URL.revokeObjectURL(url);
   };
 
+  const fieldActions = (actions ?? []).filter(
+    (a) => a.action === 'update_me' && a.field,
+  );
+
   return (
     <div className="space-y-4">
+      {profileCompleteness !== undefined && (
+        <GlowCard className="p-5">
+          <div className="flex items-start gap-4">
+            <IconBox>
+              <Sparkles className="h-5 w-5 text-primary" />
+            </IconBox>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline justify-between mb-2">
+                <h3 className="font-semibold text-foreground">
+                  Profile {profileCompleteness}% complete
+                </h3>
+                {fieldActions.length > 0 && (
+                  <span className="text-xs text-muted-foreground">
+                    {fieldActions.length} field
+                    {fieldActions.length === 1 ? '' : 's'} to fill
+                  </span>
+                )}
+              </div>
+              <div className="h-2 rounded-full bg-muted overflow-hidden mb-3">
+                <div
+                  className="h-full bg-primary transition-all"
+                  style={{ width: `${profileCompleteness}%` }}
+                />
+              </div>
+              {fieldActions.length > 0 ? (
+                <ul className="space-y-2 text-sm">
+                  {fieldActions.map((a) => (
+                    <li key={a.field} className="flex gap-2">
+                      <span className="text-primary font-mono text-xs mt-0.5">
+                        {a.field}
+                      </span>
+                      <span className="text-muted-foreground flex-1">
+                        {a.human_prompt ?? a.hint}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Profile is complete. Agents will discover you via tags and
+                  capabilities.
+                </p>
+              )}
+              <p className="text-xs text-muted-foreground mt-3">
+                Your agent fills these by calling{' '}
+                <code>PATCH /api/v1/agents/me</code> with the fields above.
+              </p>
+            </div>
+          </div>
+        </GlowCard>
+      )}
+
       <div className="flex flex-wrap gap-x-4 gap-y-2 justify-center text-sm">
         <Link
           href={`/agents/${encodeURIComponent(accountId)}`}
@@ -91,7 +165,7 @@ First run: POST /agents/me/heartbeat, then PATCH /agents/me with name, descripti
         </Link>
         <span className="text-muted-foreground">·</span>
         <a
-          href={EXTERNAL_URLS.OUTLAYER_FUND(accountId)}
+          href={handoffUrl ?? EXTERNAL_URLS.OUTLAYER_FUND(accountId)}
           target="_blank"
           rel="noopener noreferrer"
           className="inline-flex items-center gap-1 text-primary hover:underline"

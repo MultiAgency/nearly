@@ -1,5 +1,7 @@
 import type {
   Agent,
+  AgentClaimsResponse,
+  ClaimOperatorResult,
   Edge,
   EdgesResponse,
   EndorsersResponse,
@@ -85,15 +87,30 @@ class ApiClient {
   private async requestRaw(
     action: string,
     args: Record<string, unknown> = {},
-    requiresAuth = true,
+    authMode: 'wk' | 'claim' | 'none' = 'wk',
   ): Promise<{ data: unknown }> {
     const { method, url } = routeFor(action, args);
 
     const headers: Record<string, string> = {};
-    if (this.apiKey) {
-      headers.Authorization = `Bearer ${this.apiKey}`;
-    } else if (requiresAuth) {
-      throw new ApiError(401, 'API key not set');
+    // `wk` mode: Bearer wk_ header required. The proxy's direct-write path
+    // authenticates off the header and won't accept a claim as a substitute.
+    // `claim` mode: NEP-413 envelope travels in body.verifiable_claim, no
+    // header auth. Used by operator-claim writes (claim_operator /
+    // unclaim_operator) where the caller is a human with no wk_ of their own.
+    // `none`: public reads. Any stashed credentials are ignored.
+    if (authMode === 'wk') {
+      if (this.apiKey) {
+        headers.Authorization = `Bearer ${this.apiKey}`;
+      } else {
+        throw new ApiError(401, 'API key not set');
+      }
+    } else if (authMode === 'claim') {
+      if (!this.auth) {
+        throw new ApiError(
+          401,
+          'Verifiable claim not set — call setAuth() with a fresh NEP-413 claim before this request',
+        );
+      }
     }
 
     let body: string | undefined;
@@ -102,14 +119,21 @@ class ApiClient {
       if (hasPathParam(action, 'accountId')) {
         delete bodyArgs.accountId;
       }
-      if (requiresAuth && this.auth) {
+      // `wk` mode: stashed claim is forwarded alongside the bearer header —
+      // the proxy's existing "claim piggybacks on wk_ auth" path (staged for
+      // non-custody callers that want to assert a secondary identity).
+      // `claim` mode: the claim IS the auth, so always include it.
+      if ((authMode === 'wk' || authMode === 'claim') && this.auth) {
         bodyArgs.verifiable_claim = this.auth;
       }
       body = JSON.stringify(bodyArgs);
       headers['Content-Type'] = 'application/json';
     }
 
-    const doFetch = requiresAuth ? fetchWithTimeout : fetchWithRetry;
+    // Retry policy follows whether the request is a public read (`none`) or
+    // an authenticated one — reads can be retried freely, writes can't. A
+    // claim-auth request is a write, so it uses the no-retry path.
+    const doFetch = authMode === 'none' ? fetchWithRetry : fetchWithTimeout;
     const response = await doFetch(
       url,
       { method, headers, body },
@@ -139,9 +163,9 @@ class ApiClient {
   private async request<T>(
     action: string,
     args: Record<string, unknown> = {},
-    requiresAuth = true,
+    authMode: 'wk' | 'claim' | 'none' = 'wk',
   ): Promise<T> {
-    const { data } = await this.requestRaw(action, args, requiresAuth);
+    const { data } = await this.requestRaw(action, args, authMode);
     if (data === undefined || data === null) {
       throw new ApiError(502, 'Empty response data');
     }
@@ -159,7 +183,7 @@ class ApiClient {
   }
 
   async getAgent(accountId: string) {
-    return this.request<GetProfileResponse>('profile', { accountId }, false);
+    return this.request<GetProfileResponse>('profile', { accountId }, 'none');
   }
 
   async getEdges(
@@ -176,7 +200,7 @@ class ApiClient {
         direction: options?.direction,
         limit: options?.limit ? clampLimit(options.limit) : undefined,
       },
-      false,
+      'none',
     );
   }
 
@@ -195,7 +219,7 @@ class ApiClient {
       await this.requestRaw(
         'list_agents',
         { limit: clampLimit(limit), sort, cursor, tag },
-        false,
+        'none',
       ),
       'agents',
     );
@@ -215,7 +239,7 @@ class ApiClient {
       await this.requestRaw(
         action,
         { accountId, limit: clampLimit(limit), cursor },
-        false,
+        'none',
       ),
       action,
     );
@@ -236,11 +260,58 @@ class ApiClient {
   }
 
   async listTags() {
-    return this.request<TagsResponse>('list_tags', {}, false);
+    return this.request<TagsResponse>('list_tags', {}, 'none');
   }
 
   async getEndorsers(accountId: string) {
-    return this.request<EndorsersResponse>('endorsers', { accountId }, false);
+    return this.request<EndorsersResponse>('endorsers', { accountId }, 'none');
+  }
+
+  /**
+   * Public read — operators who have filed NEP-413-signed claims on the
+   * given agent. The returned `operators[]` carry display fields plus the
+   * full claim envelope, so any client (not just Nearly's UI) can
+   * independently re-verify each assertion against NEAR RPC.
+   */
+  async getAgentClaims(accountId: string) {
+    return this.request<AgentClaimsResponse>(
+      'agent_claims',
+      { accountId },
+      'none',
+    );
+  }
+
+  /**
+   * NEP-413-authed write — file an operator claim on `accountId` using the
+   * claim currently stashed via `setAuth`. The caller is responsible for
+   * minting a fresh claim (via `signClaim` in `lib/sign-claim.ts`) and
+   * calling `setAuth(claim)` immediately before this call. The claim is
+   * consumed per-request — freshness + replay protection live server-side.
+   *
+   * The stashed claim is not cleared after the call; callers that want
+   * claim-per-request semantics should call `clearCredentials()` themselves
+   * or mint a fresh claim for the next write.
+   */
+  async claimOperator(accountId: string, opts: { reason?: string } = {}) {
+    return this.request<ClaimOperatorResult>(
+      'claim_operator',
+      { accountId, ...(opts.reason != null && { reason: opts.reason }) },
+      'claim',
+    );
+  }
+
+  /**
+   * NEP-413-authed write — retract an existing operator claim on
+   * `accountId`. Same auth / freshness contract as `claimOperator`. A
+   * retract on an absent claim is a no-op server-side (symmetric with the
+   * `endorse`/`unendorse` tolerance).
+   */
+  async unclaimOperator(accountId: string) {
+    return this.request<ClaimOperatorResult>(
+      'unclaim_operator',
+      { accountId },
+      'claim',
+    );
   }
 }
 

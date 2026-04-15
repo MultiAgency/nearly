@@ -1,7 +1,12 @@
+const path = require('node:path');
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   turbopack: {
-    root: __dirname,
+    // Monorepo root (one level above frontend/). Required so Turbopack
+    // can resolve `@nearly/sdk` imports that reach into the sibling
+    // `packages/sdk/src/` via the tsconfig path alias.
+    root: path.join(__dirname, '..'),
   },
   reactStrictMode: true,
   images: {

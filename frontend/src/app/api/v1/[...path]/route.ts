@@ -10,6 +10,7 @@ import { LIMITS, OUTLAYER_ADMIN_ACCOUNT } from '@/lib/constants';
 import { dispatchFastData, handleGetSuggested } from '@/lib/fastdata-dispatch';
 import { composeKey, getHiddenSet, profileGaps } from '@/lib/fastdata-utils';
 import {
+  dispatchNep413Write,
   dispatchWrite,
   invalidatesFor,
   writeToFastData,
@@ -85,6 +86,14 @@ const DIRECT_WRITE_ACTIONS = new Set([
 // Authenticated mutations that don't touch FastData — they proxy an
 // external registration call, so there's no cache to invalidate on success.
 const PASSTHROUGH_WRITE_ACTIONS = new Set(['register_platforms']);
+
+// NEP-413-only write actions — auth lives in `body.verifiable_claim`, NOT in
+// a `Bearer wk_...` header. The operator is a human with no custody wallet;
+// Nearly's server writes the claim on the human's behalf using the service
+// key `OUTLAYER_OPERATOR_CLAIMS_WK` (see `.agents/planning/lightweight-signin-frontend.md`
+// "Data model" for the architecture). The route layer verifies the claim
+// here before dispatching to `fastdata-write.ts::dispatchNep413Write`.
+const NEP413_WRITE_ACTIONS = new Set(['claim_operator', 'unclaim_operator']);
 
 // ---------------------------------------------------------------------------
 // Contextual onboarding actions
@@ -207,8 +216,6 @@ function extractQueryParams(
       if (VALID_SORTS.has(value)) params[key] = value;
     } else if (key === 'cursor') {
       if (value === '' || CURSOR_RE.test(value)) params[key] = value;
-    } else if (key === 'since') {
-      if (/^\d{1,20}$/.test(value)) params[key] = value;
     } else if (key === 'direction') {
       if (VALID_DIRECTIONS.has(value)) params[key] = value;
     } else if (key === 'tag') {
@@ -377,7 +384,7 @@ async function handleAdmin(
       resp.headers.set('Retry-After', String(rl.retryAfter));
       return resp;
     }
-    incrementRateLimit('hidden_list', ip);
+    incrementRateLimit('hidden_list', ip, rl.window);
     const hidden = await getHiddenSet();
     return successJson({ hidden: [...hidden] });
   }
@@ -395,8 +402,7 @@ async function handleAdmin(
     if (request.method === 'POST') {
       // Existence-index idiom: the value is never read — `getHiddenSet`
       // only consults key presence under `hidden/` — so store `true` to
-      // match the `tag/` and `cap/` convention. A prior write stamped
-      // `{at: nowSecs()}`; nothing consumed it.
+      // match the `tag/` and `cap/` convention.
       const wrote = await writeToFastData(walletKey, {
         [hiddenKey]: true,
       });
@@ -477,7 +483,7 @@ async function handleVerifyClaim(
     resp.headers.set('Retry-After', String(rl.retryAfter));
     return resp;
   }
-  incrementRateLimit('verify_claim', ip);
+  incrementRateLimit('verify_claim', ip, rl.window);
 
   // `dispatch` injects `action: 'verify_claim'` into wasmBody — drop it, plus
   // the `recipient` / `expected_domain` hints which are inputs to the verifier
@@ -529,7 +535,7 @@ async function dispatchPublic(
       resp.headers.set('Retry-After', String(rl.retryAfter));
       return resp;
     }
-    incrementRateLimit('list_platforms', ip);
+    incrementRateLimit('list_platforms', ip, rl.window);
     return successJson({ platforms: PLATFORM_META });
   }
 
@@ -642,12 +648,99 @@ async function handleAuthenticatedGet(
 // Authenticated dispatch — routes to sub-handlers.
 // ---------------------------------------------------------------------------
 
+/**
+ * Handle a NEP-413-only write action (`claim_operator` / `unclaim_operator`).
+ * Verifies the caller's signed envelope against `nearly.social` as the
+ * recipient, extracts the operator identity from the verified claim, then
+ * dispatches to `fastdata-write.ts::dispatchNep413Write` which holds the
+ * handler logic, rate-limit gating, and INVALIDATION_MAP wiring.
+ *
+ * The route layer does only two things this handler cares about: the claim
+ * shape check (presence + object type) and the `verifyClaim` call. Everything
+ * downstream (operator-specific rate limits, key-shape validation, the
+ * service-key fetch, the write itself) lives in the fastdata-write handler
+ * so that the route layer stays thin and the tests are co-located with the
+ * handler logic.
+ */
+async function handleNep413Write(
+  route: ResolvedRoute,
+  wasmBody: Record<string, unknown>,
+): Promise<NextResponse> {
+  const raw = wasmBody.verifiable_claim;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return errJson(
+      'AUTH_REQUIRED',
+      'Operator-claim mutations require `body.verifiable_claim` (NEP-413 envelope). Sign in with your NEAR wallet and re-send.',
+      401,
+    );
+  }
+
+  const verification = await verifyClaim(raw, 'nearly.social', 'nearly.social');
+  if (!verification.valid) {
+    // `verifyClaim` returns structured reasons — replay, expired, signature,
+    // account_binding, malformed, rpc_error. Surface the reason directly so
+    // the caller can distinguish "your session aged out, re-sign" from
+    // "your wallet's signature is broken."
+    const status = verification.reason === 'rpc_error' ? 502 : 401;
+    return errJson(
+      'AUTH_FAILED',
+      `NEP-413 claim verification failed: ${verification.reason}`,
+      status,
+    );
+  }
+
+  // Strip the envelope off the body before dispatching — handlers read
+  // claim fields from the verified context, not from the raw body, so the
+  // envelope on `wasmBody` is redundant and could confuse downstream logs
+  // or test assertions.
+  const { verifiable_claim: _claim, ...bodyWithoutClaim } = wasmBody;
+
+  const result = await dispatchNep413Write(route.action, bodyWithoutClaim, {
+    operatorAccountId: verification.account_id,
+    claim: {
+      account_id: verification.account_id,
+      public_key: verification.public_key,
+      signature: (raw as Record<string, unknown>).signature as string,
+      nonce: verification.nonce,
+      // `verification.message` is the parsed object; the stored value must
+      // carry the ORIGINAL JSON string the wallet signed over, which lives
+      // on the raw claim we received. The type guard above ensured `raw`
+      // is an object; the shape check inside `verifyClaim` ensured the
+      // `message` field exists and is a string.
+      message: (raw as Record<string, unknown>).message as string,
+    },
+  });
+
+  if (result.success) {
+    invalidateForMutation(result.invalidates);
+    return successJson(result.data);
+  }
+  const errBody: Record<string, unknown> = {
+    success: false,
+    error: result.error,
+    code: result.code,
+  };
+  if (result.retryAfter) errBody.retry_after = result.retryAfter;
+  if (result.meta) Object.assign(errBody, result.meta);
+  return NextResponse.json(errBody, { status: result.status });
+}
+
 async function dispatchAuthenticated(
   request: NextRequest,
   route: ResolvedRoute,
   wasmBody: Record<string, unknown>,
   walletKey: string | undefined,
 ): Promise<NextResponse> {
+  // NEP-413-only write path — the caller is a human with no `wk_` of their
+  // own, authentication lives in `body.verifiable_claim`. Handled before
+  // the `wk_` / `near:` checks because these actions do not require a
+  // bearer header at all; any header is ignored. See `NEP413_WRITE_ACTIONS`
+  // at the top of this file and the architecture rationale in
+  // `.agents/planning/lightweight-signin-frontend.md`.
+  if (NEP413_WRITE_ACTIONS.has(route.action)) {
+    return handleNep413Write(route, wasmBody);
+  }
+
   // Direct write path — bypasses WASM, writes to FastData via custody wallet.
   if (walletKey?.startsWith('wk_') && DIRECT_WRITE_ACTIONS.has(route.action)) {
     const result = await dispatchWrite(

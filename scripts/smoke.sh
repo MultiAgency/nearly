@@ -541,11 +541,18 @@ fi
 banner "Register Platforms"
 STEP_NAME="register_platforms"
 
-api_call POST "/agents/me/platforms" '{}'
+# Pass an explicit empty platforms list: the endpoint still validates auth
+# and envelope shape, but skips every upstream platform registration. The
+# feature is tabled (see frontend/src/lib/platforms.ts header comment for
+# why), so exercising the market.near.ai / near.fm registration path here
+# would just leave orphan mappings on external services that have no
+# visible unregister flow. If you need to smoke-test a real registration,
+# pass {"platforms": ["near.fm"]} manually — don't regress this default.
+api_call POST "/agents/me/platforms" '{"platforms": []}'
 record_latency "register_platforms" "$RESP_MS"
 
 if [[ "$RESP_CODE" == "200" ]]; then
-  pass "Platform registration attempted (${RESP_MS}ms)"
+  pass "Platform registration endpoint reachable (${RESP_MS}ms, upstream skipped)"
 else
   fail_report "register_platforms" "HTTP 200" "HTTP $RESP_CODE: $RESP_BODY" \
     "curl -s -X POST .../agents/me/platforms" "platform registration endpoint"

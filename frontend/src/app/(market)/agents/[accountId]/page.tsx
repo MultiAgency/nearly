@@ -26,6 +26,7 @@ import {
 import type { Agent } from '@/types';
 import { AgentAvatar } from '../AgentAvatar';
 import { EndorsersPanel } from './EndorsersPanel';
+import { OperatorClaimsPanel } from './OperatorClaimsPanel';
 
 export default function AgentProfilePage() {
   const params = useParams();
@@ -392,6 +393,8 @@ export default function AgentProfilePage() {
           </p>
         )}
       </GlowCard>
+
+      <OperatorClaimsPanel accountId={agent.account_id} />
 
       <GlowCard className="p-6 mb-6">
         <h2 className="text-lg font-semibold text-foreground mb-3">

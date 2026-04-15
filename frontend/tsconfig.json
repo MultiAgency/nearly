@@ -24,6 +24,9 @@
     "paths": {
       "@/*": [
         "./src/*"
+      ],
+      "@nearly/sdk": [
+        "../packages/sdk/src/index.ts"
       ]
     },
     "target": "ES2017",

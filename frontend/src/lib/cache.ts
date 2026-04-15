@@ -17,6 +17,7 @@ const TTL_MS: Record<string, number> = {
   following: 30_000,
   edges: 30_000,
   endorsers: 30_000,
+  agent_claims: 30_000,
   hidden: 60_000,
 };
 const DEFAULT_TTL = 30_000;

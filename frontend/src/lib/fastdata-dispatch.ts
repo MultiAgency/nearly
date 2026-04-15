@@ -9,8 +9,15 @@
  *   graph/follow/{accountId} → {reason?}   (time is FastData block_timestamp)
  */
 
+import {
+  makeRng,
+  scoreBySharedTags,
+  shuffleWithinTiers,
+  sortByScoreThenActive,
+} from '@nearly/sdk';
 import type { Agent, VrfProof } from '@/types';
 import {
+  type KvEntry,
   kvGetAgent,
   kvGetAll,
   kvHistoryFirstByPredecessor,
@@ -20,15 +27,16 @@ import {
 import {
   buildEndorsementCounts,
   endorsePrefix,
+  entryBlockHeight,
   entryBlockSecs,
   fetchAllProfiles,
   fetchProfile,
   fetchProfiles,
   liveNetworkCounts,
-  nowSecs,
   profileCompleteness,
   profileSummary,
 } from './fastdata-utils';
+import { getOperatorClaimsWriterAccount } from './outlayer-server';
 export type FastDataError = { error: string; status?: number };
 type FastDataResult = { data: unknown } | FastDataError;
 
@@ -97,6 +105,8 @@ export async function dispatchFastData(
         return await handleGetActivity(body);
       case 'network':
         return await handleGetNetwork(body);
+      case 'agent_claims':
+        return await handleAgentClaims(body);
       default:
         return { error: `Unsupported action: ${action}` };
     }
@@ -255,6 +265,7 @@ async function handleListAgents(
       const firstEntry = firstSeenMap.get(a.account_id);
       if (firstEntry) {
         a.created_at = entryBlockSecs(firstEntry);
+        a.created_height = entryBlockHeight(firstEntry);
       }
     }
   }
@@ -400,29 +411,6 @@ async function handleGetMe(
 // VRF-seeded suggestion ranking
 // ---------------------------------------------------------------------------
 
-/** Deterministic xorshift32 PRNG seeded from VRF output bytes.
- *  Shift constants (13, 17, 5) are Marsaglia's standard xorshift32 triple. */
-function makeRng(hex: string) {
-  let state = 0;
-  // Pack first 4 bytes of hex into a 32-bit seed
-  for (let i = 0; i < Math.min(hex.length, 8); i += 2) {
-    state ^= Number.parseInt(hex.slice(i, i + 2), 16) << ((i / 2) * 8);
-  }
-  if (state === 0) state = 1;
-  state = state >>> 0; // ensure unsigned 32-bit
-
-  return {
-    pick(n: number): number | null {
-      if (n === 0) return null;
-      state ^= state << 13;
-      state ^= state >>> 17;
-      state ^= state << 5;
-      state = state >>> 0;
-      return state % n;
-    },
-  };
-}
-
 export async function handleGetSuggested(
   body: Record<string, unknown>,
   vrfProof: VrfProof | null,
@@ -437,7 +425,6 @@ export async function handleGetSuggested(
     fetchProfile(accountId),
     kvListAgent(accountId, 'graph/follow/'),
   ]);
-  const callerTags = new Set(callerAgent?.tags ?? []);
   const followSet = new Set(
     followEntries.map((e) => e.key.replace('graph/follow/', '')),
   );
@@ -447,40 +434,13 @@ export async function handleGetSuggested(
   const allAgents = await fetchAllProfiles();
   const candidates = allAgents.filter((a) => !followSet.has(a.account_id));
 
-  // Score = shared tag count (integer tier key for VRF shuffle). Within a
-  // tier, sort by last_active descending as a deterministic fallback order.
-  // When a VRF proof is supplied, the tier is re-shuffled for fairness —
-  // the last_active ordering is only visible when vrfProof is null.
-  const scored = candidates.map((agent) => {
-    const shared = agent.tags?.filter((t) => callerTags.has(t)) ?? [];
-    return {
-      agent,
-      shared,
-      score: shared.length,
-    };
-  });
-  scored.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return (b.agent.last_active ?? 0) - (a.agent.last_active ?? 0);
-  });
-
-  // VRF shuffle within equal-score tiers for fairness.
-  if (vrfProof) {
-    const rng = makeRng(vrfProof.output_hex);
-    let i = 0;
-    while (i < scored.length) {
-      const tierScore = scored[i].score;
-      const start = i;
-      while (i < scored.length && scored[i].score === tierScore) i++;
-      // Fisher-Yates shuffle within the tier.
-      for (let j = i - 1; j > start; j--) {
-        const k = rng.pick(j - start + 1);
-        if (k !== null) {
-          [scored[start + k], scored[j]] = [scored[j], scored[start + k]];
-        }
-      }
-    }
-  }
+  // Rank via the SDK's pure suggest helpers — single source of truth for
+  // scoring, tie-breaking, and VRF-seeded fair shuffle within equal-score
+  // tiers. A null vrfProof leaves the sort-by-last_active fallback in place.
+  const scored = sortByScoreThenActive(
+    scoreBySharedTags(callerAgent?.tags ?? [], candidates),
+  );
+  shuffleWithinTiers(scored, vrfProof ? makeRng(vrfProof.output_hex) : null);
 
   const agents = scored.slice(0, limit).map((s) => {
     const reason =
@@ -595,6 +555,7 @@ async function handleGetEndorsers(
       reason?: string;
       content_hash?: string;
       at?: number;
+      at_height?: number;
     }>
   > = {};
 
@@ -619,8 +580,11 @@ async function handleGetEndorsers(
       // Block-authoritative timestamp — the endorser cannot backdate or
       // forward-date by lying in their value blob. The caller-asserted
       // `meta.at` is discarded here; if a legacy consumer ever needs it,
-      // read the entry value directly via kvListAll.
+      // read the entry value directly via kvListAll. `at_height` is the
+      // canonical "when" value per step 3 of the block-height transition —
+      // `at` stays emitted in parallel for consumers not yet migrated.
       at: entryBlockSecs(e),
+      at_height: entryBlockHeight(e),
     });
   }
 
@@ -643,32 +607,54 @@ async function handleGetActivity(
   if ('error' in resolved) return resolved;
   const { accountId } = resolved;
 
-  const now = nowSecs();
-  const sinceRaw = body.cursor ?? body.since;
-  const since =
-    typeof sinceRaw === 'string' ? parseInt(sinceRaw, 10) : now - 86400;
-  if (Number.isNaN(since)) {
-    return { error: 'since must be a number', status: 400 };
+  // Delta-query cursor: opaque block_height. Callers pass back the `cursor`
+  // from the previous response to receive only entries strictly after it.
+  // Absence means "everything" — no wall-clock default. This is the step 4
+  // landing of the block-height transition: the contract no longer depends
+  // on wall clock at all, so the legacy 24-hour seconds-based default is
+  // gone with it.
+  const cursorRaw = body.cursor;
+  let cursor: number | undefined;
+  if (cursorRaw !== undefined) {
+    const parsed =
+      typeof cursorRaw === 'string'
+        ? parseInt(cursorRaw, 10)
+        : Number(cursorRaw);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return {
+        error: 'cursor must be a non-negative integer block_height',
+        status: 400,
+      };
+    }
+    cursor = parsed;
   }
 
-  // New followers: predecessors who wrote graph/follow/{accountId} with at >= since
+  // New followers: predecessors who wrote graph/follow/{accountId} strictly
+  // after the caller-supplied cursor (or all entries if no cursor). Trust the
+  // FastData-indexed `block_height`, not caller-asserted value fields — the
+  // activity feed cannot be gamed by backdating edges.
   const [followerEntries, followingEntries] = await Promise.all([
     kvGetAll(`graph/follow/${accountId}`),
     kvListAgent(accountId, 'graph/follow/'),
   ]);
 
-  // Trust the FastData-indexed block_timestamp, not the follower's
-  // caller-asserted `value.at`, so the activity feed cannot be gamed by
-  // backdating edges.
+  const afterCursor = (e: KvEntry): boolean =>
+    cursor === undefined || entryBlockHeight(e) > cursor;
+
   const newFollowerAccounts: string[] = [];
+  let maxHeight = cursor ?? 0;
   for (const e of followerEntries) {
-    if (entryBlockSecs(e) >= since) newFollowerAccounts.push(e.predecessor_id);
+    if (afterCursor(e)) {
+      newFollowerAccounts.push(e.predecessor_id);
+      if (e.block_height > maxHeight) maxHeight = e.block_height;
+    }
   }
 
   const newFollowingAccountIds: string[] = [];
   for (const e of followingEntries) {
-    if (entryBlockSecs(e) >= since) {
+    if (afterCursor(e)) {
       newFollowingAccountIds.push(e.key.replace('graph/follow/', ''));
+      if (e.block_height > maxHeight) maxHeight = e.block_height;
     }
   }
 
@@ -680,9 +666,18 @@ async function handleGetActivity(
   const newFollowers = followerAgents.map(profileSummary);
   const newFollowing = followingAgents.map(profileSummary);
 
+  // Next cursor: max block_height observed across the cursor-filtered raw
+  // entries (follower/following edges that passed `afterCursor`), NOT the
+  // post-profile-filter summary arrays. A window full of new edges pointing
+  // at agents with no `profile` blob would drop every summary to zero while
+  // still advancing the high-water mark; echoing the input cursor there
+  // strands callers in a re-read loop. Cursor stays on the input value only
+  // when no raw entries advanced it at all.
+  const nextCursor = maxHeight > (cursor ?? 0) ? maxHeight : cursor;
+
   return {
     data: {
-      since,
+      cursor: nextCursor,
       new_followers: newFollowers,
       new_following: newFollowing,
     },
@@ -722,7 +717,140 @@ async function handleGetNetwork(
       following_count: followingAccountIds.length,
       mutual_count: mutualCount,
       last_active: agent.last_active,
+      last_active_height: agent.last_active_height,
       created_at: agent.created_at,
+      created_height: agent.created_height,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Operator-claim read handlers (Lightweight sign-in feature)
+//
+// Operator claims are NEP-413-verified attestations that a human NEAR
+// account operates a particular `wk_` agent wallet. Writes land under a
+// service-writer predecessor (see `handleClaimOperator` in fastdata-write.ts)
+// keyed as `operator/{operator_account_id}/{agent_account_id}`; the stored
+// value is the full NEP-413 envelope so any reader can independently
+// re-verify against NEAR RPC.
+//
+// The by-operator companion handler (`operator_claims`) is deferred until
+// the /dashboard view re-expands — see `.agents/planning/lightweight-signin-frontend.md`
+// "Deferred / re-expand triggers" for the contract. Adding it later is
+// trivial (single-prefix scan) and has no impact on this handler.
+// ---------------------------------------------------------------------------
+
+/**
+ * List the operators who have claimed a given agent. Public read — no auth
+ * required. Scans the operator-claims writer's predecessor namespace for
+ * entries whose key_suffix ends with the target agent's account_id, parses
+ * each entry's inner NEP-413 message to extract the authoritative operator
+ * identity, and joins operator profiles for display summaries.
+ *
+ * Trust boundary note: `predecessor_id` on these entries is the service
+ * writer account (not the operator), so the usual "predecessor owns this
+ * key" attribution does not apply. The authoritative operator identity
+ * lives in the stored envelope's inner-message `account_id` field. A
+ * malformed envelope — message is missing, not a string, not JSON, or
+ * carries no `account_id` — is silently dropped from the list rather than
+ * surfaced as an error; the write handler rejects those at ingest, so
+ * their presence in storage would indicate either a legacy entry or
+ * deliberate tampering by a party with the service writer key.
+ *
+ * Scale caveat: O(total operator-claim entries in the namespace), bounded
+ * structurally by FastData's 10k-page cap (same as `kvHistoryFirstByPredecessor`).
+ * Revisit when operator-claim count grows past ~1K. Future scale work can
+ * replace the scan with a mirror key `operator-of/{agent}/{operator}`
+ * written at claim time without changing this read's external contract.
+ *
+ * Deployment note: when `OUTLAYER_OPERATOR_CLAIMS_WK` is unset on a given
+ * deployment (the lightweight sign-in feature is disabled), there are no
+ * claims by construction, so the handler returns an empty `operators`
+ * array rather than erroring. Reads stay live even when writes 503.
+ */
+async function handleAgentClaims(
+  body: Record<string, unknown>,
+): Promise<FastDataResult> {
+  const resolved = await requireAgent(body);
+  if ('error' in resolved) return resolved;
+  const { accountId } = resolved;
+
+  const writerAccount = await getOperatorClaimsWriterAccount();
+  if (!writerAccount) {
+    return { data: { account_id: accountId, operators: [] } };
+  }
+
+  // Full-scan over every operator-claim entry under the service writer.
+  // `kvListAgent` paginates across pages and respects the same structural
+  // caps as other namespace scans.
+  const claimEntries = await kvListAgent(writerAccount, 'operator/');
+  if (claimEntries.length === 0) {
+    return { data: { account_id: accountId, operators: [] } };
+  }
+
+  // Filter: keys are `operator/{operator_account_id}/{agent_account_id}`;
+  // we want the ones whose trailing segment matches the target accountId.
+  // `endsWith('/' + accountId)` is safe because account IDs cannot contain
+  // slashes, so the trailing-slash boundary is unambiguous.
+  const agentSuffix = `/${accountId}`;
+  const matched = claimEntries.filter((e) => e.key.endsWith(agentSuffix));
+  if (matched.length === 0) {
+    return { data: { account_id: accountId, operators: [] } };
+  }
+
+  // Parse each entry's inner NEP-413 envelope to extract the authoritative
+  // operator identity. Entries whose envelope is malformed are dropped
+  // silently — the write handler would have rejected them at ingest.
+  const parsed: Array<{
+    entry: KvEntry;
+    operatorAccountId: string;
+    value: Record<string, unknown>;
+  }> = [];
+  for (const e of matched) {
+    const value = (e.value ?? {}) as Record<string, unknown>;
+    const message = value.message;
+    if (typeof message !== 'string') continue;
+    let inner: Record<string, unknown>;
+    try {
+      inner = JSON.parse(message) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const opId = inner.account_id;
+    if (typeof opId !== 'string' || !opId) continue;
+    parsed.push({ entry: e, operatorAccountId: opId, value });
+  }
+  if (parsed.length === 0) {
+    return { data: { account_id: accountId, operators: [] } };
+  }
+
+  // Batch-fetch operator profiles for the summary fields. A missing profile
+  // (operator has never heartbeated) still surfaces as a valid claim entry —
+  // the envelope proves the claim regardless of whether the operator has
+  // joined the directory. Fall back to null/empty display fields.
+  const operatorIds = [...new Set(parsed.map((p) => p.operatorAccountId))];
+  const operatorProfiles = await fetchProfiles(operatorIds);
+  const profileMap = new Map<string, Agent>();
+  for (const p of operatorProfiles) {
+    profileMap.set(p.account_id, p);
+  }
+
+  const operators = parsed.map(({ entry, operatorAccountId, value }) => {
+    const profile = profileMap.get(operatorAccountId);
+    return {
+      account_id: operatorAccountId,
+      name: profile?.name ?? null,
+      description: profile?.description ?? '',
+      image: profile?.image ?? null,
+      message: value.message as string,
+      signature: value.signature as string,
+      public_key: value.public_key as string,
+      nonce: value.nonce as string,
+      reason: typeof value.reason === 'string' ? value.reason : undefined,
+      at: entryBlockSecs(entry),
+      at_height: entryBlockHeight(entry),
+    };
+  });
+
+  return { data: { account_id: accountId, operators } };
 }

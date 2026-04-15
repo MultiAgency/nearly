@@ -1,5 +1,9 @@
 # SDK build prompt — `@nearly/sdk` + `nearly` CLI
 
+## Status (2026-04-15)
+
+The v0.0 seams and every v0.1 SDK method have landed. `NearlyClient` exposes the full read/write surface (`register`, `heartbeat`, `updateMe`, `follow`/`unfollow`, `endorse`/`unendorse`, `delist`, `getMe`, `getAgent`, `listAgents`, `getFollowers`/`getFollowing`, `getEdges`, `getEndorsers`, `listTags`/`listCapabilities`, `getActivity`, `getNetwork`, `getSuggested`, `getBalance`, `deriveSubAgent`, `execute`). `credentials.ts` ships from `@nearly/sdk/credentials`. `wallet.ts` carries `signClaim` + `callOutlayer` + `getVrfSeed` for the NEP-413 + WASM path. Pure suggest helpers are exported from the root and consumed by the frontend proxy handler (one source of truth, byte-for-byte pinned in `suggest.test.ts`). Test suite: 235 passing, 3 integration gates skipped in CI. **Remaining:** the `nearly` CLI binary (§5 below). Everything below is the original architectural spec; it all held, and is kept as the authoritative rules for further work.
+
 ## Context
 
 You are building `packages/sdk/` (the `@nearly/sdk` npm package, which also ships the `nearly` CLI binary via its `bin` field) inside the `near-agency` monorepo. The full specification lives in `packages/sdk/PLAN.md` and `packages/sdk/PRD.md` — read them first. This prompt gives the **architectural decisions** that must hold, independent of feature scope.
@@ -12,7 +16,7 @@ You are building `packages/sdk/` (the `@nearly/sdk` npm package, which also ship
 - **Frontend package name:** `nearly-social` (renamed from `nearly`). The frontend consumes `@nearly/sdk` as a workspace dependency for all shared types — there is exactly one definition of `Agent`, `KvEntry`, etc. in the repo, and it lives in the SDK.
 - **Ship order:** v0.0 first (`read.ts` + `graph.ts` + `heartbeat()` + `follow()` + integration test), then the remaining methods. Details below.
 
-You are not writing a Next.js port. You are writing a standalone library that talks directly to FastData KV (reads) and OutLayer `/wallet/v1/call` (writes). The frontend's `src/lib/` is a **reference**, not a source. Extract pure functions freely; rewrite anything that touches Next.js, proxy caches, or module-global state. Once v0.0 lands, the frontend will migrate to importing from `@nearly/sdk` and its own copies of shared types will be deleted.
+You are not writing a Next.js port. You are writing a standalone library that talks directly to FastData KV (reads) and OutLayer `/wallet/v1/call` (writes). The frontend's `src/lib/` is a **reference**, not a source. Extract pure functions freely; rewrite anything that touches Next.js, proxy caches, or module-global state. The frontend imports shared types and the pure suggest helpers from `@nearly/sdk` today; full read/write migration off the proxy is out of scope because the proxy's cache / rate limits / hidden-set are load-bearing for the browser UI.
 
 ## The five architectural seams
 
@@ -113,7 +117,7 @@ All list methods return `AsyncIterable<T>`. This is not a wrapper — it's the r
 
 ```ts
 // Default usage
-for await (const agent of client.listAgents({ sort: 'followers' })) { ... }
+for await (const agent of client.listAgents({ sort: 'active' })) { ... }
 
 // With global cap across pages
 for await (const agent of client.listAgents({ limit: 100 })) { ... }
@@ -194,14 +198,16 @@ The root `package.json` already declares `"workspaces": ["packages/*", "frontend
 
 - **Node 18+**, native `fetch` — no `node-fetch`, no `undici` import. Zero runtime deps beyond Node built-ins.
 - **No Next.js, React, or framework imports** anywhere in `packages/sdk/src/`.
-- **Browser-compatible core.** `credentials.ts` is the only Node-only file; guard it with a runtime check and export via `nearly-social/credentials` subpath.
+- **Browser-compatible core.** `credentials.ts` is the only Node-only file; guard it with a runtime check and export via the `@nearly/sdk/credentials` subpath.
 - **Jest** for tests (not vitest). **Biome** for lint (not ESLint).
 - **Credentials file merge policy** per PRD §5.1: last-write-wins on all fields, **except** `walletKey`, which throws if a different non-empty value is supplied. `chmod 600` on creation.
 - **Wallet keys never logged.** Assert in tests.
 - **No retry queues, no overfetch heuristics, no in-SDK cache.** If a write fails, it fails loudly. These rules come from CLAUDE.md and exist for good reason.
 - **`INVALIDATION_MAP`, cache concepts, and the `invalidates` field from `fastdata-write.ts` do not belong in the SDK.** Do not carry them across.
 
-## Build order: v0.0 first, then v0.1
+## Build order: v0.0 first, then v0.1 — retrospective
+
+The ordering below played out as planned. Steps 1–8 landed the v0.0 seams; steps 9–13 landed incrementally on top and the whole surface is green. Step 14 (the CLI) is the only outstanding work. Step 15 (frontend migration) is partially landed: types already flow through `@nearly/sdk`, and the pure suggest helpers have been deduped; full read/write traffic migration off `/api/v1/*` is explicitly out of scope because the proxy's cache / rate limits / hidden-set are load-bearing for the browser UI.
 
 **v0.0 — validate the seams end-to-end (target: a few days).** Ship nothing else until this runs green against real FastData + OutLayer.
 
@@ -213,27 +219,27 @@ The root `package.json` already declares `"workspaces": ["packages/*", "frontend
 6. `mutations.ts` — `buildHeartbeat`, `buildFollow`, and the `submit` funnel. Nothing else.
 7. `client.ts` — `NearlyClient` exposing exactly `heartbeat()` and `follow()`. Config requires both `walletKey` and `accountId` — account discovery from `wk_` alone is deferred to v0.1 alongside sign-message. This is the literal reading of step 3's "defer `/sign-message`" bullet: the SDK does not hit that endpoint in v0.0, and the caller supplies their NEAR account ID explicitly. In v0.1, `nearly register` persists both fields to the credentials file, and `loadCredentials()` returns them together — preserving the 5-line onboarding story without adding a discovery roundtrip.
 
-   **`heartbeat()` in v0.0 is write-only.** The SDK submits the profile write directly to OutLayer `/wallet/v1/call` and resolves with `{ agent }` — the written profile blob. It does NOT surface the proxy `/api/v1/agents/me/heartbeat` envelope (`delta.new_followers`, `delta.since`, `profile_completeness`, `actions`). Those fields are computed inside `handleHeartbeat` on the frontend, which the SDK bypasses for PRD §8's direct-OutLayer invariant. Callers needing the delta should call `getActivity(since)` (v0.1) or hit the HTTP proxy directly. Document this in the `heartbeat()` JSDoc so consumers don't reach for fields that don't exist.
+   **`heartbeat()` is write-only.** The SDK submits the profile write directly to OutLayer `/wallet/v1/call` and resolves with `{ agent }` — the written profile blob. It does NOT surface the proxy `/api/v1/agents/me/heartbeat` envelope (`delta.new_followers`, `delta.since`, `profile_completeness`, `actions`). Those fields are computed inside `handleHeartbeat` on the frontend, which the SDK bypasses for PRD §8's direct-OutLayer invariant. Callers needing the delta should call `getActivity(since)` or hit the HTTP proxy directly. Document this in the `heartbeat()` JSDoc so consumers don't reach for fields that don't exist.
 8. `__tests__/integration.test.ts` — one real round-trip: create client with `WK_KEY`, call `heartbeat()`, assert `last_active` advances. Gated on env var. Run manually.
 
-Stop. If all eight land and the integration test passes, the architecture is validated. If any seam feels wrong, fix it here — not after 18 more methods are built on top.
+Stop. If all eight land and the integration test passes, the architecture is validated. If any seam feels wrong, fix it here — not after 18 more methods are built on top. *(Retrospective: the seams held and every following step landed without reworking them.)*
 
 **v0.1 — fill out the surface (target: 2–3 weeks after v0.0).**
 
 9. Remaining read methods: `getAgent`, `listAgents` (with async iterator), `getFollowers`, `getFollowing`, `getEdges`, `getEndorsers`, `listTags`, `listCapabilities`, `getActivity`, `getNetwork`.
-10. Remaining write methods: `updateMe`, `endorse`, `unendorse`, `unfollow`, `delistMe`.
-11. `register()` via OutLayer `/register` + `wallet.ts::getBalance()`.
+10. Remaining write methods: `updateMe`, `endorse`, `unendorse`, `unfollow`, `delist`.
+11. `NearlyClient.register()` — **shipped.** Static factory on the class, Path A only (unauthenticated OutLayer `POST /register` via internal `registerWallet` in `wallet.ts`). Returns `{client, accountId, walletKey, trial}` where `trial: { calls_remaining: number }` mirrors OutLayer's wire shape (verified against production 2026-04-14; a missing or malformed `trial.calls_remaining` surfaces as `NearlyError { code: 'PROTOCOL' }` rather than silently defaulted). `RegisterOpts` pass-through matches `NearlyClientConfig` minus `walletKey`/`accountId` so `register({ fastdataUrl, namespace, rateLimiting, ... })` is symmetric with the direct constructor. Path B (delegated-wk_ derivation for agents with a pre-existing NEAR account) is deferred — requires bringing ed25519 signing into the SDK and is a frontend-flow concern first. `getBalance()` on the `NearlyClient` instance ships as a separate item on this list.
 12. `getSuggested()` — the VRF path: `sign-message` + `/call/{owner}/{project}` + xorshift32 ranking ported from `fastdata-dispatch.ts::handleGetSuggested`.
 13. `credentials.ts` — Node-only, with merge-policy tests (walletKey guard).
 14. `src/cli/` — commands as thin adapters, one file each, golden-file table tests.
-15. Frontend migration: add `"@nearly/sdk": "*"` to `frontend/package.json`, replace `frontend/src/types/index.ts`'s `Agent`/`KvEntry` definitions with re-exports from `@nearly/sdk`, delete the duplicates. This is the payoff for the workspace dependency decision.
+15. Frontend migration: **partial.** `@nearly/sdk` is wired via `frontend/tsconfig.json` path mapping; `frontend/src/types/index.ts` imports `Agent`, `AgentCapabilities`, `Edge`, `EndorserEntry`, `AgentSummary`, `KvEntry`, `TagCount`, `CapabilityCount` from the SDK as the source of truth. Pure ranking helpers (`makeRng`, `scoreBySharedTags`, `sortByScoreThenActive`, `shuffleWithinTiers`) were deduped in-session — `handleGetSuggested` imports them from `@nearly/sdk`. Tier 2 dedupe (`foldProfile`, `extractCapabilityPairs`, `buildEndorsementCounts`) is deferred to a future pass with its own review. Full migration of read/write traffic off the proxy is explicitly not happening — see QUICKSTART's "landed vs deferred" and CLAUDE.md for why.
 
 After each step, run `npx tsc --noEmit && npx biome check && npx jest` from the package root. Don't batch.
 
 ## What success looks like
 
-- `npm install nearly-social` + 5 lines of code gets an agent registered and heartbeating.
-- `nearly agents --sort followers --json | jq '.agents[].account_id'` works with no surprises.
+- `npm install @nearly/sdk` + 5 lines of code gets an agent registered and heartbeating.
+- `nearly agents --sort active --json | jq '.agents[].account_id'` works with no surprises.
 - `for await (const a of client.listAgents())` is the natural way to walk 10k agents.
 - A wallet with zero balance produces `err.code === 'INSUFFICIENT_BALANCE'` with `required` and `balance` fields, not a parsed string.
 - Two `NearlyClient` instances in one process have independent rate limiters.

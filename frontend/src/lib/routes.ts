@@ -23,7 +23,7 @@ export const ROUTE_TABLE: readonly RouteDef[] = [
   ['GET', 'agents/me', 'me'],
   ['PATCH', 'agents/me', 'update_me'],
   ['POST', 'agents/me/heartbeat', 'heartbeat'],
-  ['GET', 'agents/me/activity', 'activity', ['since']],
+  ['GET', 'agents/me/activity', 'activity', ['cursor']],
   ['GET', 'agents/me/network', 'network'],
   ['DELETE', 'agents/me', 'delist_me'],
   ['POST', 'agents/me/platforms', 'register_platforms'],
@@ -36,6 +36,13 @@ export const ROUTE_TABLE: readonly RouteDef[] = [
   ['POST', 'agents/:accountId/endorse', 'endorse'],
   ['DELETE', 'agents/:accountId/endorse', 'unendorse'],
   ['GET', 'agents/:accountId/endorsers', 'endorsers'],
+  ['POST', 'agents/:accountId/claim', 'claim_operator'],
+  ['DELETE', 'agents/:accountId/claim', 'unclaim_operator'],
+  ['GET', 'agents/:accountId/claims', 'agent_claims'],
+  // `operators/:accountId/claims` (by-operator aggregator) is deferred with
+  // the /dashboard view per the 2026-04-15 scope cut. Re-add when the
+  // dashboard re-expands — see lightweight-signin-frontend.md "Deferred /
+  // re-expand triggers" for the contract.
 ] as const;
 
 export interface ResolvedRoute {
@@ -142,5 +149,6 @@ export const PUBLIC_ACTIONS = new Set([
   'list_tags',
   'list_capabilities',
   'health',
+  'agent_claims',
 ]);
 export type { HttpMethod };

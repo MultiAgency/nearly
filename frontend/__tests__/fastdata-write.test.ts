@@ -3,7 +3,9 @@
  */
 
 import * as fastdata from '@/lib/fastdata';
+import { agentEntries } from '@/lib/fastdata-utils';
 import {
+  dispatchNep413Write,
   dispatchWrite,
   handleDelistMe,
   handleEndorse,
@@ -16,6 +18,7 @@ import {
 } from '@/lib/fastdata-write';
 import * as fetchLib from '@/lib/fetch';
 import * as rateLimit from '@/lib/rate-limit';
+import type { VerifiableClaim } from '@/types';
 import { mockAgent } from './fixtures';
 
 jest.mock('@/lib/fastdata');
@@ -44,7 +47,13 @@ function profileEntry(
   return {
     predecessor_id: accountId,
     current_account_id: 'contextual.near',
-    block_height: 100,
+    // Mirror blockSecs into block_height so heartbeat delta tests can
+    // drive both the seconds (`last_active`) and height
+    // (`last_active_height`) cursors with a single `blockSecs` argument.
+    // The trust-boundary override populates `last_active_height` from
+    // this value, making it the caller's `previousActiveHeight` for the
+    // block-height delta comparison.
+    block_height: blockSecs,
     block_timestamp: blockSecs * 1_000_000_000,
     key: 'profile',
     value,
@@ -96,10 +105,11 @@ beforeEach(() => {
       return profileEntry('alice.near', mockAgent('alice.near'));
     return null;
   });
-  mockCheckRateLimit.mockReturnValue({ ok: true });
+  mockCheckRateLimit.mockReturnValue({ ok: true, window: 0 });
   (rateLimit.checkRateLimitBudget as jest.Mock).mockReturnValue({
     ok: true,
     remaining: 20,
+    window: 0,
     retryAfter: 0,
   });
   (rateLimit.incrementRateLimit as jest.Mock).mockImplementation(() => {});
@@ -127,17 +137,6 @@ describe('writeToFastData', () => {
     expect(outcome).toEqual({ ok: true });
   });
 
-  it('classifies an explicit 402 as insufficient_balance', async () => {
-    mockFetchWithTimeout.mockResolvedValue({
-      ok: false,
-      status: 402,
-      text: () => Promise.resolve('insufficient balance to cover storage'),
-    } as unknown as Response);
-
-    const outcome = await writeToFastData(WK, { profile: { name: 'x' } });
-    expect(outcome).toEqual({ ok: false, reason: 'insufficient_balance' });
-  });
-
   it('classifies a network error as storage_error', async () => {
     mockFetchWithTimeout.mockRejectedValue(new Error('ECONNRESET'));
 
@@ -146,14 +145,14 @@ describe('writeToFastData', () => {
   });
 
   it('coerces 502 to insufficient_balance when the wallet is unfunded', async () => {
-    // OutLayer returns 502 for writes on zero-balance wallets (verified
-    // 2026-04-13). writeToFastData disambiguates by probing /balance and
-    // folds into the same insufficient_balance reason.
+    // OutLayer returns 502 for writes on zero-balance wallets;
+    // writeToFastData disambiguates by probing /balance and folds into
+    // the same insufficient_balance reason.
     mockFetchWithTimeout
       .mockResolvedValueOnce({
         ok: false,
         status: 502,
-        text: () => Promise.resolve('cloudflare error code: 502'),
+        text: () => Promise.resolve('error code: 502'),
       } as unknown as Response)
       .mockResolvedValueOnce({
         ok: true,
@@ -172,7 +171,7 @@ describe('writeToFastData', () => {
       .mockResolvedValueOnce({
         ok: false,
         status: 502,
-        text: () => Promise.resolve('cloudflare error code: 502'),
+        text: () => Promise.resolve('error code: 502'),
       } as unknown as Response)
       .mockResolvedValueOnce({
         ok: true,
@@ -195,7 +194,7 @@ describe('writeToFastData', () => {
       .mockResolvedValueOnce({
         ok: false,
         status: 502,
-        text: () => Promise.resolve('cloudflare error code: 502'),
+        text: () => Promise.resolve('error code: 502'),
       } as unknown as Response)
       .mockRejectedValueOnce(new Error('balance endpoint timeout'));
 
@@ -216,6 +215,40 @@ describe('writeToFastData', () => {
 
     const outcome = await writeToFastData(WK, { profile: { name: 'x' } });
     expect(outcome).toEqual({ ok: false, reason: 'storage_error' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// agentEntries — trust-boundary write-side strip (regression guard)
+// ---------------------------------------------------------------------------
+
+describe('agentEntries trust-boundary strip', () => {
+  it('omits every read-derived field from the written profile blob', () => {
+    const agent = {
+      ...mockAgent('alice.near'),
+      follower_count: 42,
+      following_count: 17,
+      endorsements: { 'tags/rust': 3 },
+      endorsement_count: 3,
+      last_active: 1_700_000_000,
+      last_active_height: 123_456_789,
+      created_at: 1_690_000_000,
+      created_height: 100_000_000,
+    };
+    const entries = agentEntries(agent);
+    const profile = entries.profile as Record<string, unknown>;
+    for (const forbidden of [
+      'follower_count',
+      'following_count',
+      'endorsements',
+      'endorsement_count',
+      'last_active',
+      'last_active_height',
+      'created_at',
+      'created_height',
+    ]) {
+      expect(profile).not.toHaveProperty(forbidden);
+    }
   });
 });
 
@@ -567,11 +600,18 @@ describe('first-write heartbeat', () => {
 
   it('returns INSUFFICIENT_BALANCE with funding meta when wallet has no balance', async () => {
     mockKvGetAgent.mockResolvedValue(null);
-    mockFetchWithTimeout.mockResolvedValue({
-      ok: false,
-      status: 402,
-      text: () => Promise.resolve('insufficient balance to cover storage'),
-    } as unknown as Response);
+    // 1st call: POST /wallet/v1/call → 502 (Cloudflare upstream for zero-balance).
+    // 2nd call: GET /wallet/v1/balance → {balance: '0'} so hasZeroNearBalance confirms.
+    mockFetchWithTimeout
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 502,
+        text: () => Promise.resolve('error code: 502'),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ balance: '0' }),
+      } as unknown as Response);
 
     const result = await handleHeartbeat(WK, resolveAccountId);
     expect(result).toMatchObject({
@@ -614,9 +654,11 @@ function kvEntry(overrides: {
   value: unknown;
   /**
    * Entry block time in seconds. Maps to `block_timestamp: blockSecs * 1e9`.
-   * Callers use this to control whether an entry counts as "new" relative
-   * to a caller's `last_active` in delta tests — the trust boundary now
-   * reads block-time, not caller-asserted `value.at`.
+   * Also drives `block_height` (= `blockSecs` by default) so the heartbeat
+   * delta comparison — which switched from seconds to height in step 4 of
+   * the block-height transition — preserves the same "new vs stale"
+   * semantic against the caller's `last_active_height`. The trust boundary
+   * reads block_height for the delta filter, not caller-asserted `value.at`.
    */
   blockSecs?: number;
 }): fastdata.KvEntry {
@@ -624,7 +666,7 @@ function kvEntry(overrides: {
   return {
     predecessor_id: overrides.predecessor_id ?? 'test.near',
     current_account_id: 'contextual.near',
-    block_height: 100000,
+    block_height: blockSecs,
     block_timestamp: blockSecs * 1_000_000_000,
     key: overrides.key,
     value: overrides.value,
@@ -1345,5 +1387,263 @@ describe('handleUnendorse key_suffixes', () => {
     expect(args['endorsing/bob.near/tags/ai']).toBeNull();
     expect(args['endorsing/bob.near/task/job_1']).toBeNull();
     expect(args['endorsing/bob.near/task/not_there']).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NEP-413 write dispatch — `dispatchNep413Write` covering `claim_operator`
+// and `unclaim_operator`. These tests target the handler layer directly,
+// bypassing the route-layer `verifyClaim` step (claim verification is
+// covered by `verify-claim.test.ts`). The handler assumes its caller has
+// already verified the envelope and packed it into `Nep413WriteContext`.
+// ---------------------------------------------------------------------------
+
+describe('dispatchNep413Write (claim_operator / unclaim_operator)', () => {
+  const SERVICE_WK = 'wk_operator_claims_service';
+  const OPERATOR = 'alice.near';
+  const AGENT = 'bot.near';
+  const CLAIM: VerifiableClaim = {
+    account_id: OPERATOR,
+    public_key: 'ed25519:testpubkey',
+    signature: 'ed25519:testsig',
+    nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+    message: JSON.stringify({
+      action: 'claim_operator',
+      domain: 'nearly.social',
+      account_id: OPERATOR,
+      version: 1,
+      timestamp: 1_700_000_000_000,
+    }),
+  };
+  const CTX = { operatorAccountId: OPERATOR, claim: CLAIM };
+
+  let savedEnv: string | undefined;
+  beforeEach(() => {
+    savedEnv = process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
+    process.env.OUTLAYER_OPERATOR_CLAIMS_WK = SERVICE_WK;
+    // Rate limit open by default; individual tests override.
+    mockCheckRateLimit.mockReturnValue({ ok: true, window: 0 });
+    // Successful write by default; individual tests override.
+    mockFetchWithTimeout.mockResolvedValue({
+      ok: true,
+      status: 200,
+    } as Response);
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
+    } else {
+      process.env.OUTLAYER_OPERATOR_CLAIMS_WK = savedEnv;
+    }
+  });
+
+  describe('claim_operator', () => {
+    it('writes the full NEP-413 envelope under the composed operator key', async () => {
+      const result = await dispatchNep413Write(
+        'claim_operator',
+        { account_id: AGENT },
+        CTX,
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        data: {
+          action: 'claimed',
+          operator_account_id: OPERATOR,
+          agent_account_id: AGENT,
+        },
+      });
+
+      // `parseWriteArgs` pulls the body.args object from the first
+      // fetchWithTimeout POST to `/wallet/v1/call`. Assert the composed
+      // key and the full envelope shape on the stored value — the
+      // "publicly verifiable" property requires all four envelope fields.
+      const args = parseWriteArgs();
+      const key = `operator/${OPERATOR}/${AGENT}`;
+      expect(args[key]).toEqual({
+        message: CLAIM.message,
+        signature: CLAIM.signature,
+        public_key: CLAIM.public_key,
+        nonce: CLAIM.nonce,
+      });
+
+      // The write is signed by the service key, not the operator's own key
+      // (operators don't have `wk_` keys — that's the whole point of this
+      // dispatch path).
+      const writeCall = mockFetchWithTimeout.mock.calls[0];
+      const headers = writeCall[1]!.headers as Record<string, string>;
+      expect(headers.Authorization).toBe(`Bearer ${SERVICE_WK}`);
+    });
+
+    it('stores an optional reason alongside the envelope', async () => {
+      await dispatchNep413Write(
+        'claim_operator',
+        { account_id: AGENT, reason: 'my primary code-review bot' },
+        CTX,
+      );
+
+      const args = parseWriteArgs();
+      const key = `operator/${OPERATOR}/${AGENT}`;
+      expect(args[key]).toMatchObject({ reason: 'my primary code-review bot' });
+    });
+
+    it('returns 503 NOT_CONFIGURED when the service key is unset', async () => {
+      delete process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
+
+      const result = await dispatchNep413Write(
+        'claim_operator',
+        { account_id: AGENT },
+        CTX,
+      );
+
+      expect(result).toMatchObject({
+        success: false,
+        code: 'NOT_CONFIGURED',
+        status: 503,
+      });
+      // No write attempted when the service key is missing.
+      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+    });
+
+    it('returns 429 when the rate limit is exhausted', async () => {
+      mockCheckRateLimit.mockReturnValue({ ok: false, retryAfter: 42 });
+
+      const result = await dispatchNep413Write(
+        'claim_operator',
+        { account_id: AGENT },
+        CTX,
+      );
+
+      expect(result).toMatchObject({
+        success: false,
+        code: 'RATE_LIMITED',
+        status: 429,
+        retryAfter: 42,
+      });
+      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+    });
+
+    it('rate-limits on the verified operator account, not request IP', async () => {
+      // Verifies the handler passes the operator account to checkRateLimit
+      // (not some other value) — abuse mitigation is operator-scoped.
+      await dispatchNep413Write('claim_operator', { account_id: AGENT }, CTX);
+      expect(mockCheckRateLimit).toHaveBeenCalledWith(
+        'claim_operator',
+        OPERATOR,
+      );
+    });
+
+    it('rejects a missing agent account_id with VALIDATION_ERROR', async () => {
+      const result = await dispatchNep413Write('claim_operator', {}, CTX);
+      expect(result).toMatchObject({
+        success: false,
+        code: 'VALIDATION_ERROR',
+      });
+      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+    });
+
+    it('rejects an agent account_id containing null bytes', async () => {
+      const result = await dispatchNep413Write(
+        'claim_operator',
+        { account_id: 'bot\0.near' },
+        CTX,
+      );
+      expect(result).toMatchObject({
+        success: false,
+        code: 'VALIDATION_ERROR',
+      });
+      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+    });
+
+    it('rejects an oversized reason', async () => {
+      const result = await dispatchNep413Write(
+        'claim_operator',
+        { account_id: AGENT, reason: 'x'.repeat(500) },
+        CTX,
+      );
+      expect(result).toMatchObject({
+        success: false,
+        code: 'VALIDATION_ERROR',
+      });
+      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+    });
+
+    it('attaches the operator-claim invalidation targets on success', async () => {
+      const result = await dispatchNep413Write(
+        'claim_operator',
+        { account_id: AGENT },
+        CTX,
+      );
+      expect(result).toMatchObject({
+        success: true,
+        invalidates: ['agent_claims'],
+      });
+    });
+  });
+
+  describe('unclaim_operator', () => {
+    it('null-writes the composed operator key via the service key', async () => {
+      const result = await dispatchNep413Write(
+        'unclaim_operator',
+        { account_id: AGENT },
+        CTX,
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        data: {
+          action: 'unclaimed',
+          operator_account_id: OPERATOR,
+          agent_account_id: AGENT,
+        },
+      });
+
+      const args = parseWriteArgs();
+      const key = `operator/${OPERATOR}/${AGENT}`;
+      expect(args[key]).toBeNull();
+    });
+
+    it('returns 503 NOT_CONFIGURED when the service key is unset', async () => {
+      delete process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
+
+      const result = await dispatchNep413Write(
+        'unclaim_operator',
+        { account_id: AGENT },
+        CTX,
+      );
+
+      expect(result).toMatchObject({
+        success: false,
+        code: 'NOT_CONFIGURED',
+        status: 503,
+      });
+      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+    });
+
+    it('attaches the operator-claim invalidation targets on success', async () => {
+      const result = await dispatchNep413Write(
+        'unclaim_operator',
+        { account_id: AGENT },
+        CTX,
+      );
+      expect(result).toMatchObject({
+        success: true,
+        invalidates: ['agent_claims'],
+      });
+    });
+  });
+
+  it('returns VALIDATION_ERROR for an unknown action passed to the NEP-413 dispatcher', async () => {
+    // Guards against a regression where a new route entry routes through
+    // NEP413_WRITE_ACTIONS but forgets to add a handler case in the switch.
+    const result = await dispatchNep413Write(
+      'unknown_nep413_action',
+      { account_id: AGENT },
+      CTX,
+    );
+    expect(result).toMatchObject({
+      success: false,
+      code: 'VALIDATION_ERROR',
+    });
   });
 });

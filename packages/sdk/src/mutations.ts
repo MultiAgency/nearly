@@ -1,9 +1,43 @@
+import { LIMITS } from './constants';
 import { NearlyError, rateLimitedError } from './errors';
 import { defaultAgent, extractCapabilityPairs } from './graph';
 import type { RateLimiter } from './rateLimit';
-import type { Agent, FollowOpts, Mutation } from './types';
-import { validateReason } from './validate';
+import type { Agent, AgentCapabilities, FollowOpts, Mutation } from './types';
+import {
+  validateCapabilities,
+  validateDescription,
+  validateImageUrl,
+  validateKeySuffix,
+  validateName,
+  validateReason,
+  validateTags,
+} from './validate';
 import { submitWrite, type WalletClient } from './wallet';
+
+/**
+ * Patch accepted by `buildUpdateMe` — the subset of Agent fields an
+ * agent can rewrite. Any field absent from the patch is left untouched
+ * on the merged profile. Setting `name` or `image` to `null` clears the
+ * field; strings replace the current value.
+ */
+export interface UpdateMePatch {
+  name?: string | null;
+  description?: string;
+  image?: string | null;
+  tags?: readonly string[];
+  capabilities?: AgentCapabilities;
+}
+
+export interface EndorseOpts {
+  keySuffixes: readonly string[];
+  reason?: string;
+  /**
+   * Optional caller-asserted content hash stored alongside each entry.
+   * Round-tripped verbatim on read; never computed or validated
+   * server-side. On re-endorse with a different hash, last-write wins.
+   */
+  contentHash?: string;
+}
 
 /**
  * Build the KV entries for a profile write: the full profile blob plus
@@ -19,7 +53,9 @@ function profileEntries(agent: Agent): Record<string, unknown> {
     endorsements: _e,
     endorsement_count: _ec,
     last_active: _la,
+    last_active_height: _lah,
     created_at: _ca,
+    created_height: _ch,
     ...rest
   } = agent;
   const entries: Record<string, unknown> = { profile: rest };
@@ -105,6 +141,339 @@ export function buildFollow(
   };
 }
 
+/**
+ * Build a profile-update mutation. Pure: merges `patch` onto `current`,
+ * validates every touched field, and emits the full profile blob plus
+ * the new tag/cap existence indexes. Removed tags and capability pairs
+ * are null-written so they disappear from `listTags` / `listCapabilities`
+ * aggregation — symmetric with the proxy's `handleUpdateMe`.
+ *
+ * First-write is supported: pass `current: null` and the merge starts
+ * from a `defaultAgent` baseline, so a brand-new caller can rewrite
+ * straight into their final profile state in one call.
+ */
+export function buildUpdateMe(
+  accountId: string,
+  current: Agent | null,
+  patch: UpdateMePatch,
+): Mutation {
+  const base: Agent = {
+    ...(current ?? defaultAgent(accountId)),
+    account_id: accountId,
+  };
+  const next: Agent = { ...base };
+  let changed = false;
+
+  if ('name' in patch) {
+    if (patch.name != null) {
+      const e = validateName(patch.name);
+      if (e) throw e;
+    }
+    next.name = patch.name ?? null;
+    changed = true;
+  }
+  if (patch.description !== undefined) {
+    const e = validateDescription(patch.description);
+    if (e) throw e;
+    next.description = patch.description;
+    changed = true;
+  }
+  if ('image' in patch) {
+    if (patch.image != null) {
+      const e = validateImageUrl(patch.image);
+      if (e) throw e;
+    }
+    next.image = patch.image ?? null;
+    changed = true;
+  }
+  if (patch.tags !== undefined) {
+    const { validated, error } = validateTags(patch.tags);
+    if (error) throw error;
+    next.tags = validated;
+    changed = true;
+  }
+  if (patch.capabilities !== undefined) {
+    const e = validateCapabilities(patch.capabilities);
+    if (e) throw e;
+    next.capabilities = patch.capabilities;
+    changed = true;
+  }
+
+  if (!changed) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'patch',
+      reason: 'no valid fields to update',
+      message:
+        'Validation failed for patch: no valid fields to update (supported: name, description, image, tags, capabilities)',
+    });
+  }
+
+  const entries = profileEntries(next);
+
+  // Null-write tag indexes the caller used to have but dropped. Without
+  // this the stale `tag/{old}` existence key ghosts into `listTags`.
+  if (patch.tags !== undefined) {
+    const newTags = new Set(next.tags);
+    for (const oldTag of base.tags) {
+      if (!newTags.has(oldTag)) entries[`tag/${oldTag}`] = null;
+    }
+  }
+
+  // Same for capability pairs.
+  if (patch.capabilities !== undefined) {
+    const newCapKeys = new Set(
+      extractCapabilityPairs(next.capabilities).map(
+        ([ns, val]) => `${ns}/${val}`,
+      ),
+    );
+    for (const [ns, val] of extractCapabilityPairs(base.capabilities)) {
+      const suffix = `${ns}/${val}`;
+      if (!newCapKeys.has(suffix)) entries[`cap/${suffix}`] = null;
+    }
+  }
+
+  return {
+    action: 'update_me',
+    entries,
+    rateLimitKey: accountId,
+  };
+}
+
+/**
+ * Build an endorse mutation. Pure: writes one entry per `key_suffix`
+ * at `endorsing/{target}/{key_suffix}` carrying the optional `reason`
+ * and `content_hash`. The server does not interpret suffix structure —
+ * callers own the convention (see skill.md §6).
+ *
+ * Validation: each `key_suffix` must be non-empty, unicode-safe, and
+ * the full composed key must fit FastData's 1024-byte key limit.
+ * Duplicate suffixes within one call are deduped (first occurrence
+ * wins); the hard cap is `LIMITS.MAX_KEY_SUFFIXES`.
+ *
+ * Does not check whether the target profile exists — the client method
+ * does that as a read before building. Self-endorse is rejected here
+ * to keep the builder honest.
+ */
+export function buildEndorse(
+  callerAccountId: string,
+  target: string,
+  opts: EndorseOpts,
+): Mutation {
+  if (!target.trim()) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'target',
+      reason: 'empty account_id',
+      message: 'Validation failed for target: empty account_id',
+    });
+  }
+  if (target === callerAccountId) {
+    throw new NearlyError({
+      code: 'SELF_ENDORSE',
+      message: 'Cannot endorse yourself',
+    });
+  }
+
+  const { keySuffixes, reason, contentHash } = opts;
+  if (!Array.isArray(keySuffixes) || keySuffixes.length === 0) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'keySuffixes',
+      reason: 'array must not be empty',
+      message: 'Validation failed for keySuffixes: array must not be empty',
+    });
+  }
+  if (keySuffixes.length > LIMITS.MAX_KEY_SUFFIXES) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'keySuffixes',
+      reason: `too many (max ${LIMITS.MAX_KEY_SUFFIXES})`,
+      message: `Validation failed for keySuffixes: too many (max ${LIMITS.MAX_KEY_SUFFIXES})`,
+    });
+  }
+  if (reason !== undefined) {
+    const e = validateReason(reason);
+    if (e) throw e;
+  }
+
+  const keyPrefix = `endorsing/${target}/`;
+  const seen = new Set<string>();
+  const entries: Record<string, unknown> = {};
+  for (const ks of keySuffixes) {
+    if (typeof ks !== 'string') {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'keySuffixes',
+        reason: 'must be strings',
+        message: 'Validation failed for keySuffixes: must be strings',
+      });
+    }
+    if (seen.has(ks)) continue;
+    seen.add(ks);
+    const e = validateKeySuffix(ks, keyPrefix);
+    if (e) throw e;
+    entries[`${keyPrefix}${ks}`] = {
+      ...(reason != null && { reason }),
+      ...(contentHash != null && { content_hash: contentHash }),
+    };
+  }
+
+  return {
+    action: 'endorse',
+    entries,
+    rateLimitKey: callerAccountId,
+  };
+}
+
+/**
+ * Build an unendorse mutation. Pure: null-writes each composed key
+ * at `endorsing/{target}/{key_suffix}`. Unknown keys are harmless —
+ * FastData treats a null-write on a non-existent key as a no-op.
+ * Validation rules match `buildEndorse` so the retraction path can
+ * never write a key the endorse path would reject.
+ */
+export function buildUnendorse(
+  callerAccountId: string,
+  target: string,
+  keySuffixes: readonly string[],
+): Mutation {
+  if (!target.trim()) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'target',
+      reason: 'empty account_id',
+      message: 'Validation failed for target: empty account_id',
+    });
+  }
+  if (!Array.isArray(keySuffixes) || keySuffixes.length === 0) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'keySuffixes',
+      reason: 'array must not be empty',
+      message: 'Validation failed for keySuffixes: array must not be empty',
+    });
+  }
+  if (keySuffixes.length > LIMITS.MAX_KEY_SUFFIXES) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'keySuffixes',
+      reason: `too many (max ${LIMITS.MAX_KEY_SUFFIXES})`,
+      message: `Validation failed for keySuffixes: too many (max ${LIMITS.MAX_KEY_SUFFIXES})`,
+    });
+  }
+
+  const keyPrefix = `endorsing/${target}/`;
+  const seen = new Set<string>();
+  const entries: Record<string, unknown> = {};
+  for (const ks of keySuffixes) {
+    if (typeof ks !== 'string') {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'keySuffixes',
+        reason: 'must be strings',
+        message: 'Validation failed for keySuffixes: must be strings',
+      });
+    }
+    if (seen.has(ks)) continue;
+    seen.add(ks);
+    const e = validateKeySuffix(ks, keyPrefix);
+    if (e) throw e;
+    entries[`${keyPrefix}${ks}`] = null;
+  }
+
+  return {
+    action: 'unendorse',
+    entries,
+    rateLimitKey: callerAccountId,
+  };
+}
+
+/**
+ * Build an unfollow mutation. Pure: emits a single null-write at
+ * `graph/follow/{target}`. The client method is responsible for the
+ * "already unfollowed" short-circuit before calling submit; this
+ * builder does not check edge existence.
+ */
+export function buildUnfollow(
+  callerAccountId: string,
+  target: string,
+): Mutation {
+  if (!target.trim()) {
+    throw new NearlyError({
+      code: 'VALIDATION_ERROR',
+      field: 'target',
+      reason: 'empty account_id',
+      message: 'Validation failed for target: empty account_id',
+    });
+  }
+  if (target === callerAccountId) {
+    throw new NearlyError({
+      code: 'SELF_FOLLOW',
+      message: 'Cannot unfollow yourself',
+    });
+  }
+
+  return {
+    action: 'unfollow',
+    entries: { [`graph/follow/${target}`]: null },
+    rateLimitKey: callerAccountId,
+  };
+}
+
+/**
+ * Build a delist mutation. Pure: null-writes the caller's profile,
+ * every tag/cap existence index the caller wrote, every outgoing
+ * graph/follow edge, and every outgoing endorsing edge. The caller
+ * supplies the outgoing follow/endorse key lists — the builder has
+ * no I/O and cannot discover them on its own.
+ *
+ * Follower edges written by OTHER agents are NOT touched; retraction
+ * is the endorser's responsibility, not the subject's.
+ */
+export function buildDelistMe(
+  agent: Agent,
+  outgoingFollowKeys: readonly string[],
+  outgoingEndorseKeys: readonly string[],
+): Mutation {
+  const entries: Record<string, unknown> = { profile: null };
+
+  for (const tag of agent.tags) {
+    entries[`tag/${tag}`] = null;
+  }
+  for (const [ns, val] of extractCapabilityPairs(agent.capabilities)) {
+    entries[`cap/${ns}/${val}`] = null;
+  }
+  for (const key of outgoingFollowKeys) {
+    if (!key.startsWith('graph/follow/')) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'outgoingFollowKeys',
+        reason: `key must start with graph/follow/ (got ${key})`,
+        message: `Validation failed for outgoingFollowKeys: key must start with graph/follow/ (got ${key})`,
+      });
+    }
+    entries[key] = null;
+  }
+  for (const key of outgoingEndorseKeys) {
+    if (!key.startsWith('endorsing/')) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'outgoingEndorseKeys',
+        reason: `key must start with endorsing/ (got ${key})`,
+        message: `Validation failed for outgoingEndorseKeys: key must start with endorsing/ (got ${key})`,
+      });
+    }
+    entries[key] = null;
+  }
+
+  return {
+    action: 'delist_me',
+    entries,
+    rateLimitKey: agent.account_id,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Submit funnel
 // ---------------------------------------------------------------------------
@@ -117,6 +486,10 @@ export interface SubmitContext {
 /**
  * The one write funnel. Rate-limits, submits via OutLayer, records usage on
  * success. Throws NearlyError on any failure. All v0.0+ mutations go here.
+ *
+ * Threads the window from `check` to `record` so a long-running write can't
+ * straddle a window boundary and silently skip a slot — matches the
+ * frontend's post-Fix-5 behavior.
  */
 export async function submit(
   ctx: SubmitContext,
@@ -126,5 +499,5 @@ export async function submit(
   if (!rl.ok) throw rateLimitedError(mutation.action, rl.retryAfter);
 
   await submitWrite(ctx.wallet, mutation.entries);
-  ctx.rateLimiter.record(mutation.action, mutation.rateLimitKey);
+  ctx.rateLimiter.record(mutation.action, mutation.rateLimitKey, rl.window);
 }

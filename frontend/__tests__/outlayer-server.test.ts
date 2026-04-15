@@ -5,7 +5,11 @@
 const mockFetch = jest.fn();
 global.fetch = mockFetch;
 
-import { callOutlayer, decodeOutlayerResponse } from '@/lib/outlayer-server';
+import {
+  callOutlayer,
+  decodeOutlayerResponse,
+  resolveAccountId,
+} from '@/lib/outlayer-server';
 
 describe('decodeOutlayerResponse', () => {
   it('decodes base64-encoded string response', () => {
@@ -195,5 +199,72 @@ describe('callOutlayer', () => {
     >;
     expect(headers['X-Payment-Key']).toBe('owner:1:secret');
     expect(headers.Authorization).toBeUndefined();
+  });
+});
+
+describe('resolveAccountId', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('resolves wk_ key via GET /wallet/v1/balance without sign-message', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ account_id: 'alice.near', balance: '0' }),
+    } as unknown as Response);
+
+    // Use a fresh key per test to bypass the module-level accountCache.
+    const result = await resolveAccountId('wk_fresh_balance_first');
+    expect(result).toBe('alice.near');
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(String(url)).toContain('/wallet/v1/balance?chain=near');
+    expect(
+      (init as RequestInit).headers as Record<string, string>,
+    ).toMatchObject({ Authorization: 'Bearer wk_fresh_balance_first' });
+  });
+
+  it('falls back to sign-message when balance response lacks account_id', async () => {
+    // balance returns 2xx but omits account_id → fall through to sign-message.
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ balance: '0' }),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            account_id: 'bob.near',
+            public_key: 'ed25519:pk',
+            signature: 'ed25519:sig',
+            nonce: 'bm9uY2U=',
+          }),
+      } as unknown as Response);
+
+    const result = await resolveAccountId('wk_fresh_fallback_path');
+    expect(result).toBe('bob.near');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(String(mockFetch.mock.calls[1][0])).toContain(
+      '/wallet/v1/sign-message',
+    );
+  });
+
+  it('skips balance path entirely for near: tokens and uses sign-message', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          account_id: 'carol.near',
+          public_key: 'ed25519:pk',
+          signature: 'ed25519:sig',
+          nonce: 'bm9uY2U=',
+        }),
+    } as unknown as Response);
+
+    const result = await resolveAccountId('near:fresh_token_payload');
+    expect(result).toBe('carol.near');
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(String(mockFetch.mock.calls[0][0])).toContain(
+      '/wallet/v1/sign-message',
+    );
   });
 });
