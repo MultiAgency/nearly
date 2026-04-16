@@ -155,19 +155,17 @@ export function validateImageUrl(url: string): NearlyError | null {
 }
 
 /**
- * Normalize + validate a tag list. Returns `{validated}` on success with
- * lowercase-deduped order preserved, or `{error}` on the first failure.
- * Matches the frontend's `validateTags` wire shape exactly so round-trip
+ * Matches the frontend's `validateTags` wire shape exactly — round-trip
  * tag storage is identical whether written via proxy or SDK.
  */
 export function validateTags(
   tags: readonly string[],
 ):
   | { validated: string[]; error: null }
-  | { validated: null; error: NearlyError } {
+  | { validated: string[]; error: NearlyError } {
   if (tags.length > LIMITS.MAX_TAGS) {
     return {
-      validated: null,
+      validated: [],
       error: validationError('tags', `max ${LIMITS.MAX_TAGS} tags`),
     };
   }
@@ -177,13 +175,13 @@ export function validateTags(
     const t = tag.toLowerCase();
     if (!t) {
       return {
-        validated: null,
+        validated: [],
         error: validationError('tags', 'tag must not be empty'),
       };
     }
     if (t.length > LIMITS.MAX_TAG_LEN) {
       return {
-        validated: null,
+        validated: [],
         error: validationError(
           'tags',
           `tag must be at most ${LIMITS.MAX_TAG_LEN} characters`,
@@ -192,7 +190,7 @@ export function validateTags(
     }
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(t)) {
       return {
-        validated: null,
+        validated: [],
         error: validationError(
           'tags',
           'tags must be lowercase alphanumeric with interior hyphens (no leading or trailing hyphens)',
@@ -257,29 +255,8 @@ export function validateCapabilities(caps: unknown): NearlyError | null {
 }
 
 /**
- * Validate a sub-agent `seed` string for `NearlyClient.deriveSubAgent`.
- * OutLayer's only documented constraint is "seed must not be empty" (see
- * the error table in `.agents/skills/agent-custody/SKILL.md`). We also
- * cap length at `LIMITS.SEED_MAX` as a caller-sanity guard — this is
- * *not* an OutLayer rule and can be relaxed. No other constraints:
- * seeds flow through as JSON string field values, not as FastData keys.
- */
-export function validateSeed(seed: string): NearlyError | null {
-  if (seed.length === 0) {
-    return validationError('seed', 'must not be empty');
-  }
-  if (seed.length > LIMITS.SEED_MAX) {
-    return validationError('seed', `max ${LIMITS.SEED_MAX} characters`);
-  }
-  return null;
-}
-
-/**
- * Validate a FastData KV `key_suffix` under a fixed `key_prefix`. The
- * composed FastData key is `key_prefix + key_suffix`; this enforces
- * non-empty, no leading slash, unicode-safe, no null bytes, and the
- * 1024-byte full-key limit. Generic — any handler composing a FastData
- * key from a convention prefix plus a caller-supplied tail uses this.
+ * Generic — any handler composing a FastData key from a convention
+ * prefix plus a caller-supplied tail uses this.
  */
 export function validateKeySuffix(
   keySuffix: string,

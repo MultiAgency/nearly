@@ -6,47 +6,19 @@ import {
   buildUnendorse,
   buildUnfollow,
   buildUpdateMe,
-  submit,
-} from '../src/mutations';
-import { defaultRateLimiter, noopRateLimiter } from '../src/rateLimit';
-import type { FetchLike } from '../src/read';
+} from '../src/social';
 import type { Agent } from '../src/types';
-import type { WalletClient } from '../src/wallet';
 import { aliceProfileBlob } from './fixtures/entries';
 
 function aliceAgent(overrides: Partial<Agent> = {}): Agent {
   return { ...aliceProfileBlob, ...overrides };
 }
 
-function mockWallet(fetch: FetchLike): WalletClient {
-  return {
-    outlayerUrl: 'https://outlayer.example',
-    namespace: 'ns.near',
-    walletKey: 'wk_test',
-    fetch,
-    timeoutMs: 5000,
-    wasmOwner: 'hack.near',
-    wasmProject: 'nearly',
-  };
-}
-
-function okFetch(): {
-  fetch: FetchLike;
-  calls: { url: string; init?: RequestInit }[];
-} {
-  const calls: { url: string; init?: RequestInit }[] = [];
-  const fetch: FetchLike = async (url, init) => {
-    calls.push({ url, init });
-    return new Response('{}', { status: 200 });
-  };
-  return { fetch, calls };
-}
-
 describe('buildHeartbeat', () => {
   it('preserves caller content fields and emits tag/cap indexes', () => {
     const before = aliceAgent({ last_active: 1 });
     const m = buildHeartbeat('alice.near', before);
-    expect(m.action).toBe('heartbeat');
+    expect(m.action).toBe('social.heartbeat');
     expect(m.rateLimitKey).toBe('alice.near');
     const profile = m.entries.profile as Record<string, unknown>;
     expect(profile.name).toBe('Alice');
@@ -103,7 +75,7 @@ describe('buildHeartbeat', () => {
 describe('buildFollow', () => {
   it('produces a single graph/follow entry with reason but no at field', () => {
     const m = buildFollow('alice.near', 'bob.near', { reason: 'great rust' });
-    expect(m.action).toBe('follow');
+    expect(m.action).toBe('social.follow');
     expect(m.rateLimitKey).toBe('alice.near');
     const entry = m.entries['graph/follow/bob.near'] as Record<string, unknown>;
     expect(entry.reason).toBe('great rust');
@@ -146,7 +118,7 @@ describe('buildUpdateMe', () => {
       description: 'updated bio',
       tags: ['rust', 'security'],
     });
-    expect(m.action).toBe('update_me');
+    expect(m.action).toBe('social.update_me');
     expect(m.rateLimitKey).toBe('alice.near');
     const profile = m.entries.profile as Record<string, unknown>;
     expect(profile.description).toBe('updated bio');
@@ -238,7 +210,7 @@ describe('buildEndorse', () => {
       reason: 'shipped a good PR',
       contentHash: 'sha256:abc',
     });
-    expect(m.action).toBe('endorse');
+    expect(m.action).toBe('social.endorse');
     expect(m.rateLimitKey).toBe('alice.near');
     const a = m.entries['endorsing/bob.near/tags/rust'] as Record<
       string,
@@ -324,7 +296,7 @@ describe('buildUnendorse', () => {
       'tags/rust',
       'skills/audit',
     ]);
-    expect(m.action).toBe('unendorse');
+    expect(m.action).toBe('social.unendorse');
     expect(m.entries['endorsing/bob.near/tags/rust']).toBeNull();
     expect(m.entries['endorsing/bob.near/skills/audit']).toBeNull();
   });
@@ -345,7 +317,7 @@ describe('buildUnendorse', () => {
 describe('buildUnfollow', () => {
   it('emits a null-write at graph/follow/{target}', () => {
     const m = buildUnfollow('alice.near', 'bob.near');
-    expect(m.action).toBe('unfollow');
+    expect(m.action).toBe('social.unfollow');
     expect(m.rateLimitKey).toBe('alice.near');
     expect(m.entries['graph/follow/bob.near']).toBeNull();
     expect(Object.keys(m.entries)).toHaveLength(1);
@@ -371,7 +343,7 @@ describe('buildDelistMe', () => {
       ['graph/follow/bob.near', 'graph/follow/carol.near'],
       ['endorsing/bob.near/tags/rust'],
     );
-    expect(m.action).toBe('delist_me');
+    expect(m.action).toBe('social.delist_me');
     expect(m.rateLimitKey).toBe('alice.near');
     expect(m.entries.profile).toBeNull();
     expect(m.entries['tag/rust']).toBeNull();
@@ -399,68 +371,5 @@ describe('buildDelistMe', () => {
     expect(() =>
       buildDelistMe(aliceAgent(), [], ['graph/follow/bob.near']),
     ).toThrow(/endorsing/);
-  });
-});
-
-describe('submit funnel', () => {
-  it('calls wallet /call and records rate-limit usage', async () => {
-    const { fetch, calls } = okFetch();
-    const wallet = mockWallet(fetch);
-    const rl = defaultRateLimiter();
-    const m = buildFollow('alice.near', 'bob.near');
-    await submit({ wallet, rateLimiter: rl }, m);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.url).toBe('https://outlayer.example/wallet/v1/call');
-    const body = JSON.parse(calls[0]!.init!.body as string);
-    expect(body.receiver_id).toBe('ns.near');
-    expect(body.method_name).toBe('__fastdata_kv');
-    expect(body.args['graph/follow/bob.near']).toBeTruthy();
-  });
-
-  it('throws RATE_LIMITED when limiter rejects, without calling wallet', async () => {
-    const { fetch, calls } = okFetch();
-    const wallet = mockWallet(fetch);
-    const rl = defaultRateLimiter();
-    const m = buildFollow('alice.near', 'bob.near');
-    // Saturate: follow limit is 10/60s
-    for (let i = 0; i < 10; i++) rl.record('follow', 'alice.near');
-    await expect(submit({ wallet, rateLimiter: rl }, m)).rejects.toMatchObject({
-      code: 'RATE_LIMITED',
-    });
-    expect(calls).toHaveLength(0);
-  });
-
-  it('throws AUTH on 401 from wallet', async () => {
-    const fetch: FetchLike = async () => new Response(null, { status: 401 });
-    const wallet = mockWallet(fetch);
-    const m = buildFollow('alice.near', 'bob.near');
-    await expect(
-      submit({ wallet, rateLimiter: noopRateLimiter() }, m),
-    ).rejects.toMatchObject({ code: 'AUTH_FAILED' });
-  });
-
-  it('throws INSUFFICIENT_BALANCE on 502 (OutLayer Cloudflare upstream)', async () => {
-    const fetch: FetchLike = async () => new Response(null, { status: 502 });
-    const wallet = mockWallet(fetch);
-    const m = buildFollow('alice.near', 'bob.near');
-    await expect(
-      submit({ wallet, rateLimiter: noopRateLimiter() }, m),
-    ).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
-  });
-
-  it('never includes wk_ key in error messages', async () => {
-    const fetch: FetchLike = async () =>
-      new Response('some detail with wk_secret123 leaked', { status: 500 });
-    const wallet = mockWallet(fetch);
-    const m = buildFollow('alice.near', 'bob.near');
-    try {
-      await submit({ wallet, rateLimiter: noopRateLimiter() }, m);
-      fail('expected throw');
-    } catch (err) {
-      const message = (err as Error).message;
-      // The error carries the upstream body snippet — assert it did NOT smuggle
-      // the caller's wk_ (which is in the Authorization header, not the body).
-      expect(message).not.toMatch(/wk_test/);
-    }
   });
 });

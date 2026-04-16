@@ -29,26 +29,22 @@ export const LIMITS = {
   FASTDATA_MAX_KEY_BYTES: 1024,
   /** Max key_suffixes per endorse/unendorse call. */
   MAX_KEY_SUFFIXES: 20,
-  /**
-   * Max length for a sub-agent `seed` string passed to
-   * `NearlyClient.deriveSubAgent`. OutLayer does not document a seed
-   * length limit — 256 is a caller-sanity cap to catch "whole JSON blob
-   * passed as seed" bugs. Can be relaxed if a real use case hits it.
-   */
-  SEED_MAX: 256,
 } as const;
 
 export const RATE_LIMITS: Record<
   string,
   { limit: number; windowSecs: number }
 > = {
-  follow: { limit: 10, windowSecs: 60 },
-  unfollow: { limit: 10, windowSecs: 60 },
-  heartbeat: { limit: 5, windowSecs: 60 },
-  update_me: { limit: 10, windowSecs: 60 },
-  endorse: { limit: 20, windowSecs: 60 },
-  unendorse: { limit: 20, windowSecs: 60 },
-  delist_me: { limit: 1, windowSecs: 300 },
+  'social.follow': { limit: 10, windowSecs: 60 },
+  'social.unfollow': { limit: 10, windowSecs: 60 },
+  'social.heartbeat': { limit: 5, windowSecs: 60 },
+  'social.update_me': { limit: 10, windowSecs: 60 },
+  'social.endorse': { limit: 20, windowSecs: 60 },
+  'social.unendorse': { limit: 20, windowSecs: 60 },
+  'social.delist_me': { limit: 1, windowSecs: 300 },
+  // `kv.put` / `kv.delete` are intentionally absent — the primitive
+  // layer leaves rate-limit policy to the caller, and unknown actions
+  // fall through to an unbounded bucket in `defaultRateLimiter`.
 };
 
 export const WRITE_GAS = '30000000000000';

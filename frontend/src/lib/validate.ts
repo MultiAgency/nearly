@@ -2,15 +2,8 @@
  * Proxy-side input validation — source of truth for all mutation input rules.
  */
 
+import { LIMITS as SDK_LIMITS } from '@nearly/sdk';
 import { LIMITS } from './constants';
-
-const MAX_TAGS = 10;
-const MAX_TAG_LEN = 30;
-const MAX_REASON_LEN = 280;
-const MAX_CAPABILITY_DEPTH = 4;
-
-/** FastData KV enforces 1024 bytes for the full key, including prefix. */
-const FASTDATA_MAX_KEY_BYTES = 1024;
 
 export type ValidationError = { code: string; message: string };
 
@@ -174,8 +167,8 @@ export function validateTags(tags: string[]): {
   validated: string[];
   error: ValidationError | null;
 } {
-  if (tags.length > MAX_TAGS) {
-    return { validated: [], error: err(`Maximum ${MAX_TAGS} tags`) };
+  if (tags.length > SDK_LIMITS.MAX_TAGS) {
+    return { validated: [], error: err(`Maximum ${SDK_LIMITS.MAX_TAGS} tags`) };
   }
   const seen = new Set<string>();
   const validated: string[] = [];
@@ -184,10 +177,10 @@ export function validateTags(tags: string[]): {
     if (!t) {
       return { validated: [], error: err('Tag must not be empty') };
     }
-    if (t.length > MAX_TAG_LEN) {
+    if (t.length > SDK_LIMITS.MAX_TAG_LEN) {
       return {
         validated: [],
-        error: err(`Tag must be at most ${MAX_TAG_LEN} characters`),
+        error: err(`Tag must be at most ${SDK_LIMITS.MAX_TAG_LEN} characters`),
       };
     }
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(t)) {
@@ -207,15 +200,9 @@ export function validateTags(tags: string[]): {
 }
 
 /**
- * Validate a FastData KV `key_suffix` — the variable tail that the caller
- * supplies under a fixed `key_prefix`. The composed FastData key is
- * `key_prefix + key_suffix`. Validates the suffix shape (non-empty, no null
- * bytes, no leading slash, unicode-safe) and enforces FastData's per-key
- * byte limit on the full composed key.
- *
- * Generic — not endorsement-specific. Any handler that composes a FastData
- * key from a fixed convention prefix and a caller-supplied tail can use
- * this by passing its own `key_prefix`.
+ * Generic — not endorsement-specific. Any handler composing a FastData
+ * key from a fixed convention prefix + caller-supplied tail can use
+ * this by passing its own `keyPrefix`.
  */
 export function validateKeySuffix(
   keySuffix: string,
@@ -227,17 +214,17 @@ export function validateKeySuffix(
   if (u) return u;
   const fullKey = `${keyPrefix}${keySuffix}`;
   if (fullKey.includes('\0')) return err('key must not contain null bytes');
-  if (Buffer.byteLength(fullKey, 'utf8') > FASTDATA_MAX_KEY_BYTES) {
+  if (Buffer.byteLength(fullKey, 'utf8') > SDK_LIMITS.FASTDATA_MAX_KEY_BYTES) {
     return err(
-      `key_prefix + key_suffix exceeds ${FASTDATA_MAX_KEY_BYTES}-byte limit`,
+      `key_prefix + key_suffix exceeds ${SDK_LIMITS.FASTDATA_MAX_KEY_BYTES}-byte limit`,
     );
   }
   return null;
 }
 
 export function validateReason(reason: string): ValidationError | null {
-  if (reason.length > MAX_REASON_LEN) {
-    return err(`Reason max ${MAX_REASON_LEN} bytes`);
+  if (reason.length > SDK_LIMITS.REASON_MAX) {
+    return err(`Reason max ${SDK_LIMITS.REASON_MAX} bytes`);
   }
   return rejectUnsafeUnicode(reason, true);
 }
@@ -250,9 +237,9 @@ function validateCapabilitiesContent(
   val: unknown,
   depth: number,
 ): ValidationError | null {
-  if (depth > MAX_CAPABILITY_DEPTH) {
+  if (depth > SDK_LIMITS.MAX_CAPABILITY_DEPTH) {
     return err(
-      `Capabilities exceed maximum nesting depth of ${MAX_CAPABILITY_DEPTH}`,
+      `Capabilities exceed maximum nesting depth of ${SDK_LIMITS.MAX_CAPABILITY_DEPTH}`,
     );
   }
   if (typeof val === 'string') {

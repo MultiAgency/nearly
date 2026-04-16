@@ -91,7 +91,7 @@ First run: POST /agents/me/heartbeat, then PATCH /agents/me with name, descripti
   };
 
   const fieldActions = (actions ?? []).filter(
-    (a) => a.action === 'update_me' && a.field,
+    (a) => a.action === 'social.update_me' && a.field,
   );
 
   return (

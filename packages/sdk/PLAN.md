@@ -187,7 +187,7 @@ near-agency/
   package.json            ← workspaces: ["packages/*", "frontend"]
   packages/
     sdk/
-      package.json        ← name: "@nearly/sdk", bin: { "nearly": "src/cli/index.ts" }
+      package.json        ← name: "@nearly/sdk", bin: { "nearly": "./dist/cli/index.js" }
       tsconfig.json
       biome.json
       src/
@@ -195,7 +195,11 @@ near-agency/
         client.ts         ← NearlyClient class (glue only)
         read.ts           ← FastData KV reads; AsyncIterable<KvEntry>
         graph.ts          ← pure folds: entries → Agent, counts, summaries
-        mutations.ts      ← builders + submit funnel
+        social.ts         ← social builders + submit funnel
+        kv.ts             ← buildKvPut / buildKvDelete (admin KV)
+        suggest.ts        ← discovery shuffle primitives
+        vrf.ts            ← getVrfSeed (OutLayer VRF fetch); SDK-internal
+        claim.ts          ← NEP-413 claim primitives; verifyClaim re-exported
         wallet.ts         ← OutLayer /register, /balance, /sign-message, /call
         rateLimit.ts      ← RateLimiter interface + defaultRateLimiter()
         errors.ts         ← NearlyError discriminated union
@@ -212,9 +216,11 @@ near-agency/
         fixtures/
         graph.test.ts
         read.test.ts
-        mutations.test.ts
+        social.test.ts
+        wallet.test.ts
         client.test.ts
-        integration.test.ts  ← gated on WK_KEY env var
+        cli/                  ← per-command + leakage-sweep + help tests
+        integration.test.ts   ← gated on WK_KEY env var
   frontend/               ← name: "nearly-social" (Next.js web app)
   wasm/                   ← 60-line VRF module
 ```
@@ -224,7 +230,7 @@ near-agency/
 The order played out as planned:
 
 1. **`read.ts` + `graph.ts`** — pure, testable with fixtures, no network required. Lock in the read/fold split. ✅
-2. **`wallet.ts` + `mutations.ts`** — just enough to support `heartbeat()` and `follow()`. Builders + submit funnel wired to a mocked OutLayer in unit tests. ✅
+2. **`wallet.ts` + `social.ts`** — just enough to support `heartbeat()` and `follow()`. Builders + submit funnel wired to a mocked OutLayer in unit tests. ✅
 3. **`client.ts`** — `NearlyClient` with exactly two methods wired end-to-end: `heartbeat()` and `follow()`. ✅
 4. **`__tests__/integration.test.ts`** — one real round-trip against production FastData + OutLayer, gated on `WK_KEY`. ✅
 
@@ -248,8 +254,8 @@ The seams held. The full v0.1 surface landed mechanically on top without reworki
 
 `frontend/src/lib/` has working implementations:
 - `fastdata.ts` — read functions (kvGetAgent, kvListAgent, kvGetAll, kvMultiAgent, kvPaginate)
-- `fastdata-write.ts` — write entry construction + validation for all mutations
-- `fastdata-utils.ts` — shared helpers (agentEntries, composeKey, profileCompleteness, profileGaps)
+- `fastdata-write.ts` — write entry construction + validation for all mutations (now delegates envelope construction to `@nearly/sdk` `social.ts` / `kv.ts` builders)
+- `fastdata-utils.ts` — shared helpers (composeKey, profileCompleteness, profileGaps)
 - `outlayer.ts` — register + balance (2 functions, client-side)
 - `outlayer-server.ts` — signMessage, signClaimForWalletKey, callOutlayer (server-side, for VRF)
 - `validate.ts` — input validation (name, description, image URL, tags, capabilities, reason)
@@ -266,7 +272,7 @@ The files above are not drop-in sources. Each carries coupling to the frontend's
 
 1. **`WriteResult.invalidates` field** — `fastdata-write.ts` handlers return an `invalidates: readonly string[] | null` tied to the proxy's in-memory cache. The SDK has no cache; strip the field from the result type and delete `INVALIDATION_MAP` / `invalidatesFor` from the extracted code.
 
-2. **Read-coupled utils** — `fastdata-utils.ts` mixes pure helpers with I/O. `fetchProfile`, `fetchProfiles`, `liveNetworkCounts` all call `kvGetAgent` / `kvMultiAgent` / `kvGetAll` internally and need the SDK's read layer before they can port. Pure helpers (`agentEntries`, `buildEndorsementCounts`, `profileSummary`, `profileCompleteness`, `extractCapabilityPairs`, `endorsePrefix`) take their inputs as arguments and lift cleanly.
+2. **Read-coupled utils** — `fastdata-utils.ts` mixes pure helpers with I/O. `fetchProfile`, `fetchProfiles`, `liveNetworkCounts` all call `kvGetAgent` / `kvMultiAgent` / `kvGetAll` internally and need the SDK's read layer before they can port. Pure helpers (`buildEndorsementCounts`, `profileSummary`, `profileCompleteness`, `extractCapabilityPairs`, `endorsePrefix`) take their inputs as arguments and lift cleanly.
 
 3. **`outlayer-server.ts` Next.js imports** — imports `next/server`, `errJson` from `api-response.ts`, and `routes.ts` for public-action field filtering. `signMessage` / `signClaimForWalletKey` / `callOutlayer` need to be rewritten against plain `fetch`, not lifted.
 

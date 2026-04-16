@@ -36,7 +36,7 @@ export default defineConfig({
     },
     {
       name: 'ci-smoke',
-      testMatch: 'ci-smoke.spec.ts',
+      testMatch: ['ci-smoke.spec.ts', 'verify-claim.spec.ts'],
       use: apiSmokeUse,
     },
   ],

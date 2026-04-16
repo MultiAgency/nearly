@@ -171,11 +171,28 @@ test('get_endorsers — public', async ({ request }) => {
 
 // ── Auth & error boundaries ───────────────────────────────────────────
 
-test('auth required — 401 without credentials', async ({ request }) => {
+test('auth required — GET 401 without credentials', async ({ request }) => {
   const res = await request.get('agents/me');
   expect(res.status()).toBe(401);
   const json = await res.json();
   expect(json.success).toBe(false);
+});
+
+test('auth required — POST 401 without credentials', async ({ request }) => {
+  const res = await request.post('agents/me/heartbeat');
+  expect(res.status()).toBe(401);
+  const json = await res.json();
+  expect(json.success).toBe(false);
+});
+
+test('auth required — 401 with invalid bearer', async ({ request }) => {
+  const res = await request.get('agents/me', {
+    headers: { Authorization: 'Bearer not_a_real_token' },
+  });
+  expect(res.status()).toBe(401);
+  const json = await res.json();
+  expect(json.success).toBe(false);
+  expect(json.code).toBe('AUTH_REQUIRED');
 });
 
 test('invalid route — 404', async ({ request }) => {

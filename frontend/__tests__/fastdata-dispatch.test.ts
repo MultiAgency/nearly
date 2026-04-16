@@ -1,29 +1,31 @@
 import { clearCache } from '@/lib/cache';
 import * as fastdata from '@/lib/fastdata';
 import { dispatchFastData } from '@/lib/fastdata-dispatch';
-import {
-  agentEntries,
-  profileCompleteness,
-  profileGaps,
-} from '@/lib/fastdata-utils';
-import type { Agent } from '@/types';
-import { AGENT_ALICE } from './fixtures';
+import { profileCompleteness, profileGaps } from '@/lib/fastdata-utils';
+
+const AGENT_ALICE = {
+  name: null,
+  description: 'Test agent Alice',
+  image: null,
+  tags: ['ai', 'defi'],
+  capabilities: {},
+  account_id: 'alice.near',
+  follower_count: 5,
+  following_count: 3,
+  endorsements: {},
+  created_at: 1700000000,
+  last_active: 1700001000,
+};
 
 jest.mock('@/lib/constants', () => ({
   ...jest.requireActual('@/lib/constants'),
   OUTLAYER_ADMIN_ACCOUNT: 'admin.near',
 }));
-jest.mock('@/lib/fastdata');
 jest.mock('@/lib/outlayer-server', () => ({
-  getOperatorClaimsWriterAccount: jest.fn(),
+  resolveAdminWriterAccount: jest.fn().mockResolvedValue('admin.near'),
 }));
+jest.mock('@/lib/fastdata');
 
-import * as outlayerServer from '@/lib/outlayer-server';
-
-const mockGetOperatorClaimsWriterAccount =
-  outlayerServer.getOperatorClaimsWriterAccount as jest.MockedFunction<
-    typeof outlayerServer.getOperatorClaimsWriterAccount
-  >;
 const mockKvGetAgent = fastdata.kvGetAgent as jest.MockedFunction<
   typeof fastdata.kvGetAgent
 >;
@@ -52,9 +54,6 @@ beforeEach(() => {
   mockKvListAll.mockResolvedValue([]);
   mockKvListAgent.mockResolvedValue([]);
   mockKvMultiAgent.mockResolvedValue([]);
-  // Default: operator-claims writer is unconfigured. Tests that exercise
-  // the happy path override this to return a concrete writer account.
-  mockGetOperatorClaimsWriterAccount.mockResolvedValue('');
 });
 
 // Block timestamp in nanoseconds (the units FastData uses). This fixed value
@@ -93,17 +92,9 @@ function expectError(result: unknown): string {
 }
 
 describe('profileCompleteness', () => {
-  // Per-field scoring (see fastdata-utils.ts):
-  //   name         binary, 10 points
-  //   description  binary, 20 points
-  //   image        binary, 20 points
-  //   tags         continuous, 2 points per tag up to 10 (cap 20)
-  //   capabilities continuous, 10 points per leaf pair up to 3 (cap 30)
-  // A score of 100 means "richly populated" (name, description, image, ≥10
-  // tags, ≥3 capability pairs), not just "minimally filled." Fulfilling an
-  // emitted action moves the score by at least 2 (tags) or 10 (caps, name)
-  // or 20 (description, image) — agents use the score as a progress signal
-  // across heartbeats, and a rising score means the human engaged.
+  // 100 is "richly populated" (every field, ≥10 tags, ≥3 capability
+  // pairs), not "minimally filled" — agents read the score as a
+  // progress signal across heartbeats.
   const COMPLETE_AGENT = {
     name: 'Alice',
     description: 'A description longer than 10 chars',
@@ -203,56 +194,6 @@ describe('profileCompleteness', () => {
         AGENT_ALICE as Parameters<typeof profileCompleteness>[0],
       ),
     ).toBe(24);
-  });
-});
-
-describe('agentEntries', () => {
-  // Load-bearing invariant: stored profile is canonical self-authored state.
-  // Counts are derived at read time via liveNetworkCounts / withLiveCounts
-  // and never written to FastData. Regressing this pollutes storage
-  // persistently — a downstream "list endpoints omit counts" test would
-  // catch nothing if storage already holds stale counts. See the project
-  // plan's "Storage invariant enforced" entry and the Do-not rule against
-  // re-introducing bulk count enrichment.
-  it('strips derived count and endorsement fields before write', () => {
-    const agent: Agent = {
-      account_id: 'alice.near',
-      name: 'Alice',
-      description: 'Test agent with a sufficient description',
-      image: null,
-      tags: ['ai'],
-      capabilities: { skills: ['testing'] },
-      created_at: 1700000000,
-      last_active: 1700001000,
-      follower_count: 42,
-      following_count: 7,
-      endorsement_count: 3,
-      endorsements: { 'skills/testing': 2 },
-    };
-
-    const entries = agentEntries(agent);
-    const stored = entries.profile as Record<string, unknown>;
-
-    expect(stored).not.toHaveProperty('follower_count');
-    expect(stored).not.toHaveProperty('following_count');
-    expect(stored).not.toHaveProperty('endorsement_count');
-    expect(stored).not.toHaveProperty('endorsements');
-
-    // Canonical fields are preserved.
-    expect(stored.account_id).toBe('alice.near');
-    expect(stored.name).toBe('Alice');
-    expect(stored.description).toBe('Test agent with a sufficient description');
-    expect(stored.tags).toEqual(['ai']);
-    expect(stored.capabilities).toEqual({ skills: ['testing'] });
-    // Time fields are read-derived from FastData block_timestamp and
-    // must not leak into the stored blob — caller-asserted values would
-    // give agents a way to appear eternally fresh in sort=active.
-    expect(stored).not.toHaveProperty('created_at');
-    expect(stored).not.toHaveProperty('last_active');
-
-    // Tag and capability index keys are still written alongside profile.
-    expect(entries['tag/ai']).toBe(true);
-    expect(entries['cap/skills/testing']).toBe(true);
   });
 });
 
@@ -521,7 +462,7 @@ describe('dispatchFastData', () => {
       // the FIRST profile write's KvEntry per agent. The block_timestamp
       // on each entry determines ordering — NOT any caller-asserted
       // `created_at` field on the profile blob (those are stripped by
-      // applyTrustBoundary). To prove the test isn't accidentally
+      // `foldProfile`). To prove the test isn't accidentally
       // passing through the bug we just fixed, the blob carries an
       // ANTI-CORRELATED `created_at` (alice's blob value is bigger than
       // bob's) but the history entries set bob's first write later than
@@ -651,6 +592,271 @@ describe('dispatchFastData', () => {
       expect(data.account_id).toBe('alice.near');
       expect((data.followers as unknown[]).length).toBe(2);
       expect(mockKvGetAll).toHaveBeenCalledWith('graph/follow/alice.near');
+    });
+  });
+
+  describe('endorsing (handleGetEndorsing)', () => {
+    const CALLER = 'alice.near';
+
+    /**
+     * Construct an `endorsing/{target}/{key_suffix}` entry written by
+     * the CALLER (predecessor = alice.near). The shared `entry()`
+     * helper hardcodes block_height to 100; for ordering tests that
+     * need distinct heights, callers can override via Object.assign.
+     */
+    function endorsingEntry(
+      target: string,
+      keySuffix: string,
+      value: Record<string, unknown> = {},
+    ): fastdata.KvEntry {
+      return entry(CALLER, `endorsing/${target}/${keySuffix}`, value);
+    }
+
+    type EndorsingEntry = {
+      key_suffix: string;
+      reason?: string;
+      content_hash?: string;
+      at: number;
+      at_height: number;
+    };
+    type EndorsingGroup = {
+      target: {
+        account_id: string;
+        name: string | null;
+        description: string;
+        image: string | null;
+      };
+      entries: EndorsingEntry[];
+    };
+    type EndorsingData = {
+      account_id: string;
+      endorsing: Record<string, EndorsingGroup>;
+    };
+
+    it('returns empty envelope when the caller has written no endorsements', async () => {
+      mockKvListAgent.mockResolvedValue([]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      expect(data.account_id).toBe(CALLER);
+      expect(data.endorsing).toEqual({});
+      // Scan is addressed to the caller's own predecessor namespace.
+      expect(mockKvListAgent).toHaveBeenCalledWith(CALLER, 'endorsing/');
+    });
+
+    it('surfaces a single endorsement with one suffix', async () => {
+      mockKvListAgent.mockResolvedValue([
+        endorsingEntry('bob.near', 'skills/rust'),
+      ]);
+      mockKvMultiAgent.mockResolvedValue([
+        profileEntry('bob.near', {
+          ...AGENT_ALICE,
+          account_id: 'bob.near',
+          name: 'Bob',
+          description: 'agent bob',
+        }),
+      ]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      expect(Object.keys(data.endorsing)).toEqual(['bob.near']);
+      const group = data.endorsing['bob.near'];
+      expect(group.target.account_id).toBe('bob.near');
+      expect(group.target.name).toBe('Bob');
+      expect(group.target.description).toBe('agent bob');
+      expect(group.entries).toHaveLength(1);
+      expect(group.entries[0].key_suffix).toBe('skills/rust');
+    });
+
+    it('groups multiple suffixes on the same target into one entry list', async () => {
+      mockKvListAgent.mockResolvedValue([
+        endorsingEntry('bob.near', 'skills/rust'),
+        endorsingEntry('bob.near', 'skills/typescript'),
+        endorsingEntry('bob.near', 'task_completion/job_42'),
+      ]);
+      mockKvMultiAgent.mockResolvedValue([
+        profileEntry('bob.near', { ...AGENT_ALICE, account_id: 'bob.near' }),
+      ]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      expect(Object.keys(data.endorsing)).toEqual(['bob.near']);
+      const suffixes = data.endorsing['bob.near'].entries.map(
+        (e) => e.key_suffix,
+      );
+      expect(suffixes).toEqual([
+        'skills/rust',
+        'skills/typescript',
+        'task_completion/job_42',
+      ]);
+    });
+
+    it('groups endorsements across multiple targets independently', async () => {
+      mockKvListAgent.mockResolvedValue([
+        endorsingEntry('bob.near', 'skills/rust'),
+        endorsingEntry('carol.near', 'skills/audit'),
+        endorsingEntry('bob.near', 'skills/typescript'),
+        endorsingEntry('dave.near', 'verified/human'),
+      ]);
+      mockKvMultiAgent.mockResolvedValue([
+        profileEntry('bob.near', { ...AGENT_ALICE, account_id: 'bob.near' }),
+        profileEntry('carol.near', {
+          ...AGENT_ALICE,
+          account_id: 'carol.near',
+        }),
+        profileEntry('dave.near', { ...AGENT_ALICE, account_id: 'dave.near' }),
+      ]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      const targetIds = Object.keys(data.endorsing).sort();
+      expect(targetIds).toEqual(['bob.near', 'carol.near', 'dave.near']);
+      expect(
+        data.endorsing['bob.near'].entries.map((e) => e.key_suffix).sort(),
+      ).toEqual(['skills/rust', 'skills/typescript']);
+      expect(data.endorsing['carol.near'].entries).toHaveLength(1);
+      expect(data.endorsing['dave.near'].entries).toHaveLength(1);
+    });
+
+    it('surfaces targets with no profile using a null-fielded summary', async () => {
+      mockKvListAgent.mockResolvedValue([
+        endorsingEntry('ghost.near', 'skills/rust'),
+      ]);
+      // No profile returned — ghost.near has never heartbeated.
+      mockKvMultiAgent.mockResolvedValue([]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      const group = data.endorsing['ghost.near'];
+      expect(group.target).toEqual({
+        account_id: 'ghost.near',
+        name: null,
+        description: '',
+        image: null,
+      });
+      expect(group.entries).toHaveLength(1);
+      expect(group.entries[0].key_suffix).toBe('skills/rust');
+    });
+
+    it('round-trips reason and content_hash from the stored value blob', async () => {
+      mockKvListAgent.mockResolvedValue([
+        endorsingEntry('bob.near', 'skills/rust', {
+          reason: 'solid crate author',
+          content_hash: 'sha256:abcdef',
+        }),
+        endorsingEntry('bob.near', 'skills/typescript', {
+          reason: 'clean typing',
+        }),
+        endorsingEntry('bob.near', 'skills/audit'), // no reason / no hash
+      ]);
+      mockKvMultiAgent.mockResolvedValue([
+        profileEntry('bob.near', { ...AGENT_ALICE, account_id: 'bob.near' }),
+      ]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      const entries = data.endorsing['bob.near'].entries;
+      const rust = entries.find((e) => e.key_suffix === 'skills/rust')!;
+      expect(rust.reason).toBe('solid crate author');
+      expect(rust.content_hash).toBe('sha256:abcdef');
+      const ts = entries.find((e) => e.key_suffix === 'skills/typescript')!;
+      expect(ts.reason).toBe('clean typing');
+      expect(ts.content_hash).toBeUndefined();
+      const audit = entries.find((e) => e.key_suffix === 'skills/audit')!;
+      expect(audit.reason).toBeUndefined();
+      expect(audit.content_hash).toBeUndefined();
+    });
+
+    it('preserves scan order for entries inside a single target group', async () => {
+      // `kvListAgent` returns entries in a defined order; the handler
+      // must push them into the per-target entries array in that order
+      // without re-sorting. Order matters for UI rendering and for any
+      // consumer that cares about write sequence within a target.
+      mockKvListAgent.mockResolvedValue([
+        endorsingEntry('bob.near', 'skills/c'),
+        endorsingEntry('bob.near', 'skills/a'),
+        endorsingEntry('bob.near', 'skills/b'),
+      ]);
+      mockKvMultiAgent.mockResolvedValue([
+        profileEntry('bob.near', { ...AGENT_ALICE, account_id: 'bob.near' }),
+      ]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      expect(
+        data.endorsing['bob.near'].entries.map((e) => e.key_suffix),
+      ).toEqual(['skills/c', 'skills/a', 'skills/b']);
+    });
+
+    it('derives at and at_height from the entry block metadata, not the value blob', async () => {
+      // Caller-asserted `at` / `at_height` in the value blob must be
+      // ignored — block-authoritative times come from entry.block_*.
+      // Same trust-boundary rule as `handleGetEndorsers`.
+      mockKvListAgent.mockResolvedValue([
+        endorsingEntry('bob.near', 'skills/rust', {
+          // Lies the endorser might try to plant.
+          at: 999999,
+          at_height: 999999,
+        }),
+      ]);
+      mockKvMultiAgent.mockResolvedValue([
+        profileEntry('bob.near', { ...AGENT_ALICE, account_id: 'bob.near' }),
+      ]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      const edge = data.endorsing['bob.near'].entries[0];
+      // The fixture `entry()` helper sets block_height: 100 and
+      // block_timestamp: FIXTURE_BLOCK_TS_NS. Validate both fields
+      // come from there, not from the caller-asserted value blob.
+      expect(typeof edge.at).toBe('number');
+      expect(typeof edge.at_height).toBe('number');
+      expect(edge.at_height).toBe(100);
+      expect(edge.at).toBe(Math.floor(FIXTURE_BLOCK_TS_NS / 1e9));
+      expect(edge.at).not.toBe(999999);
+      expect(edge.at_height).not.toBe(999999);
+    });
+
+    it('drops entries with an empty key_suffix', async () => {
+      // A bare `endorsing/bob.near/` with no suffix is garbage — the
+      // server should not surface it. Same rule as `handleGetEndorsers`.
+      mockKvListAgent.mockResolvedValue([
+        entry(CALLER, 'endorsing/bob.near/', {}),
+        endorsingEntry('bob.near', 'skills/rust'),
+      ]);
+      mockKvMultiAgent.mockResolvedValue([
+        profileEntry('bob.near', { ...AGENT_ALICE, account_id: 'bob.near' }),
+      ]);
+
+      const data = expectData(
+        await dispatchFastData('endorsing', { account_id: CALLER }),
+      ) as EndorsingData;
+
+      const entries = data.endorsing['bob.near'].entries;
+      expect(entries).toHaveLength(1);
+      expect(entries[0].key_suffix).toBe('skills/rust');
+    });
+
+    it('returns an error envelope when account_id is missing from the body', async () => {
+      const err = expectError(await dispatchFastData('endorsing', {}));
+      expect(err).toContain('account_id');
+      expect(mockKvListAgent).not.toHaveBeenCalled();
     });
   });
 
@@ -837,234 +1043,6 @@ describe('dispatchFastData', () => {
         await dispatchFastData('profile', { account_id: 'alice.near' }),
       );
       expect(err).toContain('network error');
-    });
-  });
-
-  describe('agent_claims (handleAgentClaims)', () => {
-    const WRITER = 'nearly-claims-writer.near';
-    const AGENT = 'bob.near';
-
-    /**
-     * Build a single operator-claim KV entry as the writer-account
-     * predecessor. The key encodes both identities; the value carries the
-     * full NEP-413 envelope the handler parses the authoritative operator
-     * identity out of.
-     */
-    function claimEntry(
-      operator: string,
-      agent: string,
-      opts: {
-        reason?: string;
-        malformedMessage?: boolean;
-        missingAccountId?: boolean;
-      } = {},
-    ): fastdata.KvEntry {
-      const inner: Record<string, unknown> = {
-        action: 'claim_operator',
-        domain: 'nearly.social',
-        version: 1,
-        timestamp: 1_700_000_000_000,
-      };
-      if (!opts.missingAccountId) inner.account_id = operator;
-      const message = opts.malformedMessage
-        ? 'not valid json {'
-        : JSON.stringify(inner);
-      return {
-        predecessor_id: WRITER,
-        current_account_id: 'contextual.near',
-        block_height: 500,
-        block_timestamp: FIXTURE_BLOCK_TS_NS,
-        key: `operator/${operator}/${agent}`,
-        value: {
-          message,
-          signature: 'ed25519:sig',
-          public_key: 'ed25519:pk',
-          nonce: 'base64nonce',
-          ...(opts.reason != null && { reason: opts.reason }),
-        },
-      };
-    }
-
-    it('returns empty list when writer account is unconfigured', async () => {
-      // Default: writer returns '' — feature disabled on this deployment.
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as { account_id: string; operators: unknown[] };
-      expect(data.account_id).toBe(AGENT);
-      expect(data.operators).toEqual([]);
-      // Scan should not have run — no point if there's no writer account.
-      expect(mockKvListAgent).not.toHaveBeenCalled();
-    });
-
-    it('returns empty list when no operator entries exist in the namespace', async () => {
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      mockKvListAgent.mockResolvedValue([]);
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as { account_id: string; operators: unknown[] };
-      expect(data.operators).toEqual([]);
-      expect(mockKvListAgent).toHaveBeenCalledWith(WRITER, 'operator/');
-    });
-
-    it('returns empty list when entries exist but none match the target agent', async () => {
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      mockKvListAgent.mockResolvedValue([
-        claimEntry('alice.near', 'carol.near'),
-        claimEntry('dave.near', 'carol.near'),
-      ]);
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as { account_id: string; operators: unknown[] };
-      expect(data.operators).toEqual([]);
-    });
-
-    it('surfaces a single matching operator with envelope fields', async () => {
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      mockKvListAgent.mockResolvedValue([
-        claimEntry('alice.near', AGENT, { reason: 'original human' }),
-      ]);
-      // `fetchProfiles` goes through `kvMultiAgent` — return an alice profile
-      // so the operator entry carries her display fields.
-      mockKvMultiAgent.mockResolvedValue([
-        profileEntry('alice.near', {
-          ...AGENT_ALICE,
-          name: 'Alice',
-          description: 'operator',
-        }),
-      ]);
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as {
-        account_id: string;
-        operators: Array<{
-          account_id: string;
-          name: string | null;
-          description: string;
-          image: string | null;
-          message: string;
-          signature: string;
-          public_key: string;
-          nonce: string;
-          reason?: string;
-          at?: number;
-          at_height?: number;
-        }>;
-      };
-      expect(data.operators).toHaveLength(1);
-      expect(data.operators[0]).toMatchObject({
-        account_id: 'alice.near',
-        name: 'Alice',
-        description: 'operator',
-        signature: 'ed25519:sig',
-        public_key: 'ed25519:pk',
-        nonce: 'base64nonce',
-        reason: 'original human',
-      });
-      // Block-authoritative timestamps, not caller-asserted.
-      expect(data.operators[0].at_height).toBe(500);
-      expect(data.operators[0].at).toBe(Math.floor(FIXTURE_BLOCK_TS_NS / 1e9));
-      // The inner-message JSON round-trips verbatim for independent re-verify.
-      expect(JSON.parse(data.operators[0].message)).toMatchObject({
-        account_id: 'alice.near',
-        action: 'claim_operator',
-      });
-    });
-
-    it('filters entries whose key_suffix only happens to contain the agent id', async () => {
-      // `operator/alice.near/{not-the-agent}` shares the agent-ID substring
-      // but ends with a different slash-bounded tail. Must not match.
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      mockKvListAgent.mockResolvedValue([
-        claimEntry('alice.near', `${AGENT}.extra.near`),
-        claimEntry('dave.near', AGENT),
-      ]);
-      mockKvMultiAgent.mockResolvedValue([
-        profileEntry('dave.near', { ...AGENT_ALICE, name: 'Dave' }),
-      ]);
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as { operators: Array<{ account_id: string }> };
-      expect(data.operators).toHaveLength(1);
-      expect(data.operators[0].account_id).toBe('dave.near');
-    });
-
-    it('pulls the operator identity from the inner message, not the predecessor', async () => {
-      // Every entry under the writer-account namespace carries the same
-      // predecessor_id (the service account). The handler must parse
-      // `message.account_id` to surface the authoritative operator.
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      mockKvListAgent.mockResolvedValue([
-        claimEntry('alice.near', AGENT),
-        claimEntry('dave.near', AGENT),
-      ]);
-      mockKvMultiAgent.mockResolvedValue([
-        profileEntry('alice.near', { ...AGENT_ALICE, name: 'Alice' }),
-        profileEntry('dave.near', { ...AGENT_ALICE, name: 'Dave' }),
-      ]);
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as { operators: Array<{ account_id: string; name: string | null }> };
-      const ids = data.operators.map((o) => o.account_id).sort();
-      expect(ids).toEqual(['alice.near', 'dave.near']);
-      // Neither operator's account_id matches the writer predecessor — the
-      // handler didn't fall back to `predecessor_id` attribution.
-      expect(ids).not.toContain(WRITER);
-    });
-
-    it('drops entries whose NEP-413 message is malformed', async () => {
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      mockKvListAgent.mockResolvedValue([
-        claimEntry('alice.near', AGENT, { malformedMessage: true }),
-        claimEntry('dave.near', AGENT, { missingAccountId: true }),
-        claimEntry('carol.near', AGENT),
-      ]);
-      mockKvMultiAgent.mockResolvedValue([
-        profileEntry('carol.near', { ...AGENT_ALICE, name: 'Carol' }),
-      ]);
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as { operators: Array<{ account_id: string }> };
-      // Only carol.near survives — alice's malformed JSON and dave's
-      // missing inner account_id both get silently dropped.
-      expect(data.operators).toHaveLength(1);
-      expect(data.operators[0].account_id).toBe('carol.near');
-    });
-
-    it('surfaces operators even when their profile blob does not exist yet', async () => {
-      // A named NEAR account can file an operator claim before ever calling
-      // heartbeat — the envelope is the proof, the profile is optional
-      // summary metadata.
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      mockKvListAgent.mockResolvedValue([
-        claimEntry('ghost.near', AGENT, { reason: 'never joined the index' }),
-      ]);
-      // fetchProfiles returns empty — no profile for ghost.near.
-      mockKvMultiAgent.mockResolvedValue([]);
-      const data = expectData(
-        await dispatchFastData('agent_claims', { account_id: AGENT }),
-      ) as {
-        operators: Array<{
-          account_id: string;
-          name: string | null;
-          description: string;
-          image: string | null;
-          reason?: string;
-        }>;
-      };
-      expect(data.operators).toHaveLength(1);
-      expect(data.operators[0]).toMatchObject({
-        account_id: 'ghost.near',
-        name: null,
-        description: '',
-        image: null,
-        reason: 'never joined the index',
-      });
-    });
-
-    it('requires account_id in the request body', async () => {
-      mockGetOperatorClaimsWriterAccount.mockResolvedValue(WRITER);
-      const err = expectError(await dispatchFastData('agent_claims', {}));
-      expect(err).toContain('account_id');
     });
   });
 });

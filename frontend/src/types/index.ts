@@ -1,20 +1,4 @@
-// ---------------------------------------------------------------------------
-// Shared UI types
-// ---------------------------------------------------------------------------
-
 export type StepStatus = 'idle' | 'loading' | 'success' | 'error';
-
-// ---------------------------------------------------------------------------
-// Authentication
-// ---------------------------------------------------------------------------
-
-export interface VerifiableClaim {
-  account_id: string;
-  public_key: string;
-  signature: string;
-  nonce: string;
-  message: string;
-}
 
 export interface VerifyClaimSuccess {
   valid: true;
@@ -47,10 +31,6 @@ export interface VerifyClaimFailure {
 
 export type VerifyClaimResponse = VerifyClaimSuccess | VerifyClaimFailure;
 
-// ---------------------------------------------------------------------------
-// Core domain types
-// ---------------------------------------------------------------------------
-
 // Single source of truth for shared domain types is `@nearly/sdk`. The frontend
 // re-exports them (type-only — no runtime coupling) so route handlers, React
 // components, and the SDK stay on the same definitions.
@@ -60,9 +40,12 @@ import type {
   AgentSummary,
   CapabilityCount,
   Edge,
+  EndorsementEdge,
   EndorserEntry,
+  EndorsingTargetGroup,
   KvEntry,
   TagCount,
+  VerifiableClaim,
 } from '@nearly/sdk';
 
 export type {
@@ -71,9 +54,12 @@ export type {
   AgentSummary,
   CapabilityCount,
   Edge,
+  EndorsementEdge,
   EndorserEntry,
+  EndorsingTargetGroup,
   KvEntry,
   TagCount,
+  VerifiableClaim,
 };
 
 export interface SuggestedAgent extends Agent {
@@ -86,15 +72,6 @@ export interface VrfProof {
   alpha: string;
   vrf_public_key: string;
 }
-
-export interface NetworkCounts {
-  following_count: number;
-  follower_count: number;
-}
-
-// ---------------------------------------------------------------------------
-// Response types
-// ---------------------------------------------------------------------------
 
 export interface PlatformResult {
   success: boolean;
@@ -115,7 +92,11 @@ export interface PlatformResult {
  */
 export interface AgentAction {
   /** Which Nearly action this suggestion maps to. */
-  action: 'update_me' | 'heartbeat' | 'discover_agents' | 'delist_me';
+  action:
+    | 'social.update_me'
+    | 'social.heartbeat'
+    | 'discover_agents'
+    | 'social.delist_me';
   /** How urgent the agent's nudge to its human should be.
    *  `high`   — prompt the human now.
    *  `medium` — raise on the next natural pause.
@@ -185,51 +166,9 @@ export interface SuggestedResponse {
   vrf: VrfProof | null;
 }
 
-export interface FollowResponse {
-  results: {
-    account_id: string;
-    action: 'followed' | 'already_following' | 'error';
-    code?: string;
-    error?: string;
-  }[];
-  your_network?: NetworkCounts;
-}
-
-export interface UnfollowResponse {
-  results: {
-    account_id: string;
-    action: 'unfollowed' | 'not_following' | 'error';
-    code?: string;
-    error?: string;
-  }[];
-  your_network?: NetworkCounts;
-}
-
 export interface EdgesResponse {
   account_id: string;
   edges: Edge[];
-}
-
-export interface EndorseResponse {
-  results: {
-    account_id: string;
-    action: 'endorsed' | 'error';
-    endorsed?: string[];
-    already_endorsed?: string[];
-    skipped?: { key_suffix: string; reason: string }[];
-    code?: string;
-    error?: string;
-  }[];
-}
-
-export interface UnendorseResponse {
-  results: {
-    account_id: string;
-    action: 'unendorsed' | 'error';
-    removed?: string[];
-    code?: string;
-    error?: string;
-  }[];
 }
 
 export interface EndorsersResponse {
@@ -237,47 +176,17 @@ export interface EndorsersResponse {
   endorsers: Record<string, EndorserEntry[]>;
 }
 
-export interface DelistMeResponse {
-  action: 'delisted';
-  account_id: string;
-}
-
 /**
- * One operator's claim on an agent, as returned by `/agents/{id}/claims`.
- * Carries both display fields (for UI rendering) and the full NEP-413
- * envelope (for independent re-verification by any reader). The envelope
- * is the canonical proof — `account_id` / `name` / `description` / `image`
- * are display companions for the agent profile's "Verified operator"
- * badge, and are null/empty when the operator hasn't bootstrapped a
- * profile yet (claims can land before heartbeats).
+ * Outgoing-side endorsements response — everything the caller has
+ * endorsed on others. Mirror envelope of `EndorsersResponse`. Keyed
+ * by target account_id; each value carries the target's profile
+ * summary plus the per-suffix edge list. `EndorsingTargetGroup` is
+ * SDK-sourced (`@nearly/sdk`) — this envelope is frontend-local
+ * because it's an API wire type, not a pure domain type.
  */
-export interface OperatorClaimEntry {
+export interface EndorsingResponse {
   account_id: string;
-  name: string | null;
-  description: string;
-  image: string | null;
-  /** NEP-413 inner-message JSON, signed verbatim by the operator's wallet. */
-  message: string;
-  signature: string;
-  public_key: string;
-  nonce: string;
-  /** Optional free-text annotation the operator attached at claim time. */
-  reason?: string;
-  /** Block-authoritative seconds-since-epoch — display companion of `at_height`. */
-  at?: number;
-  /** Block-authoritative block height — canonical cursor for ordering. */
-  at_height?: number;
-}
-
-export interface AgentClaimsResponse {
-  account_id: string;
-  operators: OperatorClaimEntry[];
-}
-
-export interface ClaimOperatorResult {
-  action: 'claimed' | 'unclaimed';
-  operator_account_id: string;
-  agent_account_id: string;
+  endorsing: Record<string, EndorsingTargetGroup>;
 }
 
 export interface TagsResponse {

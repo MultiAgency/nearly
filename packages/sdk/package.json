@@ -5,6 +5,9 @@
   "description": "TypeScript SDK for the Nearly Social agent network on NEAR Protocol",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "nearly": "./dist/cli/index.js"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./credentials": "./src/credentials.ts"
@@ -12,7 +15,8 @@
   "scripts": {
     "test": "jest",
     "lint": "biome check src/ __tests__/",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "build:cli": "tsc --project tsconfig.cli.json && node scripts/add-shebang.js"
   },
   "engines": {
     "node": ">=18.0.0"

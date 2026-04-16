@@ -1,16 +1,13 @@
+import { buildClaim, signClaim } from '../src/claim';
 import type { FetchLike } from '../src/read';
+import { getVrfSeed } from '../src/vrf';
 import {
-  buildClaimMessage,
   callOutlayer,
+  createWallet,
   createWalletClient,
-  deriveSubAgentKey,
-  getVrfSeed,
-  getWalletBalance,
-  registerSubAgentKey,
-  registerWallet,
-  signClaim,
-  submitWrite,
+  getBalance,
   type WalletClient,
+  writeEntries,
 } from '../src/wallet';
 
 interface Call {
@@ -43,10 +40,12 @@ function walletOf(fetch: FetchLike, walletKey = 'wk_test'): WalletClient {
     namespace: 'contextual.near',
     walletKey,
     fetch,
+    claimDomain: 'nearly.social',
+    claimVersion: 1,
   });
 }
 
-describe('registerWallet', () => {
+describe('createWallet', () => {
   it('returns walletKey, accountId, trial from a valid 2xx response', async () => {
     const { fetch, calls } = scripted(() =>
       jsonResponse({
@@ -58,7 +57,7 @@ describe('registerWallet', () => {
         balance: '0',
       }),
     );
-    const res = await registerWallet({
+    const res = await createWallet({
       outlayerUrl: 'https://outlayer.example',
       fetch,
     });
@@ -82,7 +81,7 @@ describe('registerWallet', () => {
         },
       }),
     );
-    const res = await registerWallet({
+    const res = await createWallet({
       outlayerUrl: 'https://outlayer.example',
       fetch,
     });
@@ -103,7 +102,7 @@ describe('registerWallet', () => {
         trial: { calls_remaining: 100 },
       }),
     );
-    const res = await registerWallet({
+    const res = await createWallet({
       outlayerUrl: 'https://outlayer.example',
       fetch,
     });
@@ -121,7 +120,7 @@ describe('registerWallet', () => {
         }),
     );
     await expect(
-      registerWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
+      createWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
     ).rejects.toMatchObject({ code: 'PROTOCOL' });
   });
 
@@ -133,7 +132,7 @@ describe('registerWallet', () => {
       }),
     );
     await expect(
-      registerWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
+      createWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
     ).rejects.toMatchObject({ code: 'PROTOCOL' });
   });
 
@@ -142,7 +141,7 @@ describe('registerWallet', () => {
       jsonResponse({ api_key: 'wk_x', trial: { calls_remaining: 5 } }),
     );
     await expect(
-      registerWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
+      createWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
     ).rejects.toMatchObject({ code: 'PROTOCOL' });
   });
 
@@ -151,14 +150,14 @@ describe('registerWallet', () => {
       jsonResponse({ api_key: 'wk_x', near_account_id: '4397d730' }),
     );
     await expect(
-      registerWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
+      createWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
     ).rejects.toMatchObject({ code: 'PROTOCOL' });
   });
 
   it('throws authError on 401', async () => {
     const { fetch } = scripted(() => new Response(null, { status: 401 }));
     await expect(
-      registerWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
+      createWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
     ).rejects.toMatchObject({ code: 'AUTH_FAILED' });
   });
 
@@ -167,12 +166,12 @@ describe('registerWallet', () => {
       () => new Response('upstream down', { status: 503 }),
     );
     await expect(
-      registerWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
+      createWallet({ outlayerUrl: 'https://outlayer.example', fetch }),
     ).rejects.toMatchObject({ code: 'PROTOCOL' });
   });
 });
 
-describe('getWalletBalance', () => {
+describe('getBalance', () => {
   it('returns balance, accountId, derived balanceNear for chain=near', async () => {
     const { fetch, calls } = scripted(() =>
       jsonResponse({
@@ -181,7 +180,7 @@ describe('getWalletBalance', () => {
       }),
     );
     const wallet = walletOf(fetch);
-    const res = await getWalletBalance(wallet);
+    const res = await getBalance(wallet);
     expect(res.accountId).toBe('4397d730abcd');
     expect(res.chain).toBe('near');
     expect(res.balance).toBe('9393299973616100000000');
@@ -199,7 +198,7 @@ describe('getWalletBalance', () => {
     const { fetch } = scripted(() =>
       jsonResponse({ account_id: '4397d730', balance: '0' }),
     );
-    const res = await getWalletBalance(walletOf(fetch));
+    const res = await getBalance(walletOf(fetch));
     expect(res.balance).toBe('0');
     expect(res.balanceNear).toBe(0);
   });
@@ -208,7 +207,7 @@ describe('getWalletBalance', () => {
     const { fetch, calls } = scripted(() =>
       jsonResponse({ account_id: 'bob.eth', balance: '1000000000000000000' }),
     );
-    const res = await getWalletBalance(walletOf(fetch), { chain: 'eth' });
+    const res = await getBalance(walletOf(fetch), { chain: 'eth' });
     expect(res.chain).toBe('eth');
     expect(res.balance).toBe('1000000000000000000');
     expect(res.balanceNear).toBeUndefined();
@@ -217,7 +216,7 @@ describe('getWalletBalance', () => {
 
   it('throws authError on 401', async () => {
     const { fetch } = scripted(() => new Response(null, { status: 401 }));
-    await expect(getWalletBalance(walletOf(fetch))).rejects.toMatchObject({
+    await expect(getBalance(walletOf(fetch))).rejects.toMatchObject({
       code: 'AUTH_FAILED',
     });
   });
@@ -230,21 +229,21 @@ describe('getWalletBalance', () => {
           headers: { 'Content-Type': 'application/json' },
         }),
     );
-    await expect(getWalletBalance(walletOf(fetch))).rejects.toMatchObject({
+    await expect(getBalance(walletOf(fetch))).rejects.toMatchObject({
       code: 'PROTOCOL',
     });
   });
 
   it('throws protocolError when balance field is missing', async () => {
     const { fetch } = scripted(() => jsonResponse({ account_id: '4397d730' }));
-    await expect(getWalletBalance(walletOf(fetch))).rejects.toMatchObject({
+    await expect(getBalance(walletOf(fetch))).rejects.toMatchObject({
       code: 'PROTOCOL',
     });
   });
 
   it('throws protocolError when account_id field is missing', async () => {
     const { fetch } = scripted(() => jsonResponse({ balance: '1' }));
-    await expect(getWalletBalance(walletOf(fetch))).rejects.toMatchObject({
+    await expect(getBalance(walletOf(fetch))).rejects.toMatchObject({
       code: 'PROTOCOL',
     });
   });
@@ -255,7 +254,7 @@ describe('getWalletBalance', () => {
         new Response('downstream leaked wk_test inside body', { status: 500 }),
     );
     try {
-      await getWalletBalance(walletOf(fetch));
+      await getBalance(walletOf(fetch));
       fail('expected throw');
     } catch (err) {
       // The upstream body may smuggle the wk_ substring. The SDK truncates
@@ -268,206 +267,8 @@ describe('getWalletBalance', () => {
   });
 });
 
-describe('deriveSubAgentKey', () => {
-  // Pinned SHA256 fixture against the formula documented in
-  // `.agents/skills/agent-custody/SKILL.md`:
-  //
-  //   sub_key  = "wk_" + sha256_hex(f"{seed}:0:{parent_key}")
-  //   key_hash =         sha256_hex(sub_key)
-  //
-  // Pin values computed against Node 18+ `crypto.createHash('sha256')`
-  // at implementation time. Regression in the UTF-8 encoding, the
-  // concatenation order, or the Web Crypto API plumbing fails this
-  // test before any network call reaches OutLayer.
-  it('matches the pinned SHA256 derivation for a known (parent, seed) pair', async () => {
-    const { subKey, keyHash } = await deriveSubAgentKey(
-      'wk_parent_fixture',
-      'worker-1',
-    );
-    expect(subKey).toBe(
-      'wk_d980069f292e8a2a88fde6eb7b70ce4bacc88aa11172c0854a99bc8ced926bb9',
-    );
-    expect(keyHash).toBe(
-      'd59cf62037441d21a93d5fd3d6892971fdfed38c5f08a40ea77b184e0720187c',
-    );
-  });
-
-  it('is pure — same inputs produce same outputs across calls', async () => {
-    const a = await deriveSubAgentKey('wk_p', 'seed-a');
-    const b = await deriveSubAgentKey('wk_p', 'seed-a');
-    expect(a.subKey).toBe(b.subKey);
-    expect(a.keyHash).toBe(b.keyHash);
-  });
-
-  it('different seeds produce different sub_keys', async () => {
-    const a = await deriveSubAgentKey('wk_p', 'seed-a');
-    const b = await deriveSubAgentKey('wk_p', 'seed-b');
-    expect(a.subKey).not.toBe(b.subKey);
-    expect(a.keyHash).not.toBe(b.keyHash);
-  });
-
-  it('different parents produce different sub_keys for the same seed', async () => {
-    const a = await deriveSubAgentKey('wk_alice', 'shared');
-    const b = await deriveSubAgentKey('wk_bob', 'shared');
-    expect(a.subKey).not.toBe(b.subKey);
-    expect(a.keyHash).not.toBe(b.keyHash);
-  });
-
-  it('subKey is "wk_" prefix + 64 hex chars (total 67)', async () => {
-    const { subKey } = await deriveSubAgentKey('wk_p', 'seed');
-    expect(subKey).toMatch(/^wk_[0-9a-f]{64}$/);
-    expect(subKey.length).toBe(67);
-  });
-
-  it('keyHash is 64 hex chars (no prefix)', async () => {
-    const { keyHash } = await deriveSubAgentKey('wk_p', 'seed');
-    expect(keyHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(keyHash.length).toBe(64);
-  });
-});
-
-describe('registerSubAgentKey', () => {
-  it('PUTs to /wallet/v1/api-key with parent Bearer and {seed, key_hash} body', async () => {
-    const { fetch, calls } = scripted(() =>
-      jsonResponse({
-        wallet_id: 'uuid-sub',
-        near_account_id:
-          'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210',
-      }),
-    );
-    const { accountId, walletId } = await registerSubAgentKey({
-      outlayerUrl: 'https://outlayer.example',
-      parentKey: 'wk_parent_test',
-      seed: 'worker-1',
-      keyHash: 'fakehash64chars',
-      fetch,
-    });
-    expect(accountId).toMatch(/^fedcba98/);
-    expect(walletId).toBe('uuid-sub');
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe('https://outlayer.example/wallet/v1/api-key');
-    expect(calls[0].init?.method).toBe('PUT');
-    // Parent Bearer header present, sub-key not yet in play.
-    const authHeader = (calls[0].init?.headers as Record<string, string>)
-      ?.Authorization;
-    expect(authHeader).toBe('Bearer wk_parent_test');
-    const body = JSON.parse(calls[0].init?.body as string);
-    expect(body).toEqual({ seed: 'worker-1', key_hash: 'fakehash64chars' });
-  });
-
-  it('walletId is undefined when response omits it', async () => {
-    const { fetch } = scripted(() =>
-      jsonResponse({
-        near_account_id:
-          'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
-      }),
-    );
-    const { accountId, walletId } = await registerSubAgentKey({
-      outlayerUrl: 'https://outlayer.example',
-      parentKey: 'wk_parent',
-      seed: 'seed',
-      keyHash: 'hash',
-      fetch,
-    });
-    expect(accountId).toBeDefined();
-    expect(walletId).toBeUndefined();
-  });
-
-  it('throws NETWORK on fetch rejection', async () => {
-    const fetch: FetchLike = async () => {
-      throw new Error('ECONNRESET');
-    };
-    await expect(
-      registerSubAgentKey({
-        outlayerUrl: 'https://outlayer.example',
-        parentKey: 'wk_p',
-        seed: 's',
-        keyHash: 'h',
-        fetch,
-      }),
-    ).rejects.toMatchObject({ shape: { code: 'NETWORK' } });
-  });
-
-  it('throws AUTH_FAILED on 401 (parent key rejected)', async () => {
-    const { fetch } = scripted(
-      () => new Response('unauthorized', { status: 401 }),
-    );
-    await expect(
-      registerSubAgentKey({
-        outlayerUrl: 'https://outlayer.example',
-        parentKey: 'wk_bad',
-        seed: 's',
-        keyHash: 'h',
-        fetch,
-      }),
-    ).rejects.toMatchObject({ shape: { code: 'AUTH_FAILED' } });
-  });
-
-  it('throws PROTOCOL on 5xx', async () => {
-    const { fetch } = scripted(
-      () => new Response('upstream down', { status: 502 }),
-    );
-    await expect(
-      registerSubAgentKey({
-        outlayerUrl: 'https://outlayer.example',
-        parentKey: 'wk_p',
-        seed: 's',
-        keyHash: 'h',
-        fetch,
-      }),
-    ).rejects.toMatchObject({
-      shape: {
-        code: 'PROTOCOL',
-        hint: expect.stringContaining('api-key 502'),
-      },
-    });
-  });
-
-  it('throws PROTOCOL on non-JSON 2xx', async () => {
-    const { fetch } = scripted(
-      () =>
-        new Response('<html>oops</html>', {
-          status: 200,
-          headers: { 'Content-Type': 'text/html' },
-        }),
-    );
-    await expect(
-      registerSubAgentKey({
-        outlayerUrl: 'https://outlayer.example',
-        parentKey: 'wk_p',
-        seed: 's',
-        keyHash: 'h',
-        fetch,
-      }),
-    ).rejects.toMatchObject({
-      shape: {
-        code: 'PROTOCOL',
-        hint: expect.stringContaining('malformed JSON'),
-      },
-    });
-  });
-
-  it('throws PROTOCOL when near_account_id is missing', async () => {
-    const { fetch } = scripted(() => jsonResponse({ wallet_id: 'only-this' }));
-    await expect(
-      registerSubAgentKey({
-        outlayerUrl: 'https://outlayer.example',
-        parentKey: 'wk_p',
-        seed: 's',
-        keyHash: 'h',
-        fetch,
-      }),
-    ).rejects.toMatchObject({
-      shape: {
-        code: 'PROTOCOL',
-        hint: expect.stringContaining('near_account_id'),
-      },
-    });
-  });
-});
-
-describe('submitWrite', () => {
-  // `submitWrite` is the single funnel for FastData KV writes from the
+describe('writeEntries', () => {
+  // `writeEntries` is the single funnel for FastData KV writes from the
   // SDK. Direct coverage of the OutLayer wire contract so regressions
   // fail at the function-under-test level, not through an opaque
   // mutation flow in client.test.ts.
@@ -477,7 +278,7 @@ describe('submitWrite', () => {
       () => new Response(null, { status: 200 }),
     );
     const wallet = walletOf(fetch, 'wk_submit_test');
-    await submitWrite(wallet, { profile: { name: 'alice' } });
+    await writeEntries(wallet, { profile: { name: 'alice' } });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe('https://outlayer.example/wallet/v1/call');
     expect(calls[0].init?.method).toBe('POST');
@@ -499,7 +300,7 @@ describe('submitWrite', () => {
   it('resolves silently on 2xx — success is no-return, not a shape', async () => {
     const { fetch } = scripted(() => new Response(null, { status: 200 }));
     const wallet = walletOf(fetch);
-    const result = await submitWrite(wallet, { profile: {} });
+    const result = await writeEntries(wallet, { profile: {} });
     expect(result).toBeUndefined();
   });
 
@@ -508,7 +309,7 @@ describe('submitWrite', () => {
       throw new Error('ECONNRESET');
     };
     const wallet = walletOf(fetch);
-    await expect(submitWrite(wallet, { profile: {} })).rejects.toMatchObject({
+    await expect(writeEntries(wallet, { profile: {} })).rejects.toMatchObject({
       shape: { code: 'NETWORK' },
     });
   });
@@ -518,7 +319,7 @@ describe('submitWrite', () => {
       () => new Response('unauthorized', { status: 401 }),
     );
     const wallet = walletOf(fetch);
-    await expect(submitWrite(wallet, { profile: {} })).rejects.toMatchObject({
+    await expect(writeEntries(wallet, { profile: {} })).rejects.toMatchObject({
       shape: { code: 'AUTH_FAILED' },
     });
   });
@@ -528,7 +329,7 @@ describe('submitWrite', () => {
       () => new Response('forbidden', { status: 403 }),
     );
     const wallet = walletOf(fetch);
-    await expect(submitWrite(wallet, { profile: {} })).rejects.toMatchObject({
+    await expect(writeEntries(wallet, { profile: {} })).rejects.toMatchObject({
       shape: { code: 'AUTH_FAILED' },
     });
   });
@@ -540,7 +341,7 @@ describe('submitWrite', () => {
       () => new Response('upstream timeout', { status: 502 }),
     );
     const wallet = walletOf(fetch);
-    await expect(submitWrite(wallet, { profile: {} })).rejects.toMatchObject({
+    await expect(writeEntries(wallet, { profile: {} })).rejects.toMatchObject({
       shape: { code: 'INSUFFICIENT_BALANCE' },
     });
   });
@@ -550,10 +351,10 @@ describe('submitWrite', () => {
       () => new Response('internal error', { status: 500 }),
     );
     const wallet = walletOf(fetch);
-    await expect(submitWrite(wallet, { profile: {} })).rejects.toMatchObject({
+    await expect(writeEntries(wallet, { profile: {} })).rejects.toMatchObject({
       shape: {
         code: 'PROTOCOL',
-        hint: expect.stringContaining('submitWrite 500'),
+        hint: expect.stringContaining('writeEntries 500'),
       },
     });
   });
@@ -561,7 +362,7 @@ describe('submitWrite', () => {
   it('throws PROTOCOL with "no body" hint when a non-2xx response has an empty body', async () => {
     const { fetch } = scripted(() => new Response(null, { status: 500 }));
     const wallet = walletOf(fetch);
-    await expect(submitWrite(wallet, { profile: {} })).rejects.toMatchObject({
+    await expect(writeEntries(wallet, { profile: {} })).rejects.toMatchObject({
       shape: {
         code: 'PROTOCOL',
         hint: expect.stringContaining('no body'),
@@ -578,8 +379,8 @@ describe('submitWrite', () => {
     const { fetch } = scripted(() => new Response(echoBody, { status: 500 }));
     const wallet = walletOf(fetch, 'wk_secret_test_DO_NOT_LEAK');
     try {
-      await submitWrite(wallet, { profile: {} });
-      throw new Error('expected submitWrite to throw');
+      await writeEntries(wallet, { profile: {} });
+      throw new Error('expected writeEntries to throw');
     } catch (err) {
       const serialized = JSON.stringify({
         message: (err as Error).message,
@@ -590,9 +391,14 @@ describe('submitWrite', () => {
   });
 });
 
-describe('buildClaimMessage', () => {
-  it('matches the frontend claim message shape', () => {
-    const raw = buildClaimMessage('get_vrf_seed', 'alice.near');
+describe('buildClaim', () => {
+  it('matches the frontend Nearly claim message shape', () => {
+    const raw = buildClaim({
+      action: 'get_vrf_seed',
+      accountId: 'alice.near',
+      domain: 'nearly.social',
+      version: 1,
+    });
     const parsed = JSON.parse(raw);
     expect(parsed.action).toBe('get_vrf_seed');
     expect(parsed.domain).toBe('nearly.social');
@@ -603,7 +409,7 @@ describe('buildClaimMessage', () => {
 });
 
 describe('signClaim', () => {
-  it('posts message + recipient to /wallet/v1/sign-message and parses the envelope', async () => {
+  it('posts message + recipient to /wallet/v1/sign-message using client domain defaults', async () => {
     const { fetch, calls } = scripted(() =>
       jsonResponse({
         account_id: 'alice.near',
@@ -613,15 +419,20 @@ describe('signClaim', () => {
       }),
     );
     const wallet = walletOf(fetch);
-    const claim = await signClaim(wallet, 'get_vrf_seed', 'alice.near');
-    expect(claim.accountId).toBe('alice.near');
-    expect(claim.publicKey).toBe('ed25519:abc');
+    const claim = await signClaim(wallet, {
+      action: 'get_vrf_seed',
+      accountId: 'alice.near',
+    });
+    expect(claim.account_id).toBe('alice.near');
+    expect(claim.public_key).toBe('ed25519:abc');
     expect(claim.signature).toBe('sig_hex');
     expect(claim.nonce).toBe('nonce_hex');
     // Message is built locally, not returned by OutLayer, but must round-trip.
     const parsed = JSON.parse(claim.message);
     expect(parsed.action).toBe('get_vrf_seed');
     expect(parsed.account_id).toBe('alice.near');
+    expect(parsed.domain).toBe('nearly.social');
+    expect(parsed.version).toBe(1);
 
     expect(calls).toHaveLength(1);
     const [call] = calls;
@@ -638,7 +449,7 @@ describe('signClaim', () => {
     const { fetch } = scripted(() => new Response('', { status: 401 }));
     const wallet = walletOf(fetch);
     await expect(
-      signClaim(wallet, 'get_vrf_seed', 'alice.near'),
+      signClaim(wallet, { action: 'get_vrf_seed', accountId: 'alice.near' }),
     ).rejects.toMatchObject({ code: 'AUTH_FAILED' });
   });
 
@@ -648,7 +459,7 @@ describe('signClaim', () => {
     );
     const wallet = walletOf(fetch);
     await expect(
-      signClaim(wallet, 'get_vrf_seed', 'alice.near'),
+      signClaim(wallet, { action: 'get_vrf_seed', accountId: 'alice.near' }),
     ).rejects.toMatchObject({ code: 'PROTOCOL' });
   });
 });
@@ -706,6 +517,8 @@ describe('callOutlayer', () => {
       fetch,
       wasmOwner: 'staging.near',
       wasmProject: 'nearly-staging',
+      claimDomain: 'nearly.social',
+      claimVersion: 1,
     });
     await callOutlayer(wallet, { action: 'noop' });
     expect(calls[0].url).toBe(

@@ -3,7 +3,7 @@
 import { AlertTriangle, Home, RefreshCcw, WifiOff } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect } from 'react';
-import { Button } from '@/components/ui';
+import { Button } from '@/components/ui/button';
 import { classifyError, type ErrorKind } from '@/lib/utils';
 
 const ERROR_META: Record<ErrorKind, { title: string; icon: React.ReactNode }> =

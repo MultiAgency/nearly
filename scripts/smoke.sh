@@ -4,26 +4,72 @@
 # Usage:
 #   ./scripts/smoke.sh             # Run default 9-step test, keep agent
 #   ./scripts/smoke.sh --full      # Also run extended coverage (5 extra steps)
-#   ./scripts/smoke.sh --cleanup   # Delist test agent at end
+#   ./scripts/smoke.sh --cleanup   # Delist test agent at end of THIS run
 #   ./scripts/smoke.sh --fresh     # Force new wallet
+#   ./scripts/smoke.sh --cleanup-orphans
+#                                  # Standalone mode: skip the smoke test,
+#                                  # scan ~/.config/nearly/credentials.json,
+#                                  # delist every account whose live profile
+#                                  # description matches the smoke-test
+#                                  # signature ("Smoke test"), and remove
+#                                  # delisted entries from credentials.json.
+#                                  # Used to clean up orphaned wallets from
+#                                  # prior non-cleanup runs.
+#   ./scripts/smoke.sh --cleanup-orphans --dry-run
+#                                  # Same scan + match logic, but skip the
+#                                  # DELETE calls and the credentials-file
+#                                  # mutations. Prints what WOULD be delisted.
+#   ./scripts/smoke.sh --target 4397d730...
+#                                  # Pin the follow/endorse target instead of
+#                                  # picking from discover_agents.
 
 set -euo pipefail
 
-NEARLY_API="https://nearly.social/api/v1"
+NEARLY_API="${NEARLY_API:-https://nearly.social/api/v1}"
 OUTLAYER_API="https://api.outlayer.fastnear.com"
 CREDS_FILE="$HOME/.config/nearly/credentials.json"
 CLEANUP=false
+CLEANUP_ORPHANS=false
+DRY_RUN=false
 FRESH=false
 FULL=false
+TARGET_FLAG=""
 
-for arg in "$@"; do
-  case "$arg" in
-    --cleanup) CLEANUP=true ;;
-    --fresh)   FRESH=true ;;
-    --full)    FULL=true ;;
-    *) echo "Unknown arg: $arg"; exit 1 ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cleanup)         CLEANUP=true; shift ;;
+    --cleanup-orphans) CLEANUP_ORPHANS=true; shift ;;
+    --dry-run)         DRY_RUN=true; shift ;;
+    --fresh)           FRESH=true; shift ;;
+    --full)            FULL=true; shift ;;
+    --target)          TARGET_FLAG="${2:?--target requires an account}"; shift 2 ;;
+    *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
+
+if $DRY_RUN && ! $CLEANUP_ORPHANS; then
+  echo "--dry-run is only valid with --cleanup-orphans" >&2
+  exit 1
+fi
+
+# ─── Optional env overrides for deterministic local runs ──────────────
+# OUTLAYER_TEST_WALLET_KEY pins the wk_ used for the run — skips wallet
+# creation, funding, and the credentials-file save path. Useful when
+# you want the smoke to hit the same stable wallet every time without
+# minting new test accounts that accumulate in the directory.
+#
+# --target <account> pins the follow/endorse target. Skips the
+# discover-agents + list-agents scan for the target pick, so the run
+# is not sensitive to directory-ordering churn.
+#
+# Shell env wins for WALLET_KEY; frontend/.env is the fallback.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../frontend/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  if [[ -z "${OUTLAYER_TEST_WALLET_KEY:-}" ]]; then
+    OUTLAYER_TEST_WALLET_KEY=$(grep -E '^OUTLAYER_TEST_WALLET_KEY=' "$ENV_FILE" | head -1 | cut -d= -f2-)
+  fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
@@ -34,12 +80,12 @@ FAIL=0
 SKIP=0
 STEP_NAME=""
 STEP_NUM=0
-TOTAL_STEPS=9
-$FULL && TOTAL_STEPS=13
+TOTAL_STEPS=10
+$FULL && TOTAL_STEPS=16
 declare -a LATENCY_NAMES=()
 declare -a LATENCY_VALUES=()
 declare -a STEP_RESULTS=()
-declare -a STEP_LABELS=("Wall" "Prof" "Disc" "Foll" "Endr" "Beat" "Unfl" "Unen" "Plat")
+declare -a STEP_LABELS=("Wall" "Prof" "Disc" "Foll" "Endr" "Edng" "Beat" "Unfl" "Unen" "Plat")
 $FULL && STEP_LABELS+=("Caps" "Page" "Vrf" "Auth")
 START_EPOCH=$(date +%s)
 
@@ -238,6 +284,155 @@ verify() {
   fi
 }
 
+# ─── Standalone cleanup: delist orphaned smoke-test agents ───────────
+# When --cleanup-orphans is set, skip the normal smoke test entirely.
+# Scan every account in ~/.config/nearly/credentials.json, GET its live
+# profile, and if the description contains the smoke-test signature,
+# delist it via its own wk_ (DELETE /agents/me), then remove the entry
+# from the credentials file.
+#
+# The description match is the safety net. Without it, a dev running
+# this flag on a shared credentials file could accidentally delist
+# legitimate agents they registered through other flows. We only touch
+# accounts whose live profile identifies as smoke-test residue.
+#
+# Rate limit: delist_me is 1/300s per caller, but each agent is a
+# different caller — nine back-to-back delists don't conflict because
+# the budget is keyed on caller account_id, not IP.
+#
+# Never puts a wk_ in argv — writes per-call curl config files (chmod
+# 600) and deletes them after use.
+if $CLEANUP_ORPHANS; then
+  if [[ ! -f "$CREDS_FILE" ]]; then
+    printf "${C_RED}  ✗ No credentials file at %s${C_RESET}\n" "$CREDS_FILE"
+    printf "${C_DIM}    Nothing to clean up.${C_RESET}\n"
+    exit 1
+  fi
+
+  if $DRY_RUN; then
+    printf "\n  ${C_BOLD}Cleanup orphaned smoke-test agents ${C_DIM}(dry-run)${C_RESET}\n"
+  else
+    printf "\n  ${C_BOLD}Cleanup orphaned smoke-test agents${C_RESET}\n"
+  fi
+  printf "  ${C_DIM}%.43s${C_RESET}\n" "───────────────────────────────────────────"
+  printf "  ${C_DIM}Scanning %s${C_RESET}\n" "$CREDS_FILE"
+  if $DRY_RUN; then
+    printf "  ${C_DIM}Mode: dry-run — no DELETE calls, no credentials-file writes${C_RESET}\n"
+  fi
+
+  CLEANUP_CONFIG=$(mktemp -t nearly-cleanup.XXXXXX)
+  chmod 600 "$CLEANUP_CONFIG"
+  trap 'rm -f "$CLEANUP_CONFIG"' EXIT
+
+  scanned=0
+  matched=0
+  delisted=0
+  skipped_gone=0
+  skipped_nonmatch=0
+  errors=0
+
+  while IFS= read -r acct; do
+    scanned=$((scanned + 1))
+
+    # Probe the live profile. 404 means the agent is already gone from
+    # the directory — skip and leave the credentials entry (the caller
+    # may want to re-use the wallet or might need the key for audit).
+    profile_resp=$(curl -sS --max-time 10 "${NEARLY_API}/agents/${acct}" 2>/dev/null || echo '{}')
+    profile_ok=$(echo "$profile_resp" | jq -r '.success // false' 2>/dev/null)
+
+    if [[ "$profile_ok" != "true" ]]; then
+      skipped_gone=$((skipped_gone + 1))
+      continue
+    fi
+
+    description=$(echo "$profile_resp" | jq -r '.data.agent.description // ""' 2>/dev/null)
+    if [[ "$description" != *"Smoke test"* ]]; then
+      skipped_nonmatch=$((skipped_nonmatch + 1))
+      continue
+    fi
+
+    matched=$((matched + 1))
+
+    # Extract the wk_ for this account from credentials.json without
+    # echoing it. If the credentials entry is missing api_key, report
+    # and continue. (Skipped in dry-run — we only need the match set.)
+    if ! $DRY_RUN; then
+      wk=$(jq -r --arg a "$acct" '.accounts[$a].api_key // empty' "$CREDS_FILE")
+      if [[ -z "$wk" || "$wk" == "null" ]]; then
+        printf "  ${C_RED}✗ %s — matched smoke pattern but no wk_ in credentials${C_RESET}\n" "$acct"
+        errors=$((errors + 1))
+        continue
+      fi
+
+      # Per-call curl config — the Authorization header never reaches argv.
+      printf 'header = "Authorization: Bearer %s"\n' "$wk" > "$CLEANUP_CONFIG"
+
+      delete_resp=$(curl -sS --max-time 15 -X DELETE --config "$CLEANUP_CONFIG" \
+        "${NEARLY_API}/agents/me" 2>/dev/null || echo '{}')
+      delete_ok=$(echo "$delete_resp" | jq -r '.success // false' 2>/dev/null)
+
+      if [[ "$delete_ok" == "true" ]]; then
+        printf "  ${C_GREEN}✓${C_RESET} delisted ${C_DIM}%s${C_RESET}\n" "$acct"
+        delisted=$((delisted + 1))
+        # Remove from credentials file — a delisted agent's wk_ still
+        # authenticates to OutLayer, but the profile + edges are gone;
+        # keeping the credential entry would mislead future runs into
+        # thinking the account is still a live test agent. Mirrors the
+        # post-delist cleanup the --cleanup flag does for the current run.
+        tmp=$(mktemp)
+        jq --arg a "$acct" 'del(.accounts[$a])' "$CREDS_FILE" > "$tmp" \
+          && mv "$tmp" "$CREDS_FILE"
+      else
+        err=$(echo "$delete_resp" | jq -r '.error // .code // "unknown error"' 2>/dev/null)
+        printf "  ${C_RED}✗${C_RESET} %s — delist failed: %s\n" "$acct" "$err"
+        errors=$((errors + 1))
+      fi
+    else
+      # Dry-run: confirm we COULD delist (has a wk_ in the file) without
+      # actually calling DELETE. Still counts as `delisted` in the summary
+      # because that's the "would be delisted" column for the dry-run
+      # report — relabeled in the summary print below.
+      wk_present=$(jq -r --arg a "$acct" '.accounts[$a].api_key // empty' "$CREDS_FILE")
+      if [[ -z "$wk_present" || "$wk_present" == "null" ]]; then
+        printf "  ${C_RED}?${C_RESET} %s — matched smoke pattern but ${C_RED}no wk_ in credentials${C_RESET} (would error)\n" "$acct"
+        errors=$((errors + 1))
+      else
+        printf "  ${C_DIM}[dry-run]${C_RESET} would delist ${C_DIM}%s${C_RESET}\n" "$acct"
+        delisted=$((delisted + 1))
+      fi
+    fi
+  done < <(jq -r '.accounts | keys[]' "$CREDS_FILE")
+
+  rm -f "$CLEANUP_CONFIG"
+  trap - EXIT
+
+  printf "\n  ${C_BOLD}Cleanup summary${C_RESET}"
+  if $DRY_RUN; then
+    printf " ${C_DIM}(dry-run)${C_RESET}"
+  fi
+  printf "\n"
+  printf "  ${C_DIM}%.43s${C_RESET}\n" "───────────────────────────────────────────"
+  printf "  scanned:          %d\n" "$scanned"
+  printf "  smoke-matched:    %d\n" "$matched"
+  if $DRY_RUN; then
+    printf "  ${C_GREEN}would delist:     %d${C_RESET}\n" "$delisted"
+  else
+    printf "  ${C_GREEN}delisted:         %d${C_RESET}\n" "$delisted"
+  fi
+  printf "  skipped (404):    %-3d ${C_DIM}already gone from directory${C_RESET}\n" "$skipped_gone"
+  printf "  skipped (other):  %-3d ${C_DIM}non-smoke profiles, left alone${C_RESET}\n" "$skipped_nonmatch"
+  if [[ "$errors" -gt 0 ]]; then
+    printf "  ${C_RED}errors:           %d${C_RESET}\n" "$errors"
+  else
+    printf "  errors:           0\n"
+  fi
+
+  if [[ "$errors" -gt 0 ]]; then
+    exit 1
+  fi
+  exit 0
+fi
+
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
 printf "  ${C_BOLD}Smoke Test${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -245,17 +440,39 @@ printf "  ${C_DIM}%.43s${C_RESET}\n" "══════════════
 # ═══════════════════════════════════════════════════════════════════════
 
 # ─── Load or create credentials ───────────────────────────────────────
+# Priority order:
+#   1. OUTLAYER_TEST_WALLET_KEY from shell env or frontend/.env (deterministic
+#      runs against a stable wallet; no wallet creation, no funding,
+#      no credentials-file mutation)
+#   2. ~/.config/nearly/credentials.json (the existing test-agent loop)
+#   3. Create a new wallet via OutLayer /register (fallback)
+#
+# Passing --fresh forces option 3 regardless of 1 or 2.
 
 API_KEY=""
 ACCOUNT_ID=""
 
-if [[ -f "$CREDS_FILE" ]] && ! $FRESH; then
+if [[ -n "${OUTLAYER_TEST_WALLET_KEY:-}" ]] && ! $FRESH; then
+  API_KEY="$OUTLAYER_TEST_WALLET_KEY"
+  # /wallet/v1/balance returns account_id alongside balance — no
+  # sign-message round-trip needed to resolve the wallet owner.
+  # (memory: reference_outlayer_balance_returns_account_id)
+  balance_resp=$(curl -s --max-time 10 \
+    -H "Authorization: Bearer $API_KEY" \
+    "${OUTLAYER_API}/wallet/v1/balance?chain=near" 2>/dev/null || echo "")
+  ACCOUNT_ID=$(echo "$balance_resp" | jq -r '.account_id // empty' 2>/dev/null)
+  if [[ -z "$ACCOUNT_ID" ]]; then
+    printf "\n${C_RED}  ✗ OUTLAYER_TEST_WALLET_KEY set but /wallet/v1/balance failed to resolve account_id${C_RESET}\n"
+    printf "${C_DIM}    Check the wallet key is valid and OutLayer is reachable.${C_RESET}\n"
+    exit 1
+  fi
+  info "Using OUTLAYER_TEST_WALLET_KEY from env: $ACCOUNT_ID"
+elif [[ -f "$CREDS_FILE" ]] && ! $FRESH; then
   API_KEY=$(jq -r '.accounts | to_entries[0].value.api_key // empty' "$CREDS_FILE" 2>/dev/null)
   ACCOUNT_ID=$(jq -r '.accounts | to_entries[0].value.account_id // empty' "$CREDS_FILE" 2>/dev/null)
-fi
-
-if [[ -n "$API_KEY" && -n "$ACCOUNT_ID" ]]; then
-  info "Using existing credentials: $ACCOUNT_ID"
+  if [[ -n "$API_KEY" && -n "$ACCOUNT_ID" ]]; then
+    info "Using existing credentials: $ACCOUNT_ID"
+  fi
 fi
 
 # ─── Pre-flight ──────────────────────────────────────────────────────
@@ -376,7 +593,21 @@ STEP_NAME="discover_agents"
 api_call GET "/agents/discover"
 record_latency "discover_agents" "$RESP_MS"
 
+# --target pins the follow/endorse target for deterministic runs.
+# Discover still runs above for its own test coverage, but its result
+# is discarded if a pinned target is set. A pin that equals the smoke
+# agent's own account falls through to discover so the social-graph
+# blocks still exercise real edges.
 FOLLOW_TARGET=""
+FOLLOW_TARGET_PINNED=false
+if [[ -n "$TARGET_FLAG" ]]; then
+  if [[ "$TARGET_FLAG" == "$ACCOUNT_ID" ]]; then
+    info "--target equals smoke wallet — ignoring pin, falling back to discover"
+  else
+    FOLLOW_TARGET="$TARGET_FLAG"
+    FOLLOW_TARGET_PINNED=true
+  fi
+fi
 
 if [[ "$RESP_CODE" != "200" ]]; then
   skip "discover_agents returned $RESP_CODE (${RESP_MS}ms)"
@@ -384,19 +615,30 @@ else
   suggestion_count=$(echo "$RESP_BODY" | jq '.data.agents | length' 2>/dev/null || echo "0")
 
   if [[ "$suggestion_count" -gt 0 ]]; then
-    FOLLOW_TARGET=$(echo "$RESP_BODY" | jq -r '.data.agents[0].account_id // empty' 2>/dev/null)
+    if ! $FOLLOW_TARGET_PINNED; then
+      FOLLOW_TARGET=$(echo "$RESP_BODY" | jq -r '.data.agents[0].account_id // empty' 2>/dev/null)
+    fi
     pass "Got $suggestion_count suggestions (${RESP_MS}ms)"
   else
     pass "Got 0 suggestions (${RESP_MS}ms — may be a new network)"
   fi
 fi
 
+if $FOLLOW_TARGET_PINNED; then
+  info "Pinned follow target (--target): $FOLLOW_TARGET"
+fi
+
 banner "Follow"
 STEP_NAME="follow"
 
 if [[ -z "$FOLLOW_TARGET" ]]; then
-  api_call GET "/agents?limit=1"
-  FOLLOW_TARGET=$(echo "$RESP_BODY" | jq -r '.data.agents[0].account_id // empty' 2>/dev/null)
+  # Pull a handful and pick the first non-self — `limit=1` can return the
+  # smoke agent itself on small / directory-sparse instances.
+  api_call GET "/agents?limit=10"
+  FOLLOW_TARGET=$(echo "$RESP_BODY" \
+    | jq -r --arg self "$ACCOUNT_ID" \
+        '.data.agents[] | select(.account_id != $self) | .account_id' \
+        2>/dev/null | head -1)
 fi
 
 if [[ -z "$FOLLOW_TARGET" || "$FOLLOW_TARGET" == "$ACCOUNT_ID" ]]; then
@@ -456,6 +698,45 @@ else
     verify "key_suffix endorsement visible" "/agents/${FOLLOW_TARGET}/endorsers" \
       "[.data.endorsers[\"${target_key_suffix}\"][]? | select(.account_id == \"${ACCOUNT_ID}\")] | length | tostring" "1"
   fi
+fi
+
+banner "Endorsing (outgoing read)"
+STEP_NAME="endorsing"
+
+# Counterpart of the incoming endorsers read just above: call
+# `GET /agents/${ACCOUNT_ID}/endorsing` and assert that the edge we
+# just wrote shows up, grouped under the target, with the correct
+# key_suffix. Exercises Workstream A of `endorsement-graphs.md` —
+# `handleGetEndorsing` in `fastdata-dispatch.ts`. Skipped if the
+# prior endorse step was itself skipped (no target, no tags, etc.).
+if [[ -z "$FOLLOW_TARGET" || "$FOLLOW_TARGET" == "$ACCOUNT_ID" || -z "${target_key_suffix:-}" ]]; then
+  skip "No prior endorse to verify"
+  record_latency "endorsing" "0"
+else
+  api_call GET "/agents/${ACCOUNT_ID}/endorsing"
+  record_latency "endorsing" "$RESP_MS"
+
+  if [[ "$RESP_CODE" != "200" ]]; then
+    fail_report "endorsing" "HTTP 200" "HTTP $RESP_CODE: $RESP_BODY" \
+      "curl -s ${NEARLY_API}/agents/${ACCOUNT_ID}/endorsing" \
+      "Check handleGetEndorsing — route wired and in PUBLIC_ACTIONS?"
+  fi
+
+  pass "GET /endorsing: HTTP $RESP_CODE (${RESP_MS}ms)"
+
+  # The just-written edge should appear grouped under FOLLOW_TARGET
+  # with the specific key_suffix we used. `verify` retries briefly to
+  # absorb the FastData indexer lag between a write landing on-chain
+  # and the KV index observing it.
+  verify "target present in outgoing map" "/agents/${ACCOUNT_ID}/endorsing" \
+    ".data.endorsing[\"${FOLLOW_TARGET}\"].target.account_id // empty" \
+    "$FOLLOW_TARGET"
+  verify "key_suffix present in target group" "/agents/${ACCOUNT_ID}/endorsing" \
+    "[.data.endorsing[\"${FOLLOW_TARGET}\"].entries[]? | select(.key_suffix == \"${target_key_suffix}\")] | length | tostring" \
+    "1"
+  verify "at_height is numeric" "/agents/${ACCOUNT_ID}/endorsing" \
+    "[.data.endorsing[\"${FOLLOW_TARGET}\"].entries[]? | select(.key_suffix == \"${target_key_suffix}\") | .at_height] | .[0] | type" \
+    "number"
 fi
 
 banner "Heartbeat"
@@ -683,6 +964,48 @@ else
     "curl -H 'Authorization: Bearer near:...' ${NEARLY_API}/agents/me" \
     "near: tokens must work for reads — check decodeNearToken path"
 fi
+
+banner "Verify-Claim End-to-End"
+STEP_NAME="verify_claim"
+
+# Delegates to scripts/test-verify-claim.mjs — the script owns claim minting
+# via local Node 22 WebCrypto and exits 0/1 on aggregate pass. Capture
+# stdout+stderr and only surface it on failure so the gate stays quiet on
+# the happy path.
+vc_start=$SECONDS
+if vc_output=$(node "$SCRIPT_DIR/test-verify-claim.mjs" --url "${NEARLY_API}/verify-claim" 2>&1); then
+  vc_ms=$(( (SECONDS - vc_start) * 1000 ))
+  record_latency "verify_claim" "$vc_ms"
+  pass "verify-claim: all NEP-413 scenarios green (${vc_ms}ms)"
+else
+  vc_ms=$(( (SECONDS - vc_start) * 1000 ))
+  record_latency "verify_claim" "$vc_ms"
+  fail_report "verify_claim" "node test-verify-claim.mjs exits 0" "$vc_output" \
+    "node scripts/test-verify-claim.mjs --url ${NEARLY_API}/verify-claim" \
+    "NEP-413 verifier regression — rerun the script standalone to inspect the failing scenario"
+fi
+
+banner "Admin Hidden (Public Read)"
+STEP_NAME="admin_hidden_read"
+
+# Public, unauthenticated in the handler — the bearer api_call sends is
+# ignored by the read path and only the IP rate limit applies. We're
+# probing the handler/cache/getHiddenSet wire, not the write side.
+api_call GET "/admin/hidden"
+record_latency "admin_hidden_read" "$RESP_MS"
+if [[ "$RESP_CODE" != "200" ]]; then
+  fail_report "admin_hidden_read" "HTTP 200" "HTTP $RESP_CODE: $RESP_BODY" \
+    "curl -s ${NEARLY_API}/admin/hidden" \
+    "Public hidden-list probe — checks GET handler, cache, getHiddenSet, IP rate limiter"
+fi
+hidden_type=$(echo "$RESP_BODY" | jq -r '.data.hidden | type' 2>/dev/null)
+if [[ "$hidden_type" != "array" ]]; then
+  fail_report "admin_hidden_read" ".data.hidden is an array" ".data.hidden is ${hidden_type:-missing}" \
+    "curl -s ${NEARLY_API}/admin/hidden | jq .data.hidden" \
+    "Response shape drift — public GET /admin/hidden must return {data: {hidden: [...]}}"
+fi
+hidden_len=$(echo "$RESP_BODY" | jq -r '.data.hidden | length' 2>/dev/null)
+pass "Admin hidden list: ${hidden_len} entries (${RESP_MS}ms)"
 
 fi  # end --full
 

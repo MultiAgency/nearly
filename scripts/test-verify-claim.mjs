@@ -7,16 +7,30 @@
  *   node scripts/test-verify-claim.mjs --url https://nearly.social/api/v1/verify-claim
  *   NEARLY_VERIFY_URL=https://... node scripts/test-verify-claim.mjs
  *
- * Mints fresh NEP-413 claims using local Node 22 WebCrypto, posts them to the
- * verify-claim endpoint, and asserts the expected shape for each scenario.
- * All tests use implicit NEAR accounts (account_id = hex(pubkey)) so the
- * server never has to touch NEAR RPC — the script runs offline-end-to-end
- * against a local `next dev` or any deployed instance.
+ * Scenarios 1–8 sign fresh NEP-413 claims using local Node 22 WebCrypto and
+ * post them to the verify-claim endpoint. They use implicit NEAR accounts
+ * (account_id = hex(pubkey)) so the server never has to touch NEAR RPC —
+ * these scenarios run offline-end-to-end against a local `next dev` or any
+ * deployed instance.
+ *
+ * Scenario 9 optionally exercises the NAMED-account path: if
+ * `OUTLAYER_TEST_WALLET_KEY` is set (shell env or `frontend/.env`), the script
+ * signs via OutLayer's `/wallet/v1/sign-message` with a real `wk_`, posts
+ * the resulting envelope to verify-claim, and asserts the server performs
+ * the `view_access_key` lookup against NEAR RPC. Without this scenario,
+ * 100% of verify-claim coverage runs through implicit accounts and the
+ * named-account on-chain binding is untested. The scenario is skipped
+ * (not failed) when the wallet key is not available.
  *
  * Exits 0 on all pass, 1 otherwise.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 const DEFAULT_URL = 'http://localhost:3000/api/v1/verify-claim';
+const DEFAULT_OUTLAYER_URL = 'https://api.outlayer.fastnear.com';
 const FETCH_TIMEOUT_MS = 10_000;
 
 function parseArgs(argv) {
@@ -177,6 +191,58 @@ async function post(url, body) {
   return { status: resp.status, body: json };
 }
 
+/**
+ * Load OUTLAYER_TEST_WALLET_KEY from shell env first, then from
+ * `frontend/.env` as a fallback. Returns null when neither is
+ * available — the caller treats null as "skip this scenario,"
+ * never as failure.
+ */
+function loadWalletKey() {
+  if (process.env.OUTLAYER_TEST_WALLET_KEY) return process.env.OUTLAYER_TEST_WALLET_KEY;
+  try {
+    const scriptDir = dirname(fileURLToPath(import.meta.url));
+    const envPath = join(scriptDir, '..', 'frontend', '.env');
+    if (!existsSync(envPath)) return null;
+    const content = readFileSync(envPath, 'utf8');
+    for (const line of content.split('\n')) {
+      const match = line.match(/^OUTLAYER_TEST_WALLET_KEY=(.+)$/);
+      if (match) return match[1].trim();
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * OutLayer HTTP helper with `Authorization: Bearer wk_...` header.
+ * Returns `{status, body, error?}` mirroring the `post` helper above.
+ * Used exclusively by scenario 9 (the OutLayer-signed path).
+ */
+async function outlayerCall(url, walletKey, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: {
+        Authorization: `Bearer ${walletKey}`,
+        ...(body !== undefined && { 'Content-Type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    return { status: 0, body: null, error: err.message };
+  } finally {
+    clearTimeout(timer);
+  }
+  let json = null;
+  try {
+    json = await resp.json();
+  } catch {}
+  return { status: resp.status, body: json };
+}
+
 let passed = 0;
 let failed = 0;
 const USE_COLOR = process.stdout.isTTY;
@@ -312,6 +378,142 @@ async function run(url) {
     });
     assert('replay valid: false', replay.body?.valid === false);
     assert("replay reason: 'replay'", replay.body?.reason === 'replay');
+  }
+
+  // 9. Real named-account case (OutLayer-signed via OUTLAYER_TEST_WALLET_KEY).
+  //
+  // Scenarios 1–8 sign with ephemeral local ed25519 keypairs and implicit
+  // (64-hex) account IDs, so the server-side verifier derives the expected
+  // public key directly from the account_id without touching NEAR RPC.
+  // This scenario exercises the NAMED-account path: a real `wk_` signs
+  // via OutLayer's `/wallet/v1/sign-message`, the envelope is POSTed to
+  // `/verify-claim`, and the verifier performs a `view_access_key`
+  // lookup against NEAR RPC to confirm the signing key is on the
+  // account's chain state. Without this scenario, 100% of verify-claim
+  // coverage runs through implicit accounts and the named-account
+  // on-chain binding is untested end-to-end.
+  //
+  // Gated on OUTLAYER_TEST_WALLET_KEY (shell env or frontend/.env). Skipped,
+  // not failed, when the wallet key is not available — the first eight
+  // scenarios still run and still gate the implicit-account path.
+  {
+    console.log('\n9. Real named-account (OutLayer-signed)');
+    const walletKey = loadWalletKey();
+    if (!walletKey) {
+      console.log(`  ${DIM}○ skipped (OUTLAYER_TEST_WALLET_KEY not set)${RESET}`);
+    } else {
+      const outlayerBase = process.env.OUTLAYER_API_URL ?? DEFAULT_OUTLAYER_URL;
+
+      // Resolve account_id from the wallet key. /wallet/v1/balance
+      // returns account_id alongside balance — no sign-message round-trip
+      // needed to discover the wallet owner.
+      const balanceRes = await outlayerCall(
+        `${outlayerBase}/wallet/v1/balance?chain=near`,
+        walletKey,
+      );
+      if (balanceRes.status !== 200) {
+        assert(
+          'resolve account_id via /wallet/v1/balance',
+          false,
+          `HTTP ${balanceRes.status}: ${JSON.stringify(balanceRes.body)}`,
+        );
+      } else {
+        const accountId = balanceRes.body?.account_id;
+        if (typeof accountId !== 'string' || !accountId) {
+          assert(
+            'balance response includes account_id',
+            false,
+            JSON.stringify(balanceRes.body),
+          );
+        } else {
+          // Build a canonical NEP-413 inner-message matching the SDK's
+          // `buildClaim` shape. The inner `account_id` must match the
+          // outer signer or the server-side verifier rejects on the
+          // account-binding guard.
+          const message = JSON.stringify({
+            action: 'verify_claim_smoke',
+            domain: 'nearly.social',
+            account_id: accountId,
+            version: 1,
+            timestamp: Date.now(),
+          });
+
+          // Ask OutLayer to sign. The response returns {account_id,
+          // public_key, signature, nonce} as snake_case fields; OutLayer
+          // does not echo back the message, so we supply it to complete
+          // the envelope.
+          const signRes = await outlayerCall(
+            `${outlayerBase}/wallet/v1/sign-message`,
+            walletKey,
+            { message, recipient: 'nearly.social' },
+          );
+          if (signRes.status !== 200) {
+            assert(
+              '/wallet/v1/sign-message returned 200',
+              false,
+              `HTTP ${signRes.status}: ${JSON.stringify(signRes.body)}`,
+            );
+          } else if (
+            typeof signRes.body?.signature !== 'string' ||
+            typeof signRes.body?.public_key !== 'string'
+          ) {
+            assert(
+              'sign-message response has signature + public_key',
+              false,
+              JSON.stringify(signRes.body),
+            );
+          } else {
+            const envelope = {
+              account_id: signRes.body.account_id,
+              public_key: signRes.body.public_key,
+              signature: signRes.body.signature,
+              nonce: signRes.body.nonce,
+              message,
+            };
+
+            // Positive: the verifier should call NEAR RPC `view_access_key`
+            // for the named account and confirm the signing public key is
+            // on-chain.
+            const first = await post(url, {
+              ...envelope,
+              recipient: 'nearly.social',
+            });
+            assert(
+              'first status 200',
+              first.status === 200,
+              `got ${first.status}: ${JSON.stringify(first.body)}`,
+            );
+            assert(
+              'first valid: true',
+              first.body?.valid === true,
+              JSON.stringify(first.body),
+            );
+            assert(
+              'first account_id matches resolved',
+              first.body?.account_id === accountId,
+              `expected ${accountId}, got ${first.body?.account_id}`,
+            );
+
+            // Replay negative: same envelope twice must be rejected.
+            // Guards the replay store against named-account regressions.
+            const second = await post(url, {
+              ...envelope,
+              recipient: 'nearly.social',
+            });
+            assert(
+              'second valid: false',
+              second.body?.valid === false,
+              JSON.stringify(second.body),
+            );
+            assert(
+              "second reason: 'replay'",
+              second.body?.reason === 'replay',
+              JSON.stringify(second.body),
+            );
+          }
+        }
+      }
+    }
   }
 
   console.log(

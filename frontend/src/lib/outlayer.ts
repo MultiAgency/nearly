@@ -2,32 +2,10 @@ import { API_TIMEOUT_MS } from './constants';
 import { assertOk, fetchWithTimeout } from './fetch';
 
 /**
- * `POST /register` on api.outlayer.fastnear.com returns the full shape below.
- * `OutlayerRegisterResponse` types the fields Nearly currently reads —
- * required fields are load-bearing, optional fields are surfaced
- * pass-through for consumers that want them (the runtime `registerOutlayer`
- * just returns `res.json()`, so every wire field is already reachable at
- * runtime; the type is the only gate on callers).
- *
- *   {
- *     wallet_id:        string     // opaque custody-wallet UUID (not yet typed)
- *     api_key:          string     // wk_-prefixed bearer token (required)
- *     near_account_id:  string     // 64-hex NEAR account (required)
- *     handoff_url:      string     // https://outlayer.fastnear.com/wallet?key=wk_...
- *                                  //   hosted wallet-management UI; deep-link
- *                                  //   for a "Manage wallet" affordance (typed)
- *     trial: {
- *       calls_remaining: number    // (required)
- *       expires_at:      string    // ISO-8601 — trial window end (typed)
- *       limits: {                  // per-call TEE execution budget (not yet typed)
- *         max_instructions:       number
- *         max_execution_seconds:  number
- *         max_memory_mb:          number
- *       }
- *     }
- *   }
- *
- * Verified against production /register on 2026-04-14.
+ * Partial type for `POST /register`. `registerOutlayer` passes the JSON
+ * through unchanged, so fields not listed here (wallet_id, trial.limits)
+ * are still reachable at runtime via a cast. Full wire shape lives at
+ * skills.outlayer.ai/agent-custody.
  */
 export interface OutlayerRegisterResponse {
   api_key: string;

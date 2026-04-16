@@ -113,7 +113,7 @@ describe('NearlyClient constructor', () => {
 
 describe('NearlyClient.register', () => {
   // OutLayer /register is an unauthenticated provisioning call. These tests
-  // cover the happy path and every failure mode registerWallet maps to a
+  // cover the happy path and every failure mode createWallet maps to a
   // NearlyError. The integration test (integration.test.ts) covers the
   // live round-trip; these are mocked fetch unit tests.
 
@@ -323,196 +323,6 @@ describe('NearlyClient.register', () => {
       // Serialize the full error shape including message and stringified
       // shape fields — nothing in the observable error surface should
       // contain the wk_ prefix.
-      const serialized = JSON.stringify({
-        message: nearlyErr.message,
-        shape: nearlyErr.shape,
-      });
-      expect(serialized).not.toMatch(/wk_[A-Za-z0-9_]+/);
-    }
-  });
-});
-
-describe('NearlyClient.deriveSubAgent', () => {
-  // All paths use a single API-key response to simulate OutLayer's
-  // PUT /wallet/v1/api-key reply. The SubAgentResult includes a
-  // functional NearlyClient bound to the derived wk_.
-  function apiKeyResponseBody(accountId = 'a'.repeat(64)): unknown {
-    return { wallet_id: 'uuid-sub-agent', near_account_id: accountId };
-  }
-
-  function parentClient(fetch: FetchLike): NearlyClient {
-    return new NearlyClient({
-      walletKey: 'wk_parent',
-      accountId: 'parent.near',
-      fastdataUrl: 'https://kv.example',
-      outlayerUrl: 'https://outlayer.example',
-      namespace: 'contextual.near',
-      fetch,
-      rateLimiting: false,
-    });
-  }
-
-  it('derives a sub-wallet, registers its key hash, returns a working client', async () => {
-    const { fetch, calls } = scripted((url) => {
-      if (url.endsWith('/wallet/v1/api-key'))
-        return jsonResponse(apiKeyResponseBody('b'.repeat(64)));
-      throw new Error(`unexpected url: ${url}`);
-    });
-    const parent = parentClient(fetch);
-    const result = await parent.deriveSubAgent({ seed: 'worker-1' });
-    expect(result.walletKey).toMatch(/^wk_[0-9a-f]{64}$/);
-    expect(result.accountId).toBe('b'.repeat(64));
-    expect(result.client).toBeInstanceOf(NearlyClient);
-    expect(result.client.accountId).toBe('b'.repeat(64));
-    // One PUT to /wallet/v1/api-key.
-    const apiKeyCalls = calls.filter((c) =>
-      c.url.endsWith('/wallet/v1/api-key'),
-    );
-    expect(apiKeyCalls).toHaveLength(1);
-    expect(apiKeyCalls[0].init?.method).toBe('PUT');
-    // Parent's Bearer, not the derived sub-key.
-    const auth = (apiKeyCalls[0].init?.headers as Record<string, string>)
-      ?.Authorization;
-    expect(auth).toBe('Bearer wk_parent');
-    const body = JSON.parse(apiKeyCalls[0].init?.body as string);
-    expect(body.seed).toBe('worker-1');
-    expect(body.key_hash).toMatch(/^[0-9a-f]{64}$/);
-  });
-
-  it('idempotent on the wire — same seed twice sends the same key_hash', async () => {
-    const { fetch, calls } = scripted(() => jsonResponse(apiKeyResponseBody()));
-    const parent = parentClient(fetch);
-    await parent.deriveSubAgent({ seed: 'worker' });
-    await parent.deriveSubAgent({ seed: 'worker' });
-    const apiKeyBodies = calls
-      .filter((c) => c.url.endsWith('/wallet/v1/api-key'))
-      .map((c) => JSON.parse(c.init?.body as string));
-    expect(apiKeyBodies).toHaveLength(2);
-    expect(apiKeyBodies[0].key_hash).toBe(apiKeyBodies[1].key_hash);
-  });
-
-  it('deterministic across instances — two parents with the same wk_ derive the same sub_key', async () => {
-    const { fetch: f1 } = scripted(() => jsonResponse(apiKeyResponseBody()));
-    const { fetch: f2 } = scripted(() => jsonResponse(apiKeyResponseBody()));
-    const p1 = parentClient(f1);
-    const p2 = parentClient(f2);
-    const r1 = await p1.deriveSubAgent({ seed: 'same' });
-    const r2 = await p2.deriveSubAgent({ seed: 'same' });
-    expect(r1.walletKey).toBe(r2.walletKey);
-  });
-
-  it('different seeds produce different walletKeys', async () => {
-    const { fetch } = scripted(() => jsonResponse(apiKeyResponseBody()));
-    const parent = parentClient(fetch);
-    const a = await parent.deriveSubAgent({ seed: 'worker-a' });
-    const b = await parent.deriveSubAgent({ seed: 'worker-b' });
-    expect(a.walletKey).not.toBe(b.walletKey);
-  });
-
-  it('derived client inherits parent connection config (outlayerUrl, namespace)', async () => {
-    const { fetch } = scripted((url) => {
-      if (url.endsWith('/wallet/v1/api-key'))
-        return jsonResponse(apiKeyResponseBody());
-      if (url.includes('/v0/latest/'))
-        return profileEntryResponse(aliceProfileBlob);
-      return jsonResponse({});
-    });
-    const parent = parentClient(fetch);
-    const { client } = await parent.deriveSubAgent({ seed: 'worker' });
-    // Read via the sub-client — proves fastdataUrl passed through.
-    const agent = await client.getAgent(client.accountId);
-    expect(agent === null || typeof agent === 'object').toBe(true);
-  });
-
-  it('throws VALIDATION_ERROR on empty seed (synchronously, no HTTP)', async () => {
-    const { fetch, calls } = scripted(() => jsonResponse(apiKeyResponseBody()));
-    const parent = parentClient(fetch);
-    await expect(parent.deriveSubAgent({ seed: '' })).rejects.toMatchObject({
-      shape: { code: 'VALIDATION_ERROR', field: 'seed' },
-    });
-    expect(calls).toHaveLength(0);
-  });
-
-  it('throws VALIDATION_ERROR on seed > 256 chars', async () => {
-    const { fetch, calls } = scripted(() => jsonResponse(apiKeyResponseBody()));
-    const parent = parentClient(fetch);
-    await expect(
-      parent.deriveSubAgent({ seed: 'x'.repeat(257) }),
-    ).rejects.toMatchObject({
-      shape: { code: 'VALIDATION_ERROR', field: 'seed' },
-    });
-    expect(calls).toHaveLength(0);
-  });
-
-  it('throws NETWORK on fetch rejection', async () => {
-    const fetch: FetchLike = async () => {
-      throw new Error('ECONNRESET');
-    };
-    const parent = parentClient(fetch);
-    await expect(
-      parent.deriveSubAgent({ seed: 'worker' }),
-    ).rejects.toMatchObject({ shape: { code: 'NETWORK' } });
-  });
-
-  it('throws AUTH_FAILED on 401 (parent wk_ rejected)', async () => {
-    const { fetch } = scripted(
-      () => new Response('unauthorized', { status: 401 }),
-    );
-    const parent = parentClient(fetch);
-    await expect(
-      parent.deriveSubAgent({ seed: 'worker' }),
-    ).rejects.toMatchObject({ shape: { code: 'AUTH_FAILED' } });
-  });
-
-  it('throws PROTOCOL on 5xx with truncated body in hint', async () => {
-    const { fetch } = scripted(
-      () => new Response('upstream down', { status: 502 }),
-    );
-    const parent = parentClient(fetch);
-    await expect(
-      parent.deriveSubAgent({ seed: 'worker' }),
-    ).rejects.toMatchObject({
-      shape: {
-        code: 'PROTOCOL',
-        hint: expect.stringContaining('api-key 502'),
-      },
-    });
-  });
-
-  it('throws PROTOCOL when near_account_id is missing from response', async () => {
-    const { fetch } = scripted(() => jsonResponse({ wallet_id: 'only-this' }));
-    const parent = parentClient(fetch);
-    await expect(
-      parent.deriveSubAgent({ seed: 'worker' }),
-    ).rejects.toMatchObject({
-      shape: {
-        code: 'PROTOCOL',
-        hint: expect.stringContaining('near_account_id'),
-      },
-    });
-  });
-
-  it('does not leak the parent wk_ into any error after a post-success failure path', async () => {
-    // Force a parsing failure after OutLayer returned 200 — the parent's
-    // wk_secret_parent_DO_NOT_LEAK was already used to authenticate the
-    // PUT, and the test asserts the error surface cannot contain it.
-    const { fetch } = scripted(
-      () => new Response('<html>surprise</html>', { status: 200 }),
-    );
-    const parent = new NearlyClient({
-      walletKey: 'wk_secret_parent_DO_NOT_LEAK',
-      accountId: 'parent.near',
-      fastdataUrl: 'https://kv.example',
-      outlayerUrl: 'https://outlayer.example',
-      fetch,
-      rateLimiting: false,
-    });
-    try {
-      await parent.deriveSubAgent({ seed: 'worker' });
-      throw new Error('expected deriveSubAgent to throw');
-    } catch (err) {
-      expect(err).toBeInstanceOf(NearlyError);
-      const nearlyErr = err as NearlyError;
       const serialized = JSON.stringify({
         message: nearlyErr.message,
         shape: nearlyErr.shape,
@@ -1326,6 +1136,193 @@ describe('NearlyClient.getEndorsers', () => {
   });
 });
 
+describe('NearlyClient.getEndorsing', () => {
+  function targetProfileResp(accountId: string, name: string): Response {
+    return jsonResponse({
+      entries: [
+        {
+          predecessor_id: accountId,
+          current_account_id: 'contextual.near',
+          block_height: 1,
+          block_timestamp: 1,
+          key: 'profile',
+          value: { ...aliceProfileBlob, account_id: accountId, name },
+        },
+      ],
+    });
+  }
+
+  it('returns {} when the account has written no endorsements', async () => {
+    const { fetch } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    expect(await client.getEndorsing('alice.near')).toEqual({});
+  });
+
+  it('groups by target with profile summary and preserves multi-segment suffixes', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'endorsing/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 101,
+                block_timestamp: 1_700_000_100 * 1e9,
+                key: 'endorsing/bob.near/tags/rust',
+                value: { reason: 'audit reviewer', content_hash: 'sha256:abc' },
+              },
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 102,
+                block_timestamp: 1_700_000_200 * 1e9,
+                key: 'endorsing/bob.near/task_completion/job_42',
+                value: {},
+              },
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 303,
+                block_timestamp: 1_700_000_300 * 1e9,
+                key: 'endorsing/carol.near/trusted',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return targetProfileResp('bob.near', 'Bob');
+      if (url.endsWith('/v0/latest/contextual.near/carol.near/profile'))
+        return targetProfileResp('carol.near', 'Carol');
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const endorsing = await client.getEndorsing('alice.near');
+
+    expect(Object.keys(endorsing).sort()).toEqual(['bob.near', 'carol.near']);
+    expect(endorsing['bob.near'].target).toMatchObject({
+      account_id: 'bob.near',
+      name: 'Bob',
+    });
+    expect(endorsing['bob.near'].entries).toHaveLength(2);
+    // Multi-segment suffix survives split-on-first-slash.
+    const bobSuffixes = endorsing['bob.near'].entries
+      .map((e) => e.key_suffix)
+      .sort();
+    expect(bobSuffixes).toEqual(['tags/rust', 'task_completion/job_42']);
+
+    // reason / content_hash round-trip from stored value.
+    const rust = endorsing['bob.near'].entries.find(
+      (e) => e.key_suffix === 'tags/rust',
+    );
+    expect(rust).toMatchObject({
+      reason: 'audit reviewer',
+      content_hash: 'sha256:abc',
+      at: 1_700_000_100,
+      at_height: 101,
+    });
+    // Absent metadata stays undefined — defensive parse.
+    const job = endorsing['bob.near'].entries.find(
+      (e) => e.key_suffix === 'task_completion/job_42',
+    );
+    expect(job?.reason).toBeUndefined();
+    expect(job?.content_hash).toBeUndefined();
+    expect(job?.at).toBe(1_700_000_200);
+    expect(job?.at_height).toBe(102);
+
+    // Single-segment suffix on a second target.
+    expect(endorsing['carol.near'].entries).toHaveLength(1);
+    expect(endorsing['carol.near'].entries[0]).toMatchObject({
+      key_suffix: 'trusted',
+      at: 1_700_000_300,
+      at_height: 303,
+    });
+  });
+
+  it('synthesizes a null-fielded summary when the target has no profile blob', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'endorsing/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1_700_000_000 * 1e9,
+                key: 'endorsing/ghost.near/tags/rust',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/ghost.near/profile'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const endorsing = await client.getEndorsing('alice.near');
+    // Endorsement surfaces even though target has no profile.
+    expect(endorsing['ghost.near'].target).toEqual({
+      account_id: 'ghost.near',
+      name: null,
+      description: '',
+      image: null,
+    });
+    expect(endorsing['ghost.near'].entries).toHaveLength(1);
+  });
+
+  it('drops entries with empty suffixes and wrong prefixes defensively', async () => {
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'endorsing/') {
+          return jsonResponse({
+            entries: [
+              // Empty suffix — dropped.
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1,
+                key: 'endorsing/bob.near/',
+                value: {},
+              },
+              // Valid — kept.
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 2,
+                block_timestamp: 2_000_000_000,
+                key: 'endorsing/bob.near/tags/rust',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return targetProfileResp('bob.near', 'Bob');
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const endorsing = await client.getEndorsing('alice.near');
+    expect(endorsing['bob.near'].entries).toHaveLength(1);
+    expect(endorsing['bob.near'].entries[0].key_suffix).toBe('tags/rust');
+  });
+});
+
 describe('NearlyClient.listTags / listCapabilities', () => {
   it('listTags aggregates existence entries and sorts by count desc', async () => {
     const { fetch } = scripted((url, init) => {
@@ -1981,6 +1978,104 @@ describe('NearlyClient.endorse / unendorse', () => {
     expect(body.args['endorsing/bob.near/tags/rust']).toBeNull();
     expect(body.args['endorsing/bob.near/skills/audit']).toBeNull();
   });
+
+  it('endorse partitions mixed valid/invalid suffixes, writes valid, reports skipped', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return profileResp('bob.near', 'Bob');
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    // '/leading-slash' fails validateKeySuffix; 'tags/rust' and
+    // 'skills/audit' are valid. Partition writes the two valid ones
+    // and surfaces the rejected one in `skipped`.
+    const res = await client.endorse('bob.near', {
+      keySuffixes: ['tags/rust', '/leading-slash', 'skills/audit'],
+      reason: 'great work',
+    });
+    expect(res.action).toBe('endorsed');
+    expect(res.key_suffixes.sort()).toEqual(['skills/audit', 'tags/rust']);
+    expect(res.skipped).toBeDefined();
+    expect(res.skipped).toHaveLength(1);
+    expect(res.skipped?.[0]?.key_suffix).toBe('/leading-slash');
+
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    // Only valid keys landed on the wire; the invalid one never reached
+    // buildEndorse.
+    expect(body.args['endorsing/bob.near/tags/rust']).toEqual({
+      reason: 'great work',
+    });
+    expect(body.args['endorsing/bob.near/skills/audit']).toEqual({
+      reason: 'great work',
+    });
+    expect(body.args).not.toHaveProperty('endorsing/bob.near//leading-slash');
+  });
+
+  it('endorse throws VALIDATION_ERROR when every suffix is invalid', async () => {
+    const { fetch, calls } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    await expect(
+      client.endorse('bob.near', {
+        keySuffixes: ['/bad1', '/bad2'],
+      }),
+    ).rejects.toMatchObject({
+      shape: {
+        code: 'VALIDATION_ERROR',
+        field: 'keySuffixes',
+        reason: 'no valid key_suffixes',
+      },
+    });
+    // No network work — threw synchronously before the target-existence
+    // read and before any write.
+    expect(calls.find((c) => c.url.includes('/v0/latest'))).toBeUndefined();
+    expect(
+      calls.find((c) => c.url.includes('/wallet/v1/call')),
+    ).toBeUndefined();
+  });
+
+  it('unendorse partitions mixed valid/invalid suffixes, null-writes valid, reports skipped', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const res = await client.unendorse('bob.near', [
+      'tags/rust',
+      '/leading-slash',
+      'skills/audit',
+    ]);
+    expect(res.action).toBe('unendorsed');
+    expect(res.key_suffixes.sort()).toEqual(['skills/audit', 'tags/rust']);
+    expect(res.skipped).toHaveLength(1);
+    expect(res.skipped?.[0]?.key_suffix).toBe('/leading-slash');
+
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    expect(body.args['endorsing/bob.near/tags/rust']).toBeNull();
+    expect(body.args['endorsing/bob.near/skills/audit']).toBeNull();
+    expect(body.args).not.toHaveProperty('endorsing/bob.near//leading-slash');
+  });
+
+  it('endorse dedupes first-occurrence-wins and preserves order', async () => {
+    const { fetch, calls } = scripted((url) => {
+      if (url.endsWith('/v0/latest/contextual.near/bob.near/profile'))
+        return profileResp('bob.near', 'Bob');
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const res = await client.endorse('bob.near', {
+      keySuffixes: ['tags/rust', 'skills/audit', 'tags/rust'],
+    });
+    // Duplicate 'tags/rust' is deduped; both unique keys land.
+    expect(res.key_suffixes).toHaveLength(2);
+    expect(res.skipped).toBeUndefined();
+    const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
+    const body = JSON.parse(writeCall.init!.body as string);
+    expect(Object.keys(body.args)).toHaveLength(2);
+  });
 });
 
 describe('NearlyClient.delist', () => {
@@ -2157,7 +2252,7 @@ describe('wallet key leakage sweep', () => {
     });
   }
 
-  it('submitWrite 500 body is sanitized before protocolError interpolation', async () => {
+  it('writeEntries 500 body is sanitized before protocolError interpolation', async () => {
     const { fetch } = scripted((url) => {
       if (url.includes('/v0/latest/'))
         return profileEntryResponse(aliceProfileBlob);
@@ -2177,7 +2272,7 @@ describe('wallet key leakage sweep', () => {
     }
   });
 
-  it('submitWrite network-layer fetch throw with wk_ in cause message is sanitized', async () => {
+  it('writeEntries network-layer fetch throw with wk_ in cause message is sanitized', async () => {
     const { fetch } = scripted((url) => {
       if (url.includes('/v0/latest/'))
         return profileEntryResponse(aliceProfileBlob);
@@ -2195,7 +2290,7 @@ describe('wallet key leakage sweep', () => {
     }
   });
 
-  it('registerWallet 5xx body is sanitized before protocolError interpolation', async () => {
+  it('createWallet 5xx body is sanitized before protocolError interpolation', async () => {
     const { fetch } = scripted(() =>
       textResponse(`upstream rejected, offending token ${LEAK_KEY}`, 503),
     );

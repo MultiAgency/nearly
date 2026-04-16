@@ -1,10 +1,14 @@
 /**
  * Integration test: real FastData + OutLayer round-trip.
  *
- * Gated on both WK_KEY and WK_ACCOUNT_ID. Skipped in CI and normal local
- * runs. Run manually before release:
+ * Gated on `OUTLAYER_TEST_WALLET_KEY` (shared with `scripts/smoke.sh` and
+ * `frontend/.env`). The caller's `account_id` is resolved from
+ * `/wallet/v1/balance` at test startup — no separate env var. Skipped
+ * in CI and normal local runs. Run manually before release:
  *
- *   WK_KEY=wk_... WK_ACCOUNT_ID=alice.near npx jest integration
+ *   OUTLAYER_TEST_WALLET_KEY=wk_... npx jest integration
+ *
+ * With `frontend/.env` sourced, that's just `npx jest integration`.
  *
  * This is the only layer that catches protocol drift — FastData or OutLayer
  * renaming a response field, changing a status code, or shifting behavior.
@@ -12,15 +16,20 @@
  */
 
 import { NearlyClient } from '../src/client';
-import { DEFAULT_FASTDATA_URL, DEFAULT_NAMESPACE } from '../src/constants';
+import {
+  DEFAULT_FASTDATA_URL,
+  DEFAULT_NAMESPACE,
+  DEFAULT_OUTLAYER_URL,
+} from '../src/constants';
 import { createReadTransport, kvGetKey } from '../src/read';
+import { createWalletClient, getBalance } from '../src/wallet';
 
-const hasCreds = !!process.env.WK_KEY && !!process.env.WK_ACCOUNT_ID;
+const hasCreds = !!process.env.OUTLAYER_TEST_WALLET_KEY;
 const suite = hasCreds ? describe : describe.skip;
 
 // Register integration is separately gated — every run burns a real
-// OutLayer trial wallet, so we don't want it to tag along with WK_KEY-gated
-// heartbeat runs. Opt in explicitly:
+// OutLayer trial wallet, so we don't want it to tag along with the
+// credentialed suite. Opt in explicitly:
 //
 //   NEARLY_REGISTER_INTEGRATION=1 npx jest integration
 //
@@ -46,48 +55,27 @@ registerSuite('integration: real OutLayer register', () => {
   }, 15_000);
 });
 
-// Separate gate from WK_KEY so running the heartbeat integration test
-// doesn't inadvertently derive sub-wallets on every run. Each sub-agent
-// derivation creates a residue sub-wallet that cannot be cleanly
-// reclaimed — DELETE /wallet/v1/api-key/{key_hash} rejects "last active
-// key for the wallet", so the derived wk_ stays live indefinitely.
-// Accept the residue (same posture as the register gate).
-//
-//   NEARLY_SUB_AGENT_INTEGRATION=1 WK_KEY=wk_... WK_ACCOUNT_ID=alice.near \
-//     npx jest integration
-//
-// Do NOT set this in CI.
-const hasSubAgentGate = process.env.NEARLY_SUB_AGENT_INTEGRATION === '1';
-const subAgentSuite = hasSubAgentGate ? describe : describe.skip;
+// Resolved once from OUTLAYER_TEST_WALLET_KEY via `/wallet/v1/balance`
+// in `beforeAll` below — one env var, zero per-test setup.
+let callerAccountId: string;
 
-subAgentSuite('integration: real OutLayer sub-agent derivation', () => {
-  it('derives a sub-wallet from an existing parent', async () => {
-    const parent = new NearlyClient({
-      walletKey: process.env.WK_KEY!,
-      accountId: process.env.WK_ACCOUNT_ID!,
-    });
-    // Time-based seed so each run creates a distinct sub-wallet — avoids
-    // re-deriving the same wallet across runs on the same parent account.
-    const seed = `subagent-test-${Date.now()}`;
-    const result = await parent.deriveSubAgent({ seed });
-    expect(result.walletKey).toMatch(/^wk_[0-9a-f]{64}$/);
-    expect(result.accountId).toMatch(/^[0-9a-f]{64}$/);
-    expect(result.client.accountId).toBe(result.accountId);
-    // Same seed a second time MUST produce the same derived wallet —
-    // proves OutLayer's server-side idempotency and the SDK's pure
-    // derivation agree in the live wire contract.
-    const result2 = await parent.deriveSubAgent({ seed });
-    expect(result2.walletKey).toBe(result.walletKey);
-    expect(result2.accountId).toBe(result.accountId);
-    // Intentionally do NOT exercise the sub-wallet beyond this —
-    // residue budget is real and each run provisions a fresh wallet.
-  }, 15_000);
-});
+beforeAll(async () => {
+  if (!hasCreds) return;
+  const wallet = createWalletClient({
+    outlayerUrl: DEFAULT_OUTLAYER_URL,
+    namespace: DEFAULT_NAMESPACE,
+    walletKey: process.env.OUTLAYER_TEST_WALLET_KEY!,
+    claimDomain: 'nearly.social',
+    claimVersion: 1,
+  });
+  const { accountId } = await getBalance(wallet, { chain: 'near' });
+  callerAccountId = accountId;
+}, 15_000);
 
 suite('integration: real FastData + OutLayer', () => {
   it('heartbeat round-trips and advances last_active', async () => {
-    const walletKey = process.env.WK_KEY!;
-    const accountId = process.env.WK_ACCOUNT_ID!;
+    const walletKey = process.env.OUTLAYER_TEST_WALLET_KEY!;
+    const accountId = callerAccountId;
 
     const readTransport = createReadTransport({
       fastdataUrl: DEFAULT_FASTDATA_URL,
@@ -119,5 +107,76 @@ suite('integration: real FastData + OutLayer', () => {
       await new Promise((r) => setTimeout(r, 500));
     }
     expect(after).toBeGreaterThan(before);
+  }, 30_000);
+
+  // Read surface: getAgent + listAgents. No writes, safe to run every
+  // time OUTLAYER_TEST_WALLET_KEY is set. Catches FastData response-shape
+  // drift that the mocked read.test.ts cannot see — and exercises the
+  // fold layer end-to-end against real KV entries rather than fixture
+  // blobs.
+  it('getAgent returns the caller profile with live counts', async () => {
+    const client = new NearlyClient({
+      walletKey: process.env.OUTLAYER_TEST_WALLET_KEY!,
+      accountId: callerAccountId,
+    });
+    const agent = await client.getAgent(callerAccountId);
+    if (!agent) return; // profile not yet indexed; heartbeat lag tolerated.
+    expect(agent.account_id).toBe(callerAccountId);
+    expect(typeof agent.follower_count).toBe('number');
+    expect(typeof agent.following_count).toBe('number');
+    expect(typeof agent.endorsement_count).toBe('number');
+    expect(agent.last_active).toBeGreaterThan(0);
+  }, 20_000);
+
+  it('listAgents sort=active yields a sorted page of the directory', async () => {
+    const client = new NearlyClient({
+      walletKey: process.env.OUTLAYER_TEST_WALLET_KEY!,
+      accountId: callerAccountId,
+    });
+    // Cap the iterator — the full directory is large and a smoke test
+    // does not need to drain it. Every yielded agent must carry a
+    // block-derived `last_active`; any drift means the fold layer or
+    // the FastData response shape changed.
+    const seen: number[] = [];
+    for await (const a of client.listAgents({ sort: 'active', limit: 20 })) {
+      expect(typeof a.description).toBe('string');
+      expect(a.last_active).toBeGreaterThan(0);
+      seen.push(a.last_active ?? 0);
+    }
+    expect(seen.length).toBeGreaterThan(0);
+    // Sort contract: last_active must be monotonically non-increasing.
+    for (let i = 1; i < seen.length; i++) {
+      expect(seen[i]).toBeLessThanOrEqual(seen[i - 1]);
+    }
+  }, 30_000);
+
+  // Follow / unfollow round-trip. Restores pre-state so reruns are
+  // idempotent. Target defaults to `contextual.near` (the FastData
+  // namespace owner, stable); override with OUTLAYER_TEST_ACCOUNT —
+  // the same env var `scripts/smoke.sh` uses for its follow/endorse
+  // target, so one `frontend/.env` covers both runners.
+  it('follow + unfollow round-trip against a stable target', async () => {
+    const client = new NearlyClient({
+      walletKey: process.env.OUTLAYER_TEST_WALLET_KEY!,
+      accountId: callerAccountId,
+    });
+    const target = process.env.OUTLAYER_TEST_ACCOUNT ?? 'contextual.near';
+    if (target === callerAccountId) return; // self-follow rejected.
+
+    const targetAgent = await client.getAgent(target);
+    if (!targetAgent) return; // target has no profile blob; skip.
+
+    const followResult = await client.follow(target, {
+      reason: 'integration smoke',
+    });
+    expect(['followed', 'already_following']).toContain(followResult.action);
+    expect(followResult.target).toBe(target);
+
+    // Only retract what we wrote — if caller was already following
+    // before this test, leave state untouched so reruns are idempotent.
+    if (followResult.action === 'followed') {
+      const unfollowResult = await client.unfollow(target);
+      expect(['unfollowed', 'not_following']).toContain(unfollowResult.action);
+    }
   }, 30_000);
 });

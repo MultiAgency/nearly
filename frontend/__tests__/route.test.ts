@@ -8,6 +8,7 @@ const mockCallOutlayer = jest.fn();
 const mockSignMessage = jest.fn();
 jest.mock('@/lib/outlayer-server', () => ({
   getOutlayerPaymentKey: () => 'pk_test',
+  buildAdminNearToken: () => 'near:mock_admin_token',
   sanitizePublic: jest.requireActual('@/lib/outlayer-server').sanitizePublic,
   callOutlayer: (...args: unknown[]) => mockCallOutlayer(...args),
   signClaimForWalletKey: jest.fn().mockResolvedValue(null),
@@ -23,18 +24,11 @@ jest.mock('@/lib/fastdata-dispatch', () => ({
 }));
 
 const mockDispatchWrite = jest.fn();
-const mockDispatchNep413Write = jest.fn();
 const mockWriteToFastData = jest.fn().mockResolvedValue({ ok: true });
 jest.mock('@/lib/fastdata-write', () => ({
   dispatchWrite: (...args: unknown[]) => mockDispatchWrite(...args),
-  dispatchNep413Write: (...args: unknown[]) => mockDispatchNep413Write(...args),
   writeToFastData: (...args: unknown[]) => mockWriteToFastData(...args),
   invalidatesFor: jest.fn().mockReturnValue(['hidden']),
-}));
-
-const mockVerifyClaim = jest.fn();
-jest.mock('@/lib/verify-claim', () => ({
-  verifyClaim: (...args: unknown[]) => mockVerifyClaim(...args),
 }));
 
 const mockKvGetAgent = jest.fn().mockResolvedValue(null);
@@ -109,30 +103,6 @@ beforeEach(() => {
     success: true,
     data: {},
     invalidates: ['list_agents', 'profile'],
-  });
-  mockDispatchNep413Write.mockResolvedValue({
-    success: true,
-    data: {
-      action: 'claimed',
-      operator_account_id: 'alice.near',
-      agent_account_id: 'bot.near',
-    },
-    invalidates: ['agent_claims'],
-  });
-  mockVerifyClaim.mockResolvedValue({
-    valid: true,
-    account_id: 'alice.near',
-    public_key: 'ed25519:testpubkey',
-    recipient: 'nearly.social',
-    nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-    message: {
-      action: 'claim_operator',
-      domain: 'nearly.social',
-      account_id: 'alice.near',
-      version: 1,
-      timestamp: 1_700_000_000_000,
-    },
-    verified_at: 1_700_000_000_000,
   });
   mockSignMessage.mockResolvedValue(null);
   // Authenticated GETs resolve caller account via resolveAccountId.
@@ -216,19 +186,20 @@ describe('route resolution', () => {
     ['GET', 'agents', 'list_agents'],
     ['GET', 'agents/discover', 'discover_agents'],
     ['GET', 'agents/me', 'me'],
-    ['PATCH', 'agents/me', 'update_me'],
-    ['POST', 'agents/me/heartbeat', 'heartbeat'],
+    ['PATCH', 'agents/me', 'social.update_me'],
+    ['POST', 'agents/me/heartbeat', 'social.heartbeat'],
     ['GET', 'agents/me/activity', 'activity'],
     ['GET', 'agents/me/network', 'network'],
     ['GET', 'agents/alice.near', 'profile'],
-    ['POST', 'agents/alice.near/follow', 'follow'],
-    ['DELETE', 'agents/alice.near/follow', 'unfollow'],
+    ['POST', 'agents/alice.near/follow', 'social.follow'],
+    ['DELETE', 'agents/alice.near/follow', 'social.unfollow'],
     ['GET', 'agents/alice.near/followers', 'followers'],
     ['GET', 'agents/alice.near/following', 'following'],
     ['GET', 'agents/alice.near/edges', 'edges'],
-    ['POST', 'agents/alice.near/endorse', 'endorse'],
-    ['DELETE', 'agents/alice.near/endorse', 'unendorse'],
+    ['POST', 'agents/alice.near/endorse', 'social.endorse'],
+    ['DELETE', 'agents/alice.near/endorse', 'social.unendorse'],
     ['GET', 'agents/alice.near/endorsers', 'endorsers'],
+    ['GET', 'agents/alice.near/endorsing', 'endorsing'],
   ])('%s %s → %s', async (method: string, path: string, expectedAction: string) => {
     const handlers: Record<string, typeof GET> = { GET, POST, PATCH, DELETE };
     const handler = handlers[method]!;
@@ -246,13 +217,13 @@ describe('route resolution', () => {
     await handler(req, params);
 
     const DIRECT_WRITE_ACTIONS = new Set([
-      'follow',
-      'unfollow',
-      'endorse',
-      'unendorse',
-      'update_me',
-      'heartbeat',
-      'delist_me',
+      'social.follow',
+      'social.unfollow',
+      'social.endorse',
+      'social.unendorse',
+      'social.update_me',
+      'social.heartbeat',
+      'social.delist_me',
     ]);
 
     if (expectedAction === 'discover_agents') {
@@ -418,15 +389,15 @@ describe('injection prevention', () => {
     const [req, params] = makeRequest(
       'POST',
       'agents/alice.near/follow',
-      { action: 'delist_me' },
+      { action: 'social.delist_me' },
       { authorization: 'Bearer wk_test' },
     );
     await POST(req, params);
 
-    // Even though body.action was 'delist_me', the route resolved to 'follow'
-    // and dispatchWrite was called with the follow action.
+    // Even though body.action was 'social.delist_me', the route resolved to
+    // 'social.follow' and dispatchWrite was called with the follow action.
     expect(mockDispatchWrite).toHaveBeenCalledTimes(1);
-    expect(mockDispatchWrite.mock.calls[0][0]).toBe('follow');
+    expect(mockDispatchWrite.mock.calls[0][0]).toBe('social.follow');
   });
 
   it('route params override body account_id to prevent injection', async () => {
@@ -459,17 +430,14 @@ describe('injection prevention', () => {
 describe('auth dispatch', () => {
   it('returns cached response without calling callOutlayer', async () => {
     const { getCached } = jest.requireMock('@/lib/cache');
-    const cachedData = {
-      success: true,
-      data: [{ account_id: 'cached_bot.near' }],
-    };
-    (getCached as jest.Mock).mockReturnValueOnce(cachedData);
+    const rawData = [{ account_id: 'cached_bot.near' }];
+    (getCached as jest.Mock).mockReturnValueOnce(rawData);
 
     const [req, params] = makeRequest('GET', 'agents');
     const res = await GET(req, params);
     const body = await json(res);
 
-    expect(body).toEqual(cachedData);
+    expect(body).toEqual({ success: true, data: rawData });
     expect(mockCallOutlayer).not.toHaveBeenCalled();
   });
 
@@ -678,13 +646,13 @@ describe('cache invalidation', () => {
 
 describe('direct write dispatch for wk_ keys', () => {
   it.each([
-    ['POST', 'agents/alice.near/follow', 'follow'],
-    ['DELETE', 'agents/alice.near/follow', 'unfollow'],
-    ['POST', 'agents/alice/endorse', 'endorse'],
-    ['DELETE', 'agents/alice/endorse', 'unendorse'],
-    ['PATCH', 'agents/me', 'update_me'],
-    ['POST', 'agents/me/heartbeat', 'heartbeat'],
-    ['DELETE', 'agents/me', 'delist_me'],
+    ['POST', 'agents/alice.near/follow', 'social.follow'],
+    ['DELETE', 'agents/alice.near/follow', 'social.unfollow'],
+    ['POST', 'agents/alice/endorse', 'social.endorse'],
+    ['DELETE', 'agents/alice/endorse', 'social.unendorse'],
+    ['PATCH', 'agents/me', 'social.update_me'],
+    ['POST', 'agents/me/heartbeat', 'social.heartbeat'],
+    ['DELETE', 'agents/me', 'social.delist_me'],
   ] as const)('%s %s with wk_ key dispatches to dispatchWrite', async (method, path, expectedAction) => {
     const handlers: Record<string, typeof GET> = { GET, POST, PATCH, DELETE };
     const handler = handlers[method]!;
@@ -914,297 +882,6 @@ describe('admin /admin/hidden', () => {
       });
       const res = await POST(req, params);
       expect(res.status).toBe(404);
-    });
-  });
-
-  describe('NEP-413 write actions (claim_operator / unclaim_operator)', () => {
-    // These actions go through `handleNep413Write` in the route layer,
-    // which verifies the claim via `verify-claim.ts` and forwards to
-    // `dispatchNep413Write` in `fastdata-write.ts`. Handler-level coverage
-    // lives in `fastdata-write.test.ts::dispatchNep413Write`; this block
-    // covers the route-layer gates (claim presence, verification outcome,
-    // dispatch passthrough, success envelope composition).
-    const VALID_CLAIM_BODY = {
-      verifiable_claim: {
-        account_id: 'alice.near',
-        public_key: 'ed25519:testpubkey',
-        signature: 'ed25519:testsig',
-        nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-        message: JSON.stringify({
-          action: 'claim_operator',
-          domain: 'nearly.social',
-          account_id: 'alice.near',
-          version: 1,
-          timestamp: 1_700_000_000_000,
-        }),
-      },
-    };
-
-    it('dispatches a valid claim to handleNep413Write and returns the handler result', async () => {
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(200);
-      const body = await json(res);
-      expect(body).toMatchObject({
-        success: true,
-        data: {
-          action: 'claimed',
-          operator_account_id: 'alice.near',
-          agent_account_id: 'bot.near',
-        },
-      });
-
-      // `verifyClaim` called with the envelope + pinned recipient/domain.
-      expect(mockVerifyClaim).toHaveBeenCalledWith(
-        VALID_CLAIM_BODY.verifiable_claim,
-        'nearly.social',
-        'nearly.social',
-      );
-
-      // Dispatcher received `claim_operator` as the action, the path param
-      // normalized into `body.account_id`, and the verified operator in the
-      // context. The `verifiable_claim` field is stripped from the body
-      // before dispatch (handler reads the claim from the context).
-      expect(mockDispatchNep413Write).toHaveBeenCalledTimes(1);
-      const [action, dispatchBody, ctx] = mockDispatchNep413Write.mock.calls[0];
-      expect(action).toBe('claim_operator');
-      expect(dispatchBody.account_id).toBe('bot.near');
-      expect(dispatchBody.verifiable_claim).toBeUndefined();
-      expect(ctx.operatorAccountId).toBe('alice.near');
-      expect(ctx.claim.account_id).toBe('alice.near');
-      expect(ctx.claim.signature).toBe('ed25519:testsig');
-    });
-
-    it('routes DELETE /agents/:id/claim to unclaim_operator', async () => {
-      mockDispatchNep413Write.mockResolvedValueOnce({
-        success: true,
-        data: {
-          action: 'unclaimed',
-          operator_account_id: 'alice.near',
-          agent_account_id: 'bot.near',
-        },
-        invalidates: ['agent_claims'],
-      });
-      const [req, params] = makeRequest(
-        'DELETE',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await DELETE(req, params);
-      expect(res.status).toBe(200);
-      expect(mockDispatchNep413Write.mock.calls[0][0]).toBe('unclaim_operator');
-    });
-
-    it('returns 401 AUTH_REQUIRED when body.verifiable_claim is missing', async () => {
-      const [req, params] = makeRequest('POST', 'agents/bot.near/claim', {});
-      const res = await POST(req, params);
-      expect(res.status).toBe(401);
-      const body = await json(res);
-      expect(body).toMatchObject({ success: false, code: 'AUTH_REQUIRED' });
-      expect(mockVerifyClaim).not.toHaveBeenCalled();
-      expect(mockDispatchNep413Write).not.toHaveBeenCalled();
-    });
-
-    it('returns 401 AUTH_REQUIRED when verifiable_claim is not an object', async () => {
-      const [req, params] = makeRequest('POST', 'agents/bot.near/claim', {
-        verifiable_claim: 'not-an-object',
-      });
-      const res = await POST(req, params);
-      expect(res.status).toBe(401);
-      expect(mockVerifyClaim).not.toHaveBeenCalled();
-    });
-
-    it('returns 401 AUTH_REQUIRED when verifiable_claim is an array', async () => {
-      // Arrays are `typeof 'object'` but not the expected envelope shape —
-      // explicit array rejection guards against a class of garbage that
-      // `typeof` alone would wave through.
-      const [req, params] = makeRequest('POST', 'agents/bot.near/claim', {
-        verifiable_claim: [1, 2, 3],
-      });
-      const res = await POST(req, params);
-      expect(res.status).toBe(401);
-      expect(mockVerifyClaim).not.toHaveBeenCalled();
-    });
-
-    it('returns 401 AUTH_FAILED when verifyClaim rejects the envelope', async () => {
-      mockVerifyClaim.mockResolvedValueOnce({
-        valid: false,
-        reason: 'expired',
-        detail: 'Claim is older than freshness window',
-        account_id: 'alice.near',
-      });
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(401);
-      const body = await json(res);
-      expect(body).toMatchObject({
-        success: false,
-        code: 'AUTH_FAILED',
-      });
-      expect(body.error).toContain('expired');
-      expect(mockDispatchNep413Write).not.toHaveBeenCalled();
-    });
-
-    it('rejects a claim signed for a different recipient (recipient pinning)', async () => {
-      // Route-level recipient pinning check: `handleNep413Write` calls
-      // `verifyClaim(envelope, 'nearly.social', 'nearly.social')` — the
-      // pinned recipient is `'nearly.social'`. A claim the caller tries
-      // to reuse from another domain (e.g. they signed a login envelope
-      // for `'another-site.com'` and are now submitting it to our
-      // operator-claim endpoint) will fail the signature check inside
-      // the verifier because the reconstructed Borsh payload for
-      // `'nearly.social'` does not match the signature over
-      // `'another-site.com'`. This test pins the invariant: the route
-      // rejects with 401 AUTH_FAILED and the dispatcher is never called,
-      // regardless of how the verifier surfaces the rejection
-      // (`signature` is the expected reason for a recipient-scope
-      // mismatch on a well-formed envelope).
-      mockVerifyClaim.mockResolvedValueOnce({
-        valid: false,
-        reason: 'signature',
-        detail: 'Signature does not match reconstructed payload',
-        account_id: 'alice.near',
-      });
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(401);
-      const body = await json(res);
-      expect(body).toMatchObject({
-        success: false,
-        code: 'AUTH_FAILED',
-      });
-      // Confirm the route called the verifier with the pinned recipient
-      // AND pinned domain — both arguments are 'nearly.social', not
-      // caller-supplied. This is what makes the rejection happen in the
-      // first place; without pinning, a cross-domain envelope would
-      // verify successfully against its original recipient.
-      expect(mockVerifyClaim).toHaveBeenCalledWith(
-        VALID_CLAIM_BODY.verifiable_claim,
-        'nearly.social',
-        'nearly.social',
-      );
-      expect(mockDispatchNep413Write).not.toHaveBeenCalled();
-    });
-
-    it('returns 502 when verifyClaim reports an RPC error', async () => {
-      mockVerifyClaim.mockResolvedValueOnce({
-        valid: false,
-        reason: 'rpc_error',
-        detail: 'NEAR RPC query failed',
-      });
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(502);
-      expect(mockDispatchNep413Write).not.toHaveBeenCalled();
-    });
-
-    it('returns 401 when verifyClaim rejects with replay', async () => {
-      // Distinct reason from expired — replay nonces are a different
-      // failure mode (a specific nonce was seen before) and should not
-      // be silently collapsed into 'expired' on the wire.
-      mockVerifyClaim.mockResolvedValueOnce({
-        valid: false,
-        reason: 'replay',
-        detail: 'Nonce has already been used',
-      });
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(401);
-      const body = await json(res);
-      expect(body.error).toContain('replay');
-    });
-
-    it('propagates the handler result code on dispatcher failure (503 NOT_CONFIGURED)', async () => {
-      mockDispatchNep413Write.mockResolvedValueOnce({
-        success: false,
-        error:
-          'Operator claims writer key is not configured on this deployment',
-        code: 'NOT_CONFIGURED',
-        status: 503,
-      });
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(503);
-      const body = await json(res);
-      expect(body).toMatchObject({
-        success: false,
-        code: 'NOT_CONFIGURED',
-      });
-    });
-
-    it('propagates the handler 429 on dispatcher rate-limit', async () => {
-      mockDispatchNep413Write.mockResolvedValueOnce({
-        success: false,
-        error: 'Rate limit exceeded. Retry after 42s.',
-        code: 'RATE_LIMITED',
-        status: 429,
-        retryAfter: 42,
-      });
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(429);
-      const body = await json(res);
-      expect(body.retry_after).toBe(42);
-    });
-
-    it('invalidates the agent_claims cache on success', async () => {
-      // Only `agent_claims` under the 2026-04-15 scope cut — `operator_claims`
-      // (the by-operator aggregator) is deferred with the dashboard. When
-      // the dashboard re-expands, `operator_claims` returns to the
-      // INVALIDATION_MAP pair and this assertion widens.
-      const { invalidateForMutation } = jest.requireMock('@/lib/cache') as {
-        invalidateForMutation: jest.Mock;
-      };
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-      );
-      await POST(req, params);
-      expect(invalidateForMutation).toHaveBeenCalledWith(['agent_claims']);
-    });
-
-    it('does not require a Bearer wk_ header — the NEP-413 envelope is the auth', async () => {
-      // Explicit guard: the NEP-413 write path runs even when the request
-      // has no Authorization header at all. This is the whole point of
-      // the new dispatch branch — humans don't have `wk_` keys.
-      const [req, params] = makeRequest(
-        'POST',
-        'agents/bot.near/claim',
-        VALID_CLAIM_BODY,
-        // No `authorization` header.
-      );
-      const res = await POST(req, params);
-      expect(res.status).toBe(200);
-      expect(mockDispatchNep413Write).toHaveBeenCalledTimes(1);
     });
   });
 });

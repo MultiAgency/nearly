@@ -21,7 +21,7 @@ export interface StoredAccount {
 /**
  * On-disk shape of `~/.config/nearly/credentials.json`. Multi-agent by
  * design: one root file holds N entries keyed by NEAR account ID so a
- * swarm of sub-agents derived from one root wallet can live side-by-side.
+ * caller managing several wallets can keep them side-by-side.
  */
 export interface CredentialsFile {
   accounts: Record<string, StoredAccount>;
@@ -71,7 +71,7 @@ export async function loadCredentials(
   } catch (err) {
     // Route through `sanitizeErrorDetail` so a malformed file that happens
     // to contain an unredacted `wk_…` fragment near the parse-error offset
-    // cannot leak through the error surface per BUILD.md §4.
+    // cannot leak through the error surface.
     const detail = sanitizeErrorDetail(
       err instanceof Error ? err.message : String(err),
     );

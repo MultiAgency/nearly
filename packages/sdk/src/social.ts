@@ -1,7 +1,6 @@
 import { LIMITS } from './constants';
-import { NearlyError, rateLimitedError } from './errors';
+import { NearlyError } from './errors';
 import { defaultAgent, extractCapabilityPairs } from './graph';
-import type { RateLimiter } from './rateLimit';
 import type { Agent, AgentCapabilities, FollowOpts, Mutation } from './types';
 import {
   validateCapabilities,
@@ -12,7 +11,6 @@ import {
   validateReason,
   validateTags,
 } from './validate';
-import { submitWrite, type WalletClient } from './wallet';
 
 /**
  * Patch accepted by `buildUpdateMe` — the subset of Agent fields an
@@ -91,7 +89,7 @@ export function buildHeartbeat(
   };
 
   return {
-    action: 'heartbeat',
+    action: 'social.heartbeat',
     entries: profileEntries(next),
     rateLimitKey: accountId,
   };
@@ -126,16 +124,16 @@ export function buildFollow(
       message: 'Cannot follow yourself',
     });
   }
-  if (opts.reason !== undefined) {
+  if (opts.reason != null) {
     const e = validateReason(opts.reason);
     if (e) throw e;
   }
 
   const entry: Record<string, unknown> =
-    opts.reason !== undefined ? { reason: opts.reason } : {};
+    opts.reason != null ? { reason: opts.reason } : {};
 
   return {
-    action: 'follow',
+    action: 'social.follow',
     entries: { [`graph/follow/${target}`]: entry },
     rateLimitKey: callerAccountId,
   };
@@ -234,7 +232,7 @@ export function buildUpdateMe(
   }
 
   return {
-    action: 'update_me',
+    action: 'social.update_me',
     entries,
     rateLimitKey: accountId,
   };
@@ -320,7 +318,7 @@ export function buildEndorse(
   }
 
   return {
-    action: 'endorse',
+    action: 'social.endorse',
     entries,
     rateLimitKey: callerAccountId,
   };
@@ -383,7 +381,7 @@ export function buildUnendorse(
   }
 
   return {
-    action: 'unendorse',
+    action: 'social.unendorse',
     entries,
     rateLimitKey: callerAccountId,
   };
@@ -409,13 +407,13 @@ export function buildUnfollow(
   }
   if (target === callerAccountId) {
     throw new NearlyError({
-      code: 'SELF_FOLLOW',
+      code: 'SELF_UNFOLLOW',
       message: 'Cannot unfollow yourself',
     });
   }
 
   return {
-    action: 'unfollow',
+    action: 'social.unfollow',
     entries: { [`graph/follow/${target}`]: null },
     rateLimitKey: callerAccountId,
   };
@@ -468,36 +466,8 @@ export function buildDelistMe(
   }
 
   return {
-    action: 'delist_me',
+    action: 'social.delist_me',
     entries,
     rateLimitKey: agent.account_id,
   };
-}
-
-// ---------------------------------------------------------------------------
-// Submit funnel
-// ---------------------------------------------------------------------------
-
-export interface SubmitContext {
-  wallet: WalletClient;
-  rateLimiter: RateLimiter;
-}
-
-/**
- * The one write funnel. Rate-limits, submits via OutLayer, records usage on
- * success. Throws NearlyError on any failure. All v0.0+ mutations go here.
- *
- * Threads the window from `check` to `record` so a long-running write can't
- * straddle a window boundary and silently skip a slot — matches the
- * frontend's post-Fix-5 behavior.
- */
-export async function submit(
-  ctx: SubmitContext,
-  mutation: Mutation,
-): Promise<void> {
-  const rl = ctx.rateLimiter.check(mutation.action, mutation.rateLimitKey);
-  if (!rl.ok) throw rateLimitedError(mutation.action, rl.retryAfter);
-
-  await submitWrite(ctx.wallet, mutation.entries);
-  ctx.rateLimiter.record(mutation.action, mutation.rateLimitKey, rl.window);
 }

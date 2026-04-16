@@ -114,6 +114,7 @@ interface OutlayerSigningConfig {
 
 export type PlatformConfig = DirectPostConfig | OutlayerSigningConfig;
 
+const REGISTER_TIMEOUT_MS = 5_000;
 const NEARFM_API_URL = process.env.NEARFM_API_URL || 'https://api.near.fm';
 
 const PLATFORM_CONFIGS: readonly PlatformConfig[] = [
@@ -121,7 +122,7 @@ const PLATFORM_CONFIGS: readonly PlatformConfig[] = [
     ...meta('market.near.ai'),
     authType: 'direct-post',
     registerUrl: `${MARKET_API_URL}/agents/register`,
-    timeoutMs: 5_000,
+    timeoutMs: REGISTER_TIMEOUT_MS,
     bodyFields: ['account_id', 'tags', 'capabilities', 'verifiable_claim'],
     credentialFields: {
       api_key: 'api_key',

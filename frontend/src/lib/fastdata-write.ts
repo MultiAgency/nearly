@@ -16,8 +16,18 @@
  * `entryBlockHeight` / `entryBlockSecs`.
  */
 
-import { getOperatorClaimsWriterKey } from '@/lib/outlayer-server';
-import type { Agent, VerifiableClaim } from '@/types';
+import {
+  buildDelistMe,
+  buildEndorse,
+  buildFollow,
+  buildHeartbeat,
+  buildUnendorse,
+  buildUnfollow,
+  buildUpdateMe,
+  LIMITS,
+  type UpdateMePatch,
+} from '@nearly/sdk';
+import type { Agent } from '@/types';
 import {
   EXTERNAL_URLS,
   FASTDATA_NAMESPACE,
@@ -32,12 +42,10 @@ import {
   kvMultiAgent,
 } from './fastdata';
 import {
-  agentEntries,
   buildEndorsementCounts,
   composeKey,
   endorsePrefix,
   entryBlockHeight,
-  extractCapabilityPairs,
   fetchProfile,
   fetchProfiles,
   liveNetworkCounts,
@@ -60,6 +68,8 @@ import {
   validateReason,
   validateTags,
 } from './validate';
+
+const BALANCE_CHECK_TIMEOUT_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // Response helpers
@@ -122,11 +132,6 @@ function insufficientBalance(accountId: string): WriteResult {
   };
 }
 
-/**
- * Map a failed write outcome to the non-batch handler's WriteResult
- * envelope. Pure — no I/O. Batch handlers produce per-target records and
- * do the mapping inline.
- */
 function writeFailureToResult(
   wrote: Extract<WriteOutcome, { ok: false }>,
   accountId: string,
@@ -136,11 +141,6 @@ function writeFailureToResult(
     : fail('STORAGE_ERROR', 'Failed to write to FastData', 500);
 }
 
-/**
- * Per-target guard shared by the four graph handlers. Returns an error
- * entry for empty or self-targeting account IDs, or null if the target
- * passes the guard and should be processed.
- */
 function targetGuardError(
   targetAccountId: string,
   callerAccountId: string,
@@ -174,17 +174,14 @@ export type WriteOutcome =
   | { ok: true }
   | { ok: false; reason: 'insufficient_balance' | 'storage_error' };
 
-/**
- * Returns true iff OutLayer reports this wallet's NEAR balance as exactly
- * "0". Any other outcome (HTTP failure, malformed body, non-zero balance)
- * returns false — never misclassify an upstream outage as a drained wallet.
- */
+// Fail-closed on ambiguity: HTTP failures and malformed bodies return
+// false so an upstream outage is never misclassified as a drained wallet.
 async function hasZeroNearBalance(walletKey: string): Promise<boolean> {
   try {
     const res = await fetchWithTimeout(
       `${OUTLAYER_API_URL}/wallet/v1/balance?chain=near`,
       { headers: { Authorization: `Bearer ${walletKey}` } },
-      5_000,
+      BALANCE_CHECK_TIMEOUT_MS,
     );
     if (!res.ok) return false;
     const data = (await res.json().catch(() => null)) as {
@@ -248,21 +245,9 @@ interface CallerIdentity {
   agent: Agent;
 }
 
-/**
- * In-memory default for callers without a profile blob. Used as the
- * fallback for every mutation so no-profile callers can proceed without a
- * gate: heartbeat and update_me persist this default as part of their
- * normal write batch, while follow/endorse/unendorse/delist use it in
- * memory only, so edge-only callers stay invisible to `list_agents` until
- * they heartbeat or update_me. Nearly does not gate profile creation — the
- * first profile-writing mutation is the bootstrap.
- *
- * Holds no time fields — `last_active` and `created_at` are read-derived
- * from block timestamps and have no honest write-side value before the
- * first read. Handlers that need a "since when" baseline for first-
- * heartbeat delta computation use `caller.agent.last_active ?? 0`, which
- * surfaces every pre-existing edge as "new" on the first call.
- */
+// No time fields: `last_active` / `created_at` are read-derived from
+// block timestamps and have no honest write-side value before the first
+// read.
 function defaultAgent(accountId: string): Agent {
   return {
     name: null,
@@ -275,21 +260,10 @@ function defaultAgent(accountId: string): Agent {
   };
 }
 
-/**
- * Resolve caller, defaulting to a fresh agent shape if no profile exists.
- * Used by every mutation handler (follow/unfollow/endorse/unendorse via
- * `runBatch`, plus heartbeat, update_me, and delist_me directly). There
- * is no caller-side profile gate: any authenticated `wk_` caller can
- * mutate, regardless of whether they have a `profile` blob in FastData.
- *
- * Does not write. The caller's own post-resolution write persists the
- * default merged with whatever fields that handler updates, collapsing
- * bootstrap + first mutation into a single round-trip to OutLayer — but
- * only for handlers that actually write profile entries (heartbeat,
- * update_me). Follow/endorse/unendorse/delist use the default in memory
- * and do not persist it, so edge-only callers stay invisible to
- * `list_agents` until they heartbeat or update_me.
- */
+// Nearly does not gate profile creation — any authenticated `wk_` can
+// mutate, and the first profile-writing mutation (heartbeat or update_me)
+// bootstraps the profile blob. Edge-only callers stay invisible to
+// `list_agents` until that first profile write lands.
 async function resolveCallerOrInit(
   walletKey: string,
   resolveAccountId: (wk: string) => Promise<string | null>,
@@ -307,14 +281,12 @@ async function resolveCallerOrInit(
 
 const MAX_BATCH_SIZE = 20;
 
-type BatchAction = 'follow' | 'unfollow' | 'endorse' | 'unendorse';
+type BatchAction =
+  | 'social.follow'
+  | 'social.unfollow'
+  | 'social.endorse'
+  | 'social.unendorse';
 
-/**
- * A single target's contribution to a batch. `skip` and `fail` append a
- * per-target result without consuming rate-limit budget or issuing a write;
- * `write` issues a KV write, charges budget, then appends `onWritten()`'s
- * result. Used by runBatch — handler logic only builds these.
- */
 type BatchStep =
   | { kind: 'skip'; result: Record<string, unknown> }
   | { kind: 'fail'; result: Record<string, unknown> }
@@ -339,16 +311,9 @@ interface BatchOptions {
   ) => Promise<Record<string, unknown>>;
 }
 
-/**
- * Shared scaffold for graph-mutation batch handlers. Normalizes target
- * validation, caller resolution, rate-limit gating, self-action guards,
- * per-target writes, and response shape. Per-target logic lives in the
- * handler-supplied `step`; response shape in optional `finalize`.
- *
- * A 402 on any write aborts the batch with INSUFFICIENT_BALANCE — no
- * subsequent target will succeed with an underfunded wallet, and the
- * caller needs the fund link, not N misleading STORAGE_ERROR items.
- */
+// A 402 on any write aborts the batch with INSUFFICIENT_BALANCE — no
+// subsequent target would succeed with an underfunded wallet, and the
+// caller needs the fund link, not N misleading STORAGE_ERROR items.
 async function runBatch(opts: BatchOptions): Promise<WriteResult> {
   const targets = resolveTargets(opts.body);
   if (!Array.isArray(targets)) return targets;
@@ -438,7 +403,7 @@ export async function handleFollow(
   }
 
   return runBatch({
-    action: 'follow',
+    action: 'social.follow',
     selfCode: 'SELF_FOLLOW',
     verb: 'follow',
     walletKey,
@@ -465,16 +430,14 @@ export async function handleFollow(
           },
         };
       }
-      // Edge value: just the reason if provided, else an empty object.
-      // No `at` field — the FastData-indexed `block_height` of this
-      // entry is the only authoritative time, surfaced via `entryBlockHeight`
-      // (and its seconds sibling `entryBlockSecs`) on the read path. Empty
-      // `{}` is a "live" entry (object, not null).
+      const mutation = buildFollow(
+        caller.accountId,
+        target,
+        reason != null ? { reason } : undefined,
+      );
       return {
         kind: 'write',
-        entries: {
-          [followKey]: reason != null ? { reason } : {},
-        },
+        entries: mutation.entries,
         onWritten: () => ({ account_id: target, action: 'followed' }),
       };
     },
@@ -497,12 +460,13 @@ export async function handleUnfollow(
   resolveAccountId: (wk: string) => Promise<string | null>,
 ): Promise<WriteResult> {
   return runBatch({
-    action: 'unfollow',
+    action: 'social.unfollow',
     selfCode: 'SELF_UNFOLLOW',
     verb: 'unfollow',
     walletKey,
     body,
     resolveAccountId,
+    // No target-exists check — you can remove an edge to a deleted account.
     step: async (target, caller) => {
       const followKey = composeKey('graph/follow/', target);
       const existing = await kvGetAgent(caller.accountId, followKey);
@@ -512,9 +476,10 @@ export async function handleUnfollow(
           result: { account_id: target, action: 'not_following' },
         };
       }
+      const mutation = buildUnfollow(caller.accountId, target);
       return {
         kind: 'write',
-        entries: { [followKey]: null },
+        entries: mutation.entries,
         onWritten: () => ({ account_id: target, action: 'unfollowed' }),
       };
     },
@@ -535,19 +500,16 @@ export async function handleUnfollow(
 // Endorse / Unendorse
 // ---------------------------------------------------------------------------
 
-/** Max key_suffixes per endorse/unendorse call, independent of targets.length. */
-const MAX_KEY_SUFFIXES = 20;
-
 function resolveKeySuffixes(
   body: Record<string, unknown>,
 ): { keySuffixes: string[] } | WriteResult {
   const raw = body.key_suffixes;
   if (!Array.isArray(raw) || raw.length === 0)
     return fail('VALIDATION_ERROR', 'key_suffixes array must not be empty');
-  if (raw.length > MAX_KEY_SUFFIXES)
+  if (raw.length > LIMITS.MAX_KEY_SUFFIXES)
     return fail(
       'VALIDATION_ERROR',
-      `Too many key_suffixes (max ${MAX_KEY_SUFFIXES})`,
+      `Too many key_suffixes (max ${LIMITS.MAX_KEY_SUFFIXES})`,
     );
   // Dedupe: duplicate key_suffixes in a single call would write the same
   // KV key twice and return misleading duplicate entries in endorsed[].
@@ -581,18 +543,14 @@ export async function handleEndorse(
   const contentHash = body.content_hash as string | undefined;
 
   return runBatch({
-    action: 'endorse',
+    action: 'social.endorse',
     selfCode: 'SELF_ENDORSE',
     verb: 'endorse',
     walletKey,
     body,
     resolveAccountId,
     // Rate-limit unit: one per target regardless of key_suffixes count.
-    // Multiple key_suffixes within a target share the charge — endorsed.length
-    // === 0 means no write and no budget consumed (skip kind).
     step: async (target, caller) => {
-      // Existence gate only — the fetched profile is not used beyond this
-      // check, so skip the resolve-wrapper and drop the throwaway object.
       if ((await fetchProfile(target)) == null) {
         return {
           kind: 'fail',
@@ -605,8 +563,6 @@ export async function handleEndorse(
         };
       }
 
-      // Validate key_suffixes, then write all of them. On content_hash change,
-      // last write wins — overwrite prior entry with no history.
       const keyPrefix = endorsePrefix(target);
       const validKeySuffixes: string[] = [];
       const skipped: { key_suffix: string; reason: string }[] = [];
@@ -634,7 +590,9 @@ export async function handleEndorse(
         fullKeys.map((key) => ({ accountId: caller.accountId, key })),
       );
 
-      const entries: Record<string, unknown> = {};
+      // Skip suffixes whose stored `content_hash` already matches; last
+      // write wins on mismatch.
+      const suffixesToWrite: string[] = [];
       const endorsed: string[] = [];
       const alreadyEndorsed: string[] = [];
 
@@ -652,15 +610,18 @@ export async function handleEndorse(
           alreadyEndorsed.push(ks);
           continue;
         }
-        // Edge value: optional reason + content_hash. No `at` field —
-        // FastData's indexed `block_timestamp` is the only authoritative
-        // time. Empty `{}` is a "live" entry (object, not null/undefined).
-        entries[fullKeys[i]!] = {
-          ...(reason != null && { reason }),
-          ...(contentHash != null && { content_hash: contentHash }),
-        };
+        suffixesToWrite.push(ks);
         endorsed.push(ks);
       }
+
+      const entries: Record<string, unknown> =
+        suffixesToWrite.length > 0
+          ? buildEndorse(caller.accountId, target, {
+              keySuffixes: suffixesToWrite,
+              ...(reason != null && { reason }),
+              ...(contentHash != null && { contentHash }),
+            }).entries
+          : {};
 
       const buildResult = (): Record<string, unknown> => {
         const result: Record<string, unknown> = {
@@ -692,41 +653,69 @@ export async function handleUnendorse(
   const { keySuffixes } = keySuffixesResult;
 
   return runBatch({
-    action: 'unendorse',
+    action: 'social.unendorse',
     selfCode: 'SELF_UNENDORSE',
     verb: 'unendorse',
     walletKey,
     body,
     resolveAccountId,
     step: async (target, caller) => {
-      // Read only the keys the caller wants to retract. Gating on the
-      // caller's own keys — not the target's current profile — means
-      // retraction works even if the target mutated. Symmetric with
-      // endorse's read path, and avoids the high-fanout cliff of listing
-      // every endorsement the caller has on this target.
-      //
-      // UX note: this is a targeted retract by specific key_suffixes.
-      // There is no "retract everything I endorsed on this target" path —
-      // a caller who wants that must first GET /agents/{target}/endorsers,
-      // filter by their own account_id, and pass the resulting key_suffixes
-      // back here in one or more calls (respecting MAX_KEY_SUFFIXES).
+      // Read only the caller's own keys — gating on the target's
+      // current profile would break retraction after the target mutated,
+      // and scanning every endorsement on this target is the high-fanout
+      // cliff. Validation rules mirror endorse so a retract can't land
+      // on a key the endorse path would reject; partition into valid /
+      // skipped for per-suffix caller feedback. No "retract everything"
+      // path — callers compose the key_suffix list themselves.
       const keyPrefix = endorsePrefix(target);
-      const fullKeys = keySuffixes.map((ks) => composeKey(keyPrefix, ks));
+      const validKeySuffixes: string[] = [];
+      const skipped: { key_suffix: string; reason: string }[] = [];
+      for (const ks of keySuffixes) {
+        const e = validateKeySuffix(ks, keyPrefix);
+        if (e) skipped.push({ key_suffix: ks, reason: e.message });
+        else validKeySuffixes.push(ks);
+      }
+
+      if (validKeySuffixes.length === 0) {
+        return {
+          kind: 'fail',
+          result: {
+            account_id: target,
+            action: 'error',
+            code: 'VALIDATION_ERROR',
+            error: 'no valid key_suffixes',
+            ...(skipped.length > 0 && { skipped }),
+          },
+        };
+      }
+
+      const fullKeys = validKeySuffixes.map((ks) => composeKey(keyPrefix, ks));
       const existingEntries = await kvMultiAgent(
         fullKeys.map((key) => ({ accountId: caller.accountId, key })),
       );
 
-      const entries: Record<string, unknown> = {};
+      // FastData no-ops null-writes on absent keys, so the filter is for
+      // response accuracy only — `removed` must list only edges that
+      // actually transitioned live → tombstone.
       const removed: string[] = [];
-
-      for (let i = 0; i < keySuffixes.length; i++) {
+      for (let i = 0; i < validKeySuffixes.length; i++) {
         if (existingEntries[i] != null) {
-          entries[fullKeys[i]!] = null;
-          removed.push(keySuffixes[i]!);
+          removed.push(validKeySuffixes[i]!);
         }
       }
 
-      const result = { account_id: target, action: 'unendorsed', removed };
+      const entries: Record<string, unknown> =
+        removed.length > 0
+          ? buildUnendorse(caller.accountId, target, removed).entries
+          : {};
+
+      const result: Record<string, unknown> = {
+        account_id: target,
+        action: 'unendorsed',
+        removed,
+      };
+      if (skipped.length > 0) result.skipped = skipped;
+
       if (removed.length === 0) {
         return { kind: 'skip', result };
       }
@@ -744,18 +733,21 @@ export async function handleUpdateMe(
   body: Record<string, unknown>,
   resolveAccountId: (wk: string) => Promise<string | null>,
 ): Promise<WriteResult> {
-  // First-write: creates default profile if none exists (agent-paid).
+  // First-write creates a default profile if none exists.
   const caller = await resolveCallerOrInit(walletKey, resolveAccountId);
   if ('success' in caller) return caller;
 
-  const rl = checkRateLimit('update_me', caller.accountId);
+  const rl = checkRateLimit('social.update_me', caller.accountId);
   if (!rl.ok) return rateLimited(rl.retryAfter);
   const rlWindow = rl.window;
 
+  // Validation runs here (not inside `buildUpdateMe`) so failures land
+  // as structured `WriteResult`s — the SDK builder throws, which would
+  // require try/catch translation at every call site.
   const agent = { ...caller.agent };
+  const patch: UpdateMePatch = {};
   let changed = false;
 
-  // Validate and apply fields
   if ('name' in body) {
     const name = body.name as string | null;
     if (name != null) {
@@ -763,12 +755,14 @@ export async function handleUpdateMe(
       if (e) return validationFail(e);
     }
     agent.name = name;
+    patch.name = name;
     changed = true;
   }
   if (typeof body.description === 'string') {
     const e = validateDescription(body.description);
     if (e) return validationFail(e);
     agent.description = body.description;
+    patch.description = body.description;
     changed = true;
   }
   if ('image' in body) {
@@ -778,18 +772,21 @@ export async function handleUpdateMe(
       if (e) return validationFail(e);
     }
     agent.image = url;
+    patch.image = url;
     changed = true;
   }
   if (Array.isArray(body.tags)) {
     const { validated, error } = validateTags(body.tags as string[]);
     if (error) return validationFail(error);
     agent.tags = validated;
+    patch.tags = validated;
     changed = true;
   }
   if (body.capabilities !== undefined) {
     const e = validateCapabilities(body.capabilities);
     if (e) return validationFail(e);
     agent.capabilities = body.capabilities as Agent['capabilities'];
+    patch.capabilities = body.capabilities as Agent['capabilities'];
     changed = true;
   }
 
@@ -800,41 +797,13 @@ export async function handleUpdateMe(
     );
   }
 
-  // No write-side timestamp on `agent.last_active` — `agentEntries`
-  // strips the field, and the read path derives it from the block
-  // timestamp of this very write.
-  const entries = agentEntries(agent);
-
-  // Delete old tag keys if tags changed
-  if (Array.isArray(body.tags)) {
-    const newTags = new Set(agent.tags);
-    for (const oldTag of caller.agent.tags) {
-      if (!newTags.has(oldTag)) {
-        entries[composeKey('tag/', oldTag)] = null;
-      }
-    }
-  }
-
-  // Delete old capability keys if capabilities changed — otherwise a
-  // dropped cap/{ns}/{value} existence index ghosts into list_capabilities.
-  if (body.capabilities !== undefined) {
-    const newCapKeys = new Set(
-      extractCapabilityPairs(agent.capabilities).map(
-        ([ns, val]) => `${ns}/${val}`,
-      ),
-    );
-    for (const [ns, val] of extractCapabilityPairs(caller.agent.capabilities)) {
-      const capSuffix = `${ns}/${val}`;
-      if (!newCapKeys.has(capSuffix)) {
-        entries[composeKey('cap/', capSuffix)] = null;
-      }
-    }
-  }
-
+  // Dropped tags and capability pairs must emit explicit null-writes —
+  // otherwise `list_tags` / `list_capabilities` keep returning ghost indexes.
+  const { entries } = buildUpdateMe(caller.accountId, caller.agent, patch);
   const wrote = await writeToFastData(walletKey, entries);
   if (!wrote.ok) return writeFailureToResult(wrote, caller.accountId);
 
-  incrementRateLimit('update_me', caller.accountId, rlWindow);
+  incrementRateLimit('social.update_me', caller.accountId, rlWindow);
 
   // Overlay live counts on the response so clients receive the same agent
   // shape as heartbeat returns (stored profiles don't carry count fields).
@@ -854,40 +823,26 @@ export async function handleHeartbeat(
   walletKey: string,
   resolveAccountId: (wk: string) => Promise<string | null>,
 ): Promise<WriteResult> {
-  // First-write: creates default profile if none exists (agent-paid).
+  // First-write creates a default profile if none exists.
   const caller = await resolveCallerOrInit(walletKey, resolveAccountId);
   if ('success' in caller) return caller;
 
-  const rl = checkRateLimit('heartbeat', caller.accountId);
+  const rl = checkRateLimit('social.heartbeat', caller.accountId);
   if (!rl.ok) return rateLimited(rl.retryAfter);
   const rlWindow = rl.window;
 
-  // `previousActiveHeight` is block-authoritative — `fetchProfile` set
-  // `caller.agent.last_active_height` from the block height of the caller's
-  // most recent profile write via `applyTrustBoundary`. Edge comparisons
-  // below filter with `entryBlockHeight(e) > previousActiveHeight` — the
-  // strictly-after semantic matches the activity-query cursor (step 4)
-  // and the at-or-after seconds comparison we used before was wrong: it
-  // could re-include edges the caller had already seen on the prior
-  // heartbeat response.
-  //
-  // `previousActive` (seconds) stays around only to populate `delta.since`
-  // on the response for consumers not yet migrated to `since_height`.
-  //
-  // First-heartbeat case: `caller.agent` is the in-memory `defaultAgent`
-  // (no profile exists yet) which carries no `last_active_height`. The
-  // `?? 0` fallback makes the delta surface every pre-existing follower
-  // edge as "new since you never existed."
-  //
-  // Note: `responseAgent.last_active` ends up undefined for first
-  // heartbeats and equal to the prior block time for subsequent ones —
-  // never wall clock. Clients that need the post-write block time re-read
-  // via `GET /agents/me` after the transaction lands.
+  // Edge comparisons below use `entryBlockHeight(e) > previousActiveHeight`
+  // — strictly-after matches the activity-query cursor and prevents
+  // re-surfacing edges the caller already saw on their prior heartbeat.
+  // `previousActive` (seconds) is retained only to populate `delta.since`
+  // for consumers not yet migrated to `since_height`. On first heartbeat
+  // `caller.agent` is the in-memory `defaultAgent` with no
+  // `last_active_height`; the `?? 0` fallback surfaces every pre-existing
+  // follower edge as new.
   const previousActive = caller.agent.last_active ?? 0;
   const previousActiveHeight = caller.agent.last_active_height ?? 0;
   const agent = { ...caller.agent };
 
-  // Compute live counts from graph traversal (parallel)
   const [followerEntries, followingEntries, endorseEntries] = await Promise.all(
     [
       kvGetAll(`graph/follow/${caller.accountId}`),
@@ -897,13 +852,9 @@ export async function handleHeartbeat(
   );
   agent.endorsements = buildEndorsementCounts(endorseEntries, caller.accountId);
 
-  // New followers since last heartbeat. We filter by the FastData-indexed
-  // `block_height` of the edge write — strictly greater than the caller's
-  // previous `last_active_height` — so a follower cannot backdate their
-  // edge to hide from (or forge an appearance in) this delta. Strictly
-  // after, not at-or-after, matches the activity-query cursoring semantic
-  // from step 4: the caller already saw everything up to and including
-  // their own previous profile-write block on the prior heartbeat.
+  // Filtering on FastData-indexed `block_height` closes the backdate /
+  // forge vector — a follower cannot fabricate a value-blob timestamp
+  // to hide from or inject into this delta.
   const newFollowerAccounts: string[] = [];
   for (const e of followerEntries) {
     if (entryBlockHeight(e) > previousActiveHeight) {
@@ -911,25 +862,21 @@ export async function handleHeartbeat(
     }
   }
 
-  // New following since last heartbeat — same block-height rule applied
-  // to the caller's own outbound edges for symmetry.
   const newFollowingCount = followingEntries.filter(
     (e) => entryBlockHeight(e) > previousActiveHeight,
   ).length;
 
-  // Batch-fetch profiles for new follower summaries. `fetchProfiles`
-  // enforces the trust-boundary override so the summaries always carry
-  // the authoritative account_id from the predecessor namespace.
   const newFollowers = (await fetchProfiles(newFollowerAccounts)).map(
     profileSummary,
   );
 
-  // Write updated profile + tag/cap indexes
-  const entries = agentEntries(agent);
+  // No tombstones emitted (heartbeat is a pure index refresh, not a diff —
+  // a reader might otherwise expect dropped tags to null-write).
+  const { entries } = buildHeartbeat(caller.accountId, agent);
   const wrote = await writeToFastData(walletKey, entries);
   if (!wrote.ok) return writeFailureToResult(wrote, caller.accountId);
 
-  incrementRateLimit('heartbeat', caller.accountId, rlWindow);
+  incrementRateLimit('social.heartbeat', caller.accountId, rlWindow);
 
   const responseAgent: Agent = {
     ...agent,
@@ -961,41 +908,29 @@ export async function handleDelistMe(
   const caller = await resolveCallerOrInit(walletKey, resolveAccountId);
   if ('success' in caller) return caller;
 
-  const rl = checkRateLimit('delist_me', caller.accountId);
+  const rl = checkRateLimit('social.delist_me', caller.accountId);
   if (!rl.ok) return rateLimited(rl.retryAfter);
   const rlWindow = rl.window;
 
-  // Null-write all agent keys
-  const entries: Record<string, unknown> = {
-    profile: null,
-  };
-
-  // Null-write tag keys
-  for (const tag of caller.agent.tags) {
-    entries[composeKey('tag/', tag)] = null;
-  }
-
-  // Null-write capability keys
-  for (const [ns, val] of extractCapabilityPairs(caller.agent.capabilities)) {
-    entries[composeKey('cap/', `${ns}/${val}`)] = null;
-  }
-
-  // Null-write follow + endorsement edges
+  // Scan the caller's own outgoing edges so the delist envelope can
+  // null-write every edge they authored. Follower edges written by
+  // OTHER agents are intentionally NOT touched — retraction is the
+  // writer's responsibility, not the subject's.
   const [followingEntries, endorsingEntries] = await Promise.all([
     kvListAgent(caller.accountId, 'graph/follow/'),
     kvListAgent(caller.accountId, 'endorsing/'),
   ]);
-  for (const e of followingEntries) {
-    entries[e.key] = null;
-  }
-  for (const e of endorsingEntries) {
-    entries[e.key] = null;
-  }
+
+  const { entries } = buildDelistMe(
+    caller.agent,
+    followingEntries.map((e) => e.key),
+    endorsingEntries.map((e) => e.key),
+  );
 
   const wrote = await writeToFastData(walletKey, entries);
   if (!wrote.ok) return writeFailureToResult(wrote, caller.accountId);
 
-  incrementRateLimit('delist_me', caller.accountId, rlWindow);
+  incrementRateLimit('social.delist_me', caller.accountId, rlWindow);
 
   return ok({
     action: 'delisted',
@@ -1006,22 +941,48 @@ export async function handleDelistMe(
 // ---------------------------------------------------------------------------
 // Invalidation map — co-located with mutations so new actions can't forget it.
 // Unmapped actions invalidate all cached action types (safe default).
+//
+// `WRITE_ACTIONS` below is the authoritative list of every mutation this
+// module dispatches, plus the admin mutations dispatched from `route.ts` via
+// `writeToFastData` + `invalidatesFor`. A test in `fastdata-write.test.ts`
+// asserts `WRITE_ACTIONS` and the `INVALIDATION_MAP` keys are the same set,
+// so a new action added in the dispatch switch or a renamed action either
+// fails CI or forces a deliberate map update.
 // ---------------------------------------------------------------------------
 
-const INVALIDATION_MAP: Record<string, readonly string[]> = {
-  update_me: ['list_agents', 'list_tags', 'list_capabilities', 'profile'],
-  follow: ['profile', 'followers', 'following', 'edges'],
-  unfollow: ['profile', 'followers', 'following', 'edges'],
-  endorse: ['profile', 'endorsers'],
-  unendorse: ['profile', 'endorsers'],
-  heartbeat: [
+export const WRITE_ACTIONS = [
+  'hide_agent',
+  'social.delist_me',
+  'social.endorse',
+  'social.follow',
+  'social.heartbeat',
+  'social.unendorse',
+  'social.unfollow',
+  'social.update_me',
+  'unhide_agent',
+] as const;
+
+export type WriteAction = (typeof WRITE_ACTIONS)[number];
+
+export const INVALIDATION_MAP: Record<string, readonly string[]> = {
+  'social.update_me': [
+    'list_agents',
+    'list_tags',
+    'list_capabilities',
+    'profile',
+  ],
+  'social.follow': ['profile', 'followers', 'following', 'edges'],
+  'social.unfollow': ['profile', 'followers', 'following', 'edges'],
+  'social.endorse': ['profile', 'endorsers', 'endorsing'],
+  'social.unendorse': ['profile', 'endorsers', 'endorsing'],
+  'social.heartbeat': [
     'list_agents',
     'profile',
     'health',
     'list_tags',
     'list_capabilities',
   ],
-  delist_me: [
+  'social.delist_me': [
     'list_agents',
     'list_tags',
     'list_capabilities',
@@ -1031,11 +992,10 @@ const INVALIDATION_MAP: Record<string, readonly string[]> = {
     'following',
     'edges',
     'endorsers',
+    'endorsing',
   ],
   hide_agent: ['hidden'],
   unhide_agent: ['hidden'],
-  claim_operator: ['agent_claims'],
-  unclaim_operator: ['agent_claims'],
 };
 
 /** Cached reads that a given mutation stales. Null means "clear everything". */
@@ -1047,9 +1007,8 @@ export function invalidatesFor(action: string): readonly string[] | null {
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-/** Normalize single account_id or targets[] into a non-empty array.
- *  Rejects non-string items in `targets[]` at the boundary so downstream
- *  handlers never see garbage (a numeric item would crash on `.trim()`). */
+// Reject non-string `targets[]` items at the boundary — a numeric item
+// would crash downstream handlers on `.trim()`.
 function resolveTargets(body: Record<string, unknown>): string[] | WriteResult {
   if (Array.isArray(body.targets)) {
     for (const t of body.targets) {
@@ -1075,25 +1034,25 @@ export async function dispatchWrite(
   let result: WriteResult;
 
   switch (action) {
-    case 'follow':
+    case 'social.follow':
       result = await handleFollow(walletKey, body, resolveAccountId);
       break;
-    case 'unfollow':
+    case 'social.unfollow':
       result = await handleUnfollow(walletKey, body, resolveAccountId);
       break;
-    case 'endorse':
+    case 'social.endorse':
       result = await handleEndorse(walletKey, body, resolveAccountId);
       break;
-    case 'unendorse':
+    case 'social.unendorse':
       result = await handleUnendorse(walletKey, body, resolveAccountId);
       break;
-    case 'update_me':
+    case 'social.update_me':
       result = await handleUpdateMe(walletKey, body, resolveAccountId);
       break;
-    case 'heartbeat':
+    case 'social.heartbeat':
       result = await handleHeartbeat(walletKey, resolveAccountId);
       break;
-    case 'delist_me':
+    case 'social.delist_me':
       result = await handleDelistMe(walletKey, resolveAccountId);
       break;
     default:
@@ -1108,179 +1067,4 @@ export async function dispatchWrite(
     result.invalidates = INVALIDATION_MAP[action] ?? null;
   }
   return result;
-}
-
-// ---------------------------------------------------------------------------
-// NEP-413 write dispatch — for mutations gated on a verified NEP-413 envelope
-// rather than on a `wk_` custody wallet bearer token. Currently only
-// `claim_operator` / `unclaim_operator` land here; if a future mutation also
-// accepts human sign-ins, add it to `NEP413_WRITE_ACTIONS` in `route.ts` and
-// case it in the switch below.
-//
-// Architecture notes (see `.agents/planning/lightweight-signin-frontend.md`
-// "Data model" section for the full framing):
-//
-// - The caller is a human with no `wk_` of their own. Nearly's server writes
-//   the claim on the human's behalf using `OUTLAYER_OPERATOR_CLAIMS_WK` — a
-//   server-held service custody wallet key. The stored KV value IS the full
-//   NEP-413 envelope, so any reader can independently re-verify the operator's
-//   assertion against NEAR RPC — the predecessor attribution is irrelevant to
-//   trust, the envelope is the proof.
-// - The key is `operator/{operator_account_id}/{agent_account_id}` under the
-//   service-writer predecessor. The operator's account_id is read from the
-//   verified claim (the authority is the envelope signature, not the request).
-//   The agent's account_id is the path param.
-// - Identity mismatch between the claim's outer `account_id` and its inner
-//   message `account_id` is already rejected by `verifyClaim` (see
-//   `verify-claim.ts` lines around the "message account_id does not match"
-//   guard). This dispatcher does not re-check it.
-// ---------------------------------------------------------------------------
-
-/**
- * Context passed to NEP-413 write handlers. The route layer verifies the
- * claim via `verifyClaim` and packages the result into this shape before
- * dispatching; handlers should treat the fields as authoritative.
- */
-export interface Nep413WriteContext {
-  /** The verified operator identity from `verifyClaim().account_id`. */
-  operatorAccountId: string;
-  /** The full verified claim envelope, stored as the KV value on writes. */
-  claim: VerifiableClaim;
-}
-
-export async function dispatchNep413Write(
-  action: string,
-  body: Record<string, unknown>,
-  ctx: Nep413WriteContext,
-): Promise<WriteResult> {
-  // Rate-limit keyed on the verified operator, not request IP — abusive
-  // callers must rotate their NEAR account to get a fresh budget, which is
-  // the same "cost of abuse" story as `wk_`-keyed write limits.
-  const rl = checkRateLimit(action, ctx.operatorAccountId);
-  if (!rl.ok) return rateLimited(rl.retryAfter);
-  const rlWindow = rl.window;
-
-  let result: WriteResult;
-
-  switch (action) {
-    case 'claim_operator':
-      result = await handleClaimOperator(body, ctx, rlWindow);
-      break;
-    case 'unclaim_operator':
-      result = await handleUnclaimOperator(body, ctx, rlWindow);
-      break;
-    default:
-      return fail(
-        'VALIDATION_ERROR',
-        `Action '${action}' not supported for NEP-413 write`,
-      );
-  }
-
-  if (result.success) {
-    result.invalidates = INVALIDATION_MAP[action] ?? null;
-  }
-  return result;
-}
-
-/**
- * Extract and validate the `account_id` path param that names the target
- * agent. The route layer normalizes `:accountId` into `body.account_id`
- * before dispatch, so this reads from there.
- */
-function requireAgentAccountId(
-  body: Record<string, unknown>,
-): string | WriteResult {
-  const raw = body.account_id;
-  if (typeof raw !== 'string' || !raw.trim()) {
-    return fail('VALIDATION_ERROR', 'agent account_id is required');
-  }
-  return raw;
-}
-
-async function handleClaimOperator(
-  body: Record<string, unknown>,
-  ctx: Nep413WriteContext,
-  rlWindow: number,
-): Promise<WriteResult> {
-  const agentAccountId = requireAgentAccountId(body);
-  if (typeof agentAccountId !== 'string') return agentAccountId;
-
-  const keyPrefix = composeKey('operator/', `${ctx.operatorAccountId}/`);
-  const suffixError = validateKeySuffix(agentAccountId, keyPrefix);
-  if (suffixError) return validationFail(suffixError);
-
-  const reason = body.reason as string | undefined;
-  if (reason != null) {
-    const e = validateReason(reason);
-    if (e) return validationFail(e);
-  }
-
-  const serviceKey = getOperatorClaimsWriterKey();
-  if (!serviceKey) {
-    return fail(
-      'NOT_CONFIGURED',
-      'Operator claims writer key is not configured on this deployment',
-      503,
-    );
-  }
-
-  const fullKey = composeKey(keyPrefix, agentAccountId);
-  // Store the full NEP-413 envelope so readers can independently re-verify.
-  // Optional `reason` is stored alongside; `at` / `at_height` are never
-  // stored (derived on read from the entry's block timestamp / height).
-  const value: Record<string, unknown> = {
-    message: ctx.claim.message,
-    signature: ctx.claim.signature,
-    public_key: ctx.claim.public_key,
-    nonce: ctx.claim.nonce,
-    ...(reason != null && { reason }),
-  };
-
-  const wrote = await writeToFastData(serviceKey, { [fullKey]: value });
-  if (!wrote.ok) {
-    return writeFailureToResult(wrote, ctx.operatorAccountId);
-  }
-
-  incrementRateLimit('claim_operator', ctx.operatorAccountId, rlWindow);
-
-  return ok({
-    action: 'claimed',
-    operator_account_id: ctx.operatorAccountId,
-    agent_account_id: agentAccountId,
-  });
-}
-
-async function handleUnclaimOperator(
-  body: Record<string, unknown>,
-  ctx: Nep413WriteContext,
-  rlWindow: number,
-): Promise<WriteResult> {
-  const agentAccountId = requireAgentAccountId(body);
-  if (typeof agentAccountId !== 'string') return agentAccountId;
-
-  const serviceKey = getOperatorClaimsWriterKey();
-  if (!serviceKey) {
-    return fail(
-      'NOT_CONFIGURED',
-      'Operator claims writer key is not configured on this deployment',
-      503,
-    );
-  }
-
-  const fullKey = composeKey(
-    composeKey('operator/', `${ctx.operatorAccountId}/`),
-    agentAccountId,
-  );
-  const wrote = await writeToFastData(serviceKey, { [fullKey]: null });
-  if (!wrote.ok) {
-    return writeFailureToResult(wrote, ctx.operatorAccountId);
-  }
-
-  incrementRateLimit('unclaim_operator', ctx.operatorAccountId, rlWindow);
-
-  return ok({
-    action: 'unclaimed',
-    operator_account_id: ctx.operatorAccountId,
-    agent_account_id: agentAccountId,
-  });
 }

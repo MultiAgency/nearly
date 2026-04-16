@@ -146,7 +146,7 @@ describe('fetchProfile', () => {
   it('leaves created fields absent when history fetch returns null', async () => {
     // If the first-write entry is missing (history call failed, or the
     // agent's first write hasn't been indexed yet), both created fields
-    // stay genuinely absent from the returned Agent — applyTrustBoundary
+    // stay genuinely absent from the returned Agent — `foldProfile`
     // destructured them out and fetchProfile does not re-assign when
     // firstWrite is null. We never fall back to the latest entry's block
     // values, because that would conflate "when was this written" with
@@ -174,7 +174,7 @@ describe('fetchProfile', () => {
 
   it('returns null when the stored blob is an array', async () => {
     // Arrays are `typeof 'object'`; spreading one would yield a "profile"
-    // with numeric-string keys. applyTrustBoundary must reject arrays
+    // with numeric-string keys. `foldProfile` must reject arrays
     // explicitly or this class of garbage leaks through.
     mockKvGetAgent.mockResolvedValue(profileEntry('alice.near', [1, 2, 3]));
     expect(await fetchProfile('alice.near')).toBeNull();
@@ -197,10 +197,9 @@ describe('fetchProfiles', () => {
   });
 
   it('overrides last_active from each entry block_timestamp', async () => {
-    // Block times are per-entry, so batch reads preserve the trust
-    // boundary across the whole list — not just fetchProfile's single
-    // case. This is the audit closure for sort=active under tag/cap
-    // filters, which used to bypass the override via kvMultiAgent.
+    // Per-entry block times must override caller-asserted `last_active`
+    // on every profile in a batch, not just the single `fetchProfile`
+    // path — otherwise `sort=active` under tag/cap filters is gameable.
     mockKvMultiAgent.mockResolvedValue([
       profileEntry(
         'alice.near',
@@ -270,12 +269,12 @@ describe('fetchProfiles', () => {
 
   it('strips every trust-boundary and derived field from legacy blobs', async () => {
     // List paths don't overlay live counts or join history — whatever
-    // applyTrustBoundary returns is what callers see. A legacy blob
+    // `foldProfile` returns is what callers see. A legacy blob
     // written before the write-side strippers landed could carry forged
     // values in any of the eight trust-boundary-owned fields; this test
-    // is the read-side complement of the `agentEntries` strip guard in
-    // `fastdata-write.test.ts` and ensures those forged values never
-    // surface from a bulk read.
+    // is the read-side complement of the `buildHeartbeat` / `buildUpdateMe`
+    // write-side strip guard in `packages/sdk/__tests__/social.test.ts`
+    // and ensures those forged values never surface from a bulk read.
     mockKvMultiAgent.mockResolvedValue([
       profileEntry(
         'alice.near',

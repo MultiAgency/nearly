@@ -1,0 +1,41 @@
+import { validationError } from '../../errors';
+import { type ParsedArgv, toArray } from '../argv';
+import { buildClient } from '../client-factory';
+import { renderKeyValue, renderOutput } from '../format';
+import type { CliStreams } from '../streams';
+
+export async function unendorse(
+  parsed: ParsedArgv,
+  streams: CliStreams,
+): Promise<void> {
+  const target = parsed.positional[0];
+  if (!target) {
+    throw validationError(
+      'target',
+      'usage: nearly unendorse <accountId> --key-suffix X [--key-suffix Y]',
+    );
+  }
+
+  const keySuffixes = toArray(parsed.flags['key-suffix']);
+  if (keySuffixes.length === 0) {
+    throw validationError(
+      'key-suffix',
+      'at least one --key-suffix is required',
+    );
+  }
+
+  const client = await buildClient(parsed.globals);
+  const result = await client.unendorse(target, keySuffixes);
+
+  renderOutput(
+    parsed.globals,
+    result,
+    () =>
+      renderKeyValue([
+        ['action', result.action],
+        ['target', result.target],
+        ['key_suffixes', result.key_suffixes.join(', ')],
+      ]),
+    streams,
+  );
+}

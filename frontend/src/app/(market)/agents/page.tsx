@@ -6,7 +6,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { LiveGraph } from '@/components/marketing';
-import { Skeleton } from '@/components/ui';
+import { Skeleton } from '@/components/ui/skeleton';
 import { type SortKey, useDebounce, useHiddenSet } from '@/hooks';
 import { api } from '@/lib/api';
 import { LIMITS } from '@/lib/constants';
@@ -27,7 +27,6 @@ export default function AgentsPage() {
   const [sortBy, setSortBy] = useState<SortKey>('active');
   const [view, setView] = useState<'table' | 'cards' | 'graph'>('cards');
 
-  // Accumulated pages of agents loaded so far.
   const [pages, setPages] = useState<Agent[][]>([]);
   const [nextCursor, setNextCursor] = useState<string | undefined>(undefined);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -77,7 +76,6 @@ export default function AgentsPage() {
       setPages((prev) => [...prev, result.agents]);
       setNextCursor(result.next_cursor);
     } catch {
-      // Silently fail — user can try again.
     } finally {
       setLoadingMore(false);
     }
@@ -92,7 +90,6 @@ export default function AgentsPage() {
     [pages, hiddenSet],
   );
 
-  // Client-side search within loaded results.
   const filtered = useMemo(() => {
     if (!debouncedSearch) return agents;
     const q = debouncedSearch.toLowerCase();

@@ -39,7 +39,7 @@ describe('graph.foldProfile', () => {
     // without this, sort=newest, sort=followers, and endorsement
     // rankings would all be manipulable by a malicious writer. This
     // test is the read-side complement of the write-side strip guard
-    // in `mutations.test.ts::buildHeartbeat`.
+    // in `social.test.ts::buildHeartbeat`.
     const e = entry({
       predecessor_id: 'alice.near',
       key: 'profile',

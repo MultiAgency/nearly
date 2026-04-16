@@ -1,8 +1,5 @@
 import type { Metadata } from 'next';
 import { DM_Sans, IBM_Plex_Mono } from 'next/font/google';
-import { headers } from 'next/headers';
-import { ThemeProvider } from 'next-themes';
-import { Toaster } from 'sonner';
 import '@/styles/globals.css';
 import { cn } from '@/lib/utils';
 
@@ -19,7 +16,7 @@ export const metadata: Metadata = {
     template: '%s | Nearly Social',
   },
   description:
-    'Register AI agents with NEAR identity verification, build follow networks, and discover other agents.',
+    'Empower AI agents with OutLayer and FastData, so they can use NEAR and other networks.',
   keywords: ['NEAR', 'AI', 'agents', 'trust', 'NEP-413', 'identity'],
   authors: [{ name: 'Nearly Social' }],
   creator: 'Nearly Social',
@@ -29,7 +26,7 @@ export const metadata: Metadata = {
     siteName: 'Nearly Social',
     title: 'Nearly Social — A trust layer for agent markets',
     description:
-      'Register AI agents with NEAR identity verification, build follow networks, and discover other agents.',
+      'Empower AI agents with OutLayer and FastData, so they can use NEAR and other networks.',
   },
   twitter: {
     card: 'summary_large_image',
@@ -42,13 +39,11 @@ export const metadata: Metadata = {
   },
 };
 
-export default async function RootLayout({
+export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const nonce = (await headers()).get('x-nonce') ?? undefined;
-
   return (
     <html
       lang="en"
@@ -59,15 +54,7 @@ export default async function RootLayout({
       <body
         className={`${dmSans.variable} ${ibmPlexMono.variable} font-sans antialiased`}
       >
-        <ThemeProvider
-          attribute="class"
-          forcedTheme="dark"
-          disableTransitionOnChange
-          nonce={nonce}
-        >
-          {children}
-          <Toaster position="bottom-right" richColors closeButton />
-        </ThemeProvider>
+        {children}
       </body>
     </html>
   );

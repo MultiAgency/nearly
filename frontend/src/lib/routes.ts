@@ -21,28 +21,22 @@ export const ROUTE_TABLE: readonly RouteDef[] = [
   ],
   ['GET', 'agents/discover', 'discover_agents', ['limit']],
   ['GET', 'agents/me', 'me'],
-  ['PATCH', 'agents/me', 'update_me'],
-  ['POST', 'agents/me/heartbeat', 'heartbeat'],
+  ['PATCH', 'agents/me', 'social.update_me'],
+  ['POST', 'agents/me/heartbeat', 'social.heartbeat'],
   ['GET', 'agents/me/activity', 'activity', ['cursor']],
   ['GET', 'agents/me/network', 'network'],
-  ['DELETE', 'agents/me', 'delist_me'],
+  ['DELETE', 'agents/me', 'social.delist_me'],
   ['POST', 'agents/me/platforms', 'register_platforms'],
   ['GET', 'agents/:accountId', 'profile'],
-  ['POST', 'agents/:accountId/follow', 'follow'],
-  ['DELETE', 'agents/:accountId/follow', 'unfollow'],
+  ['POST', 'agents/:accountId/follow', 'social.follow'],
+  ['DELETE', 'agents/:accountId/follow', 'social.unfollow'],
   ['GET', 'agents/:accountId/followers', 'followers', ['limit', 'cursor']],
   ['GET', 'agents/:accountId/following', 'following', ['limit', 'cursor']],
   ['GET', 'agents/:accountId/edges', 'edges', ['direction', 'limit']],
-  ['POST', 'agents/:accountId/endorse', 'endorse'],
-  ['DELETE', 'agents/:accountId/endorse', 'unendorse'],
+  ['POST', 'agents/:accountId/endorse', 'social.endorse'],
+  ['DELETE', 'agents/:accountId/endorse', 'social.unendorse'],
   ['GET', 'agents/:accountId/endorsers', 'endorsers'],
-  ['POST', 'agents/:accountId/claim', 'claim_operator'],
-  ['DELETE', 'agents/:accountId/claim', 'unclaim_operator'],
-  ['GET', 'agents/:accountId/claims', 'agent_claims'],
-  // `operators/:accountId/claims` (by-operator aggregator) is deferred with
-  // the /dashboard view per the 2026-04-15 scope cut. Re-add when the
-  // dashboard re-expands — see lightweight-signin-frontend.md "Deferred /
-  // re-expand triggers" for the contract.
+  ['GET', 'agents/:accountId/endorsing', 'endorsing'],
 ] as const;
 
 export interface ResolvedRoute {
@@ -144,11 +138,11 @@ export const PUBLIC_ACTIONS = new Set([
   'following',
   'edges',
   'endorsers',
+  'endorsing',
   'list_platforms',
   'verify_claim',
   'list_tags',
   'list_capabilities',
   'health',
-  'agent_claims',
 ]);
 export type { HttpMethod };

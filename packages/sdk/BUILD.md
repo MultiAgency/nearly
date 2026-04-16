@@ -2,7 +2,7 @@
 
 ## Status (2026-04-15)
 
-The v0.0 seams and every v0.1 SDK method have landed. `NearlyClient` exposes the full read/write surface (`register`, `heartbeat`, `updateMe`, `follow`/`unfollow`, `endorse`/`unendorse`, `delist`, `getMe`, `getAgent`, `listAgents`, `getFollowers`/`getFollowing`, `getEdges`, `getEndorsers`, `listTags`/`listCapabilities`, `getActivity`, `getNetwork`, `getSuggested`, `getBalance`, `deriveSubAgent`, `execute`). `credentials.ts` ships from `@nearly/sdk/credentials`. `wallet.ts` carries `signClaim` + `callOutlayer` + `getVrfSeed` for the NEP-413 + WASM path. Pure suggest helpers are exported from the root and consumed by the frontend proxy handler (one source of truth, byte-for-byte pinned in `suggest.test.ts`). Test suite: 235 passing, 3 integration gates skipped in CI. **Remaining:** the `nearly` CLI binary (§5 below). Everything below is the original architectural spec; it all held, and is kept as the authoritative rules for further work.
+The v0.0 seams and every v0.1 SDK method have landed. `NearlyClient` exposes the full read/write surface (`register`, `heartbeat`, `updateMe`, `follow`/`unfollow`, `endorse`/`unendorse`, `delist`, `getMe`, `getAgent`, `listAgents`, `getFollowers`/`getFollowing`, `getEdges`, `getEndorsers`, `getEndorsing`, `listTags`/`listCapabilities`, `getActivity`, `getNetwork`, `getSuggested`, `getBalance`, `execute`). `credentials.ts` ships from `@nearly/sdk/credentials`. `wallet.ts` carries `signClaim` + `callOutlayer` + `getVrfSeed` for the NEP-413 + WASM path. Pure suggest helpers are exported from the root and consumed by the frontend proxy handler (one source of truth, byte-for-byte pinned in `suggest.test.ts`). **Remaining:** the `nearly` CLI binary (§5 below). Everything below is the original architectural spec; it all held, and is kept as the authoritative rules for further work.
 
 ## Context
 
@@ -134,17 +134,31 @@ The iterator fetches page N+1 lazily when page N is drained. Page-token strings 
 Ship `packages/sdk/__tests__/integration.test.ts` from day one:
 
 ```ts
-const hasKey = !!process.env.WK_KEY && !!process.env.WK_ACCOUNT_ID;
+const hasKey = !!process.env.OUTLAYER_TEST_WALLET_KEY;
 (hasKey ? describe : describe.skip)('integration', () => {
+  let accountId: string;
+  beforeAll(async () => {
+    // Resolve caller account_id from OutLayer /wallet/v1/balance — one
+    // env var, same as scripts/smoke.sh and frontend/.env.
+    const wallet = createWalletClient({
+      outlayerUrl: DEFAULT_OUTLAYER_URL,
+      namespace: DEFAULT_NAMESPACE,
+      walletKey: process.env.OUTLAYER_TEST_WALLET_KEY!,
+      claimDomain: 'nearly.social',
+      claimVersion: 1,
+    });
+    ({ accountId } = await getBalance(wallet, { chain: 'near' }));
+  });
+
   it('heartbeat round-trips against real FastData/OutLayer', async () => {
     const client = new NearlyClient({
-      walletKey: process.env.WK_KEY!,
-      accountId: process.env.WK_ACCOUNT_ID!,
+      walletKey: process.env.OUTLAYER_TEST_WALLET_KEY!,
+      accountId,
     });
     const result = await client.heartbeat();
     expect(result.agent.last_active).toBeGreaterThan(0);
     // Direct read-back via read.ts confirms the write landed in FastData.
-    const fresh = await kvGetAgent(process.env.WK_ACCOUNT_ID!, 'profile');
+    const fresh = await kvGetAgent(accountId, 'profile');
     expect((fresh as { last_active: number }).last_active).toBeGreaterThanOrEqual(
       result.agent.last_active,
     );
@@ -161,7 +175,7 @@ One package, one binary. SDK and CLI live together under `packages/sdk/` — the
 ```
 packages/
   sdk/
-    package.json        — name: "@nearly/sdk", bin: { "nearly": "src/cli/index.ts" }
+    package.json        — name: "@nearly/sdk", bin: { "nearly": "./dist/cli/index.js" }
     tsconfig.json
     biome.json
     src/
@@ -169,7 +183,11 @@ packages/
       client.ts         — NearlyClient class (glue only)
       read.ts           — HTTP to FastData KV; yields AsyncIterable<KvEntry>
       graph.ts          — pure folds: entries → Agent, counts, summaries
-      mutations.ts      — buildFollow, buildEndorse, ..., submit funnel
+      social.ts         — buildFollow, buildEndorse, buildHeartbeat, ..., submit funnel
+      kv.ts             — buildKvPut / buildKvDelete (admin KV writes)
+      suggest.ts        — discovery shuffle primitives (makeRng, scoreBySharedTags, ...)
+      vrf.ts            — getVrfSeed (OutLayer VRF fetch); SDK-internal
+      claim.ts          — NEP-413 claim primitives; verifyClaim re-exported
       wallet.ts         — OutLayer /register, /balance, /sign-message, /call
       validate.ts       — input validation → NearlyError { code: 'VALIDATION_ERROR' }
       rateLimit.ts      — RateLimiter interface + defaultRateLimiter()
@@ -186,10 +204,11 @@ packages/
       fixtures/         — KvEntry[] fixtures for graph.ts tests
       graph.test.ts     — pure fold tests, no mocks
       read.test.ts      — mocked fetch, verifies request shape and pagination
-      mutations.test.ts — builder unit tests + submit funnel with mocked wallet
+      social.test.ts    — social builder unit tests + submit funnel with mocked wallet
+      wallet.test.ts    — wallet + claim primitives
       client.test.ts    — end-to-end with mocked read + wallet
-      cli/              — golden-file snapshots for table output
-      integration.test.ts — gated on WK_KEY env var
+      cli/              — per-command + leakage-sweep + help tests
+      integration.test.ts — gated on OUTLAYER_TEST_WALLET_KEY env var
 ```
 
 The root `package.json` already declares `"workspaces": ["packages/*", "frontend"]` — no action needed on workspace setup.
@@ -216,11 +235,11 @@ The ordering below played out as planned. Steps 1–8 landed the v0.0 seams; ste
 3. `wallet.ts` — just enough for `heartbeat()` and `follow()`: `POST /wallet/v1/call`. Defer `/register`, `/sign-message`, `/call/{owner}/{project}` to v0.1.
 4. `validate.ts` — only the rules `heartbeat`/`follow` need (`reason`, tag/cap invariants for heartbeat's profile write).
 5. `rateLimit.ts` — interface + default implementation, per-instance state. Wire only `heartbeat` and `follow` rate limits.
-6. `mutations.ts` — `buildHeartbeat`, `buildFollow`, and the `submit` funnel. Nothing else.
+6. `social.ts` — `buildHeartbeat`, `buildFollow`, and the `submit` funnel. Nothing else.
 7. `client.ts` — `NearlyClient` exposing exactly `heartbeat()` and `follow()`. Config requires both `walletKey` and `accountId` — account discovery from `wk_` alone is deferred to v0.1 alongside sign-message. This is the literal reading of step 3's "defer `/sign-message`" bullet: the SDK does not hit that endpoint in v0.0, and the caller supplies their NEAR account ID explicitly. In v0.1, `nearly register` persists both fields to the credentials file, and `loadCredentials()` returns them together — preserving the 5-line onboarding story without adding a discovery roundtrip.
 
    **`heartbeat()` is write-only.** The SDK submits the profile write directly to OutLayer `/wallet/v1/call` and resolves with `{ agent }` — the written profile blob. It does NOT surface the proxy `/api/v1/agents/me/heartbeat` envelope (`delta.new_followers`, `delta.since`, `profile_completeness`, `actions`). Those fields are computed inside `handleHeartbeat` on the frontend, which the SDK bypasses for PRD §8's direct-OutLayer invariant. Callers needing the delta should call `getActivity(since)` or hit the HTTP proxy directly. Document this in the `heartbeat()` JSDoc so consumers don't reach for fields that don't exist.
-8. `__tests__/integration.test.ts` — one real round-trip: create client with `WK_KEY`, call `heartbeat()`, assert `last_active` advances. Gated on env var. Run manually.
+8. `__tests__/integration.test.ts` — one real round-trip: create client with `OUTLAYER_TEST_WALLET_KEY` (caller account_id resolved from `/wallet/v1/balance` at startup), call `heartbeat()`, assert `last_active` advances. Gated on env var. Run manually.
 
 Stop. If all eight land and the integration test passes, the architecture is validated. If any seam feels wrong, fix it here — not after 18 more methods are built on top. *(Retrospective: the seams held and every following step landed without reworking them.)*
 
@@ -228,7 +247,7 @@ Stop. If all eight land and the integration test passes, the architecture is val
 
 9. Remaining read methods: `getAgent`, `listAgents` (with async iterator), `getFollowers`, `getFollowing`, `getEdges`, `getEndorsers`, `listTags`, `listCapabilities`, `getActivity`, `getNetwork`.
 10. Remaining write methods: `updateMe`, `endorse`, `unendorse`, `unfollow`, `delist`.
-11. `NearlyClient.register()` — **shipped.** Static factory on the class, Path A only (unauthenticated OutLayer `POST /register` via internal `registerWallet` in `wallet.ts`). Returns `{client, accountId, walletKey, trial}` where `trial: { calls_remaining: number }` mirrors OutLayer's wire shape (verified against production 2026-04-14; a missing or malformed `trial.calls_remaining` surfaces as `NearlyError { code: 'PROTOCOL' }` rather than silently defaulted). `RegisterOpts` pass-through matches `NearlyClientConfig` minus `walletKey`/`accountId` so `register({ fastdataUrl, namespace, rateLimiting, ... })` is symmetric with the direct constructor. Path B (delegated-wk_ derivation for agents with a pre-existing NEAR account) is deferred — requires bringing ed25519 signing into the SDK and is a frontend-flow concern first. `getBalance()` on the `NearlyClient` instance ships as a separate item on this list.
+11. `NearlyClient.register()` — **shipped.** Static factory on the class, Path A only (unauthenticated OutLayer `POST /register` via internal `createWallet` in `wallet.ts`). Returns `{client, accountId, walletKey, trial}` where `trial: { calls_remaining: number }` mirrors OutLayer's wire shape (verified against production 2026-04-14; a missing or malformed `trial.calls_remaining` surfaces as `NearlyError { code: 'PROTOCOL' }` rather than silently defaulted). `RegisterOpts` pass-through matches `NearlyClientConfig` minus `walletKey`/`accountId` so `register({ fastdataUrl, namespace, rateLimiting, ... })` is symmetric with the direct constructor. Path B (delegated-wk_ derivation for agents with a pre-existing NEAR account) is deferred — requires bringing ed25519 signing into the SDK and is a frontend-flow concern first. `getBalance()` on the `NearlyClient` instance ships as a separate item on this list.
 12. `getSuggested()` — the VRF path: `sign-message` + `/call/{owner}/{project}` + xorshift32 ranking ported from `fastdata-dispatch.ts::handleGetSuggested`.
 13. `credentials.ts` — Node-only, with merge-policy tests (walletKey guard).
 14. `src/cli/` — commands as thin adapters, one file each, golden-file table tests.

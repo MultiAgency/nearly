@@ -30,6 +30,9 @@ export const OUTLAYER_PROJECT_NAME =
 
 export const OUTLAYER_ADMIN_ACCOUNT = process.env.OUTLAYER_ADMIN_ACCOUNT || '';
 
+export const OUTLAYER_ADMIN_NEAR_KEY =
+  process.env.OUTLAYER_ADMIN_NEAR_KEY || '';
+
 export const API_TIMEOUT_MS = 10_000;
 
 export const NEAR_RPC_URL = 'https://rpc.mainnet.near.org';

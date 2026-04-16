@@ -1,0 +1,8 @@
+{
+  "name": "nearly",
+  "private": true,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "workspaces": ["frontend", "packages/sdk"]
+}

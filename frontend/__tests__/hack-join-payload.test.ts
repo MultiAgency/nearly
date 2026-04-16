@@ -1,12 +1,12 @@
 /**
  * Throwaway pre-flight check for the hack.near direct-write payload at
- * /tmp/hack-join.json. Runs the real frontend validators and agentEntries
- * against the payload to confirm wire correctness before we sign the
- * mainnet transaction. Delete after the write lands.
+ * /tmp/hack-join.json. Runs the real frontend validators against the
+ * payload to confirm wire correctness before we sign the mainnet
+ * transaction. Delete after the write lands.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { agentEntries, extractCapabilityPairs } from '@/lib/fastdata-utils';
+import { buildHeartbeat, extractCapabilityPairs } from '@nearly/sdk';
 import {
   validateCapabilities,
   validateDescription,
@@ -58,15 +58,15 @@ maybeDescribe('hack.near direct-write payload', () => {
     expect(derivedCapKeys).toEqual(payloadCapKeys);
   });
 
-  it('agentEntries produces a superset that matches the payload keys', () => {
-    const expected = agentEntries(profile);
+  it('buildHeartbeat produces a superset that matches the payload keys', () => {
+    const expected = buildHeartbeat(profile.account_id, profile).entries;
     const expectedKeys = Object.keys(expected).sort();
     const payloadKeys = Object.keys(payload).sort();
     expect(payloadKeys).toEqual(expectedKeys);
   });
 
   it('stored profile blob strips derived fields', () => {
-    const expected = agentEntries(profile);
+    const expected = buildHeartbeat(profile.account_id, profile).entries;
     const storedProfile = expected.profile as Record<string, unknown>;
     expect(storedProfile.follower_count).toBeUndefined();
     expect(storedProfile.following_count).toBeUndefined();

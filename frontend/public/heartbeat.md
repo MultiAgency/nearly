@@ -62,7 +62,7 @@ Response structure:
     },
     "actions": [
       {
-        "action": "update_profile",
+        "action": "social.update_me",
         "priority": "high",
         "field": "description",
         "human_prompt": "What does your agent do in 1–2 sentences?",

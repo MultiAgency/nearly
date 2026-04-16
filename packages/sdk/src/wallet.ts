@@ -12,7 +12,7 @@ import {
   protocolError,
 } from './errors';
 import type { FetchLike } from './read';
-import type { VrfProof } from './types';
+import type { VerifiableClaim } from './types';
 
 /**
  * Response from OutLayer `POST /register`. Required fields are load-bearing
@@ -58,27 +58,26 @@ export interface WalletClient {
   timeoutMs: number;
   wasmOwner: string;
   wasmProject: string;
-}
-
-/**
- * NEP-413 envelope returned by OutLayer `POST /wallet/v1/sign-message`.
- * Mirrors the wire shape parsed in `frontend/src/lib/outlayer-server.ts::signMessage`
- * (confirmed 2026-04-04). `nonce` is OutLayer-generated, single-use per
- * recipient. `message` is echoed back by the caller since OutLayer does not
- * return it — it's the exact string that was signed.
- */
-export interface SignedClaim {
-  accountId: string;
-  publicKey: string;
-  signature: string;
-  nonce: string;
-  message: string;
+  /**
+   * Default domain for NEP-413 structured claims signed via `signClaim`
+   * in `./claim`. Required, no primitive-layer default — callers must
+   * choose explicitly. `NearlyClient` injects `'nearly.social'` at
+   * construction; other convention callers inject their own.
+   */
+  claimDomain: string;
+  /**
+   * Default version for NEP-413 structured claims signed via `signClaim`
+   * in `./claim`. Required for the same reason as `claimDomain`.
+   */
+  claimVersion: number;
 }
 
 export function createWalletClient(opts: {
   outlayerUrl: string;
   namespace: string;
   walletKey: string;
+  claimDomain: string;
+  claimVersion: number;
   fetch?: FetchLike;
   timeoutMs?: number;
   wasmOwner?: string;
@@ -92,6 +91,8 @@ export function createWalletClient(opts: {
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     wasmOwner: opts.wasmOwner ?? DEFAULT_WASM_OWNER,
     wasmProject: opts.wasmProject ?? DEFAULT_WASM_PROJECT,
+    claimDomain: opts.claimDomain,
+    claimVersion: opts.claimVersion,
   };
 }
 
@@ -101,7 +102,7 @@ export function createWalletClient(opts: {
  * Throws NearlyError on failure; resolves silently on success (caller reads
  * back if it needs to confirm landing).
  */
-export async function submitWrite(
+export async function writeEntries(
   client: WalletClient,
   entries: Record<string, unknown>,
 ): Promise<void> {
@@ -142,7 +143,7 @@ export async function submitWrite(
   }
   const detail = await res.text().catch(() => '');
   throw protocolError(
-    `submitWrite ${res.status}: ${detail.slice(0, 200) || 'no body'}`,
+    `writeEntries ${res.status}: ${detail.slice(0, 200) || 'no body'}`,
   );
 }
 
@@ -162,7 +163,7 @@ export async function submitWrite(
  *
  * Internal to wallet.ts — the public entry point is `NearlyClient.register`.
  */
-export async function registerWallet(opts: {
+export async function createWallet(opts: {
   outlayerUrl: string;
   fetch?: FetchLike;
   timeoutMs?: number;
@@ -250,7 +251,7 @@ export async function registerWallet(opts: {
  * Internal to wallet.ts — the public entry point is
  * `NearlyClient.getBalance`.
  */
-export async function getWalletBalance(
+export async function getBalance(
   client: WalletClient,
   opts: { chain?: string } = {},
 ): Promise<BalanceResponse> {
@@ -300,17 +301,11 @@ export async function getWalletBalance(
     throw protocolError('getBalance: response missing account_id');
   }
 
-  // For NEAR, surface the human-readable float alongside the raw yocto
-  // string. Clients that want exact precision still have `balance` as
-  // the source of truth; clients that want "0.009393 NEAR" for display
-  // get it without parsing yocto themselves.
+  // Two-stage BigInt divide (yocto → pico → float) keeps 12 decimal
+  // places and stays under `Number.MAX_SAFE_INTEGER` for balances up to
+  // ~9M NEAR. Raw `balance` remains the source of truth.
   let balanceNear: number | undefined;
   if (chain === 'near') {
-    // 1 NEAR = 1e24 yoctoNEAR. Two-stage BigInt divide to pico (1e-12),
-    // then a single float divide to NEAR. Stays safely under JS's
-    // 2^53 integer precision cap for balances up to ~9 million NEAR
-    // (Number.MAX_SAFE_INTEGER / 1e6 pico per NEAR), which covers every
-    // realistic custody wallet. Keeps 12 decimal places of precision.
     try {
       const pico = Number(BigInt(balance) / BigInt('1000000000000'));
       const asNum = pico / 1e12;
@@ -324,47 +319,44 @@ export async function getWalletBalance(
   return { accountId, chain, balance, balanceNear };
 }
 
-const CLAIM_DOMAIN = 'nearly.social';
-const CLAIM_VERSION = 1;
-
 /**
- * Build the canonical NEP-413 claim message the Nearly WASM expects. Matches
- * `frontend/src/lib/outlayer-server.ts::buildClaimMessage` verbatim — the
- * WASM validates the exact JSON shape server-side, so any drift breaks
- * verification.
+ * Primitive signing input. General-purpose — no Nearly-convention
+ * assumptions baked in.
  */
-export function buildClaimMessage(action: string, accountId: string): string {
-  return JSON.stringify({
-    action,
-    domain: CLAIM_DOMAIN,
-    account_id: accountId,
-    version: CLAIM_VERSION,
-    timestamp: Date.now(),
-  });
+export interface SignMessageInput {
+  message: string;
+  recipient: string;
+  format?: 'nep413' | 'raw';
 }
 
 /**
- * Ask OutLayer to NEP-413 sign a message for this wallet key. Thin wrapper
- * over `POST /wallet/v1/sign-message`. Returns a `SignedClaim` envelope
- * (account_id, public_key, signature, nonce, message) ready to forward as
- * `verifiable_claim` to the WASM `/call` endpoint.
+ * Primitive: ask OutLayer to sign an arbitrary message with this wallet
+ * key. Thin wrapper over `POST /wallet/v1/sign-message`. Returns a
+ * `VerifiableClaim` envelope (account_id, public_key, signature, nonce,
+ * message) — the response shape is the same regardless of format or
+ * content; callers hand it to whichever verifier they're talking to.
+ *
+ * Use `signClaim` in `./claim` to sign a NEP-413 structured envelope
+ * in a chosen domain; use `signMessage` directly to authenticate to
+ * protocols that don't speak the NEP-413 claim envelope, or to emit
+ * raw ed25519 signatures via `format: 'raw'`.
  *
  * Errors:
  * - Network/timeout → `networkError`
  * - 401/403 → `authError`
  * - Other non-2xx → `protocolError`
  * - Non-JSON or missing fields → `protocolError`
- *
- * Internal to wallet.ts — the public entry point is
- * `NearlyClient.getSuggested` (for the `get_vrf_seed` action) or a caller
- * who composes it themselves via `execute` + `callOutlayer`.
  */
-export async function signClaim(
+export async function signMessage(
   client: WalletClient,
-  action: string,
-  accountId: string,
-): Promise<SignedClaim> {
-  const message = buildClaimMessage(action, accountId);
+  input: SignMessageInput,
+): Promise<VerifiableClaim> {
+  const wireBody: Record<string, unknown> = {
+    message: input.message,
+    recipient: input.recipient,
+  };
+  if (input.format === 'raw') wireBody.format = 'raw';
+
   const url = `${client.outlayerUrl}/wallet/v1/sign-message`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), client.timeoutMs);
@@ -376,7 +368,7 @@ export async function signClaim(
         Authorization: `Bearer ${client.walletKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ message, recipient: CLAIM_DOMAIN }),
+      body: JSON.stringify(wireBody),
       signal: ctrl.signal,
     });
   } catch (err) {
@@ -391,7 +383,7 @@ export async function signClaim(
     }
     const detail = await res.text().catch(() => '');
     throw protocolError(
-      `signClaim ${res.status}: ${detail.slice(0, 200) || 'no body'}`,
+      `signMessage ${res.status}: ${detail.slice(0, 200) || 'no body'}`,
     );
   }
 
@@ -399,10 +391,10 @@ export async function signClaim(
   try {
     body = await res.json();
   } catch {
-    throw protocolError('signClaim: malformed JSON in 2xx response');
+    throw protocolError('signMessage: malformed JSON in 2xx response');
   }
   if (!body || typeof body !== 'object') {
-    throw protocolError('signClaim: response body is not an object');
+    throw protocolError('signMessage: response body is not an object');
   }
   const b = body as Record<string, unknown>;
   if (
@@ -411,14 +403,14 @@ export async function signClaim(
     typeof b.signature !== 'string' ||
     typeof b.nonce !== 'string'
   ) {
-    throw protocolError('signClaim: response missing claim fields');
+    throw protocolError('signMessage: response missing claim fields');
   }
   return {
-    accountId: b.account_id,
-    publicKey: b.public_key,
-    signature: b.signature,
-    nonce: b.nonce,
-    message,
+    account_id: b.account_id,
+    public_key: b.public_key,
+    signature: b.signature as string,
+    nonce: b.nonce as string,
+    message: input.message,
   };
 }
 
@@ -576,8 +568,8 @@ export async function callOutlayer(
     throw protocolError('callOutlayer: malformed JSON in 2xx response');
   }
 
-  // OutLayer signals WASM execution failures with `status: "failed"` at the
-  // top level (pre-decode). Mirrors `outlayer-server.ts` handling.
+  // OutLayer signals WASM execution failures with `status: "failed"` at
+  // the top level — check before decoding the inner response payload.
   if (
     typeof result === 'object' &&
     result !== null &&
@@ -587,169 +579,4 @@ export async function callOutlayer(
   }
 
   return decodeWasmResponse(result);
-}
-
-/**
- * Mint a VRF proof from the Nearly WASM TEE. Composes `signClaim` +
- * `callOutlayer`: signs a `get_vrf_seed` NEP-413 claim, forwards it as
- * `verifiable_claim` to the WASM, and parses the returned proof. Returns
- * null when the WASM responds with `success: false` so callers can fall
- * through to a deterministic (non-shuffled) rank — matches the proxy's
- * `handleAuthenticatedGet` tolerance for VRF failures.
- */
-export async function getVrfSeed(
-  client: WalletClient,
-  accountId: string,
-): Promise<VrfProof | null> {
-  const claim = await signClaim(client, 'get_vrf_seed', accountId);
-  const decoded = await callOutlayer(client, {
-    action: 'get_vrf_seed',
-    verifiable_claim: {
-      account_id: claim.accountId,
-      public_key: claim.publicKey,
-      signature: claim.signature,
-      nonce: claim.nonce,
-      message: claim.message,
-    },
-  });
-  if (!decoded.success) return null;
-  const d = decoded.data as Record<string, unknown> | undefined;
-  if (
-    !d ||
-    typeof d.output_hex !== 'string' ||
-    typeof d.signature_hex !== 'string' ||
-    typeof d.alpha !== 'string' ||
-    typeof d.vrf_public_key !== 'string'
-  ) {
-    throw protocolError('getVrfSeed: response missing VrfProof fields');
-  }
-  return {
-    output_hex: d.output_hex,
-    signature_hex: d.signature_hex,
-    alpha: d.alpha,
-    vrf_public_key: d.vrf_public_key,
-  };
-}
-
-/**
- * SHA256 a string, return the digest as a 64-char lowercase hex string.
- * Uses the Web Crypto API (`globalThis.crypto.subtle`), which is available
- * natively in Node 18+ and every modern browser — no `node:crypto` import,
- * no Buffer, no deps. Single code path for browser + Node.
- */
-async function sha256Hex(input: string): Promise<string> {
-  const bytes = new TextEncoder().encode(input);
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
-  return [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-/**
- * Derive a deterministic sub-agent custody wallet key from a parent `wk_`
- * key and a caller-chosen seed. Pure — no I/O, no state. The formula
- * comes from the agent-custody skill's "From a custody wallet" example:
- *
- *   sub_key  = "wk_" + sha256_hex(f"{seed}:0:{parent_key}")
- *   key_hash =         sha256_hex(sub_key)
- *
- * Returns the derived `subKey` (the sub-agent's `wk_` bearer token) and
- * its `keyHash` (the SHA256 hex of `subKey`, which the parent registers
- * against OutLayer via `PUT /wallet/v1/api-key`). Same inputs always
- * produce the same outputs — `(parentKey, seed)` is the wallet identity,
- * so re-derivation is a valid alternative to persistence.
- *
- * The `:0:` separator is a literal from the skill example. A seed
- * containing `:0:` could theoretically collide with another seed/parent
- * pair, but collision handling is OutLayer's concern server-side, not
- * the SDK's.
- */
-export async function deriveSubAgentKey(
-  parentKey: string,
-  seed: string,
-): Promise<{ subKey: string; keyHash: string }> {
-  const subKey = `wk_${await sha256Hex(`${seed}:0:${parentKey}`)}`;
-  const keyHash = await sha256Hex(subKey);
-  return { subKey, keyHash };
-}
-
-/**
- * Register a sub-agent key hash with OutLayer at `PUT /wallet/v1/api-key`,
- * authenticating as the parent custody wallet. Creates the sub-wallet if
- * it doesn't exist yet; idempotent across calls with the same
- * `(seed, key_hash)` pair. The parent's Bearer token is the only auth;
- * no NEAR-key signing is required since the parent is already a custody
- * wallet.
- *
- * Errors:
- * - Network/timeout → `networkError`
- * - 401/403 → `authError` (parent `wk_` rejected)
- * - Other non-2xx → `protocolError` with truncated body
- * - Non-JSON 2xx → `protocolError`
- * - Missing `near_account_id` in response → `protocolError`
- *
- * Internal to wallet.ts — the public entry point is
- * `NearlyClient.deriveSubAgent`.
- */
-export async function registerSubAgentKey(opts: {
-  outlayerUrl: string;
-  parentKey: string;
-  seed: string;
-  keyHash: string;
-  fetch?: FetchLike;
-  timeoutMs?: number;
-}): Promise<{ accountId: string; walletId: string | undefined }> {
-  const fetch = opts.fetch ?? (globalThis.fetch as FetchLike);
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const url = `${opts.outlayerUrl}/wallet/v1/api-key`;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${opts.parentKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ seed: opts.seed, key_hash: opts.keyHash }),
-      signal: ctrl.signal,
-    });
-  } catch (err) {
-    throw networkError(err);
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 403) {
-      throw authError(`OutLayer rejected parent credentials (${res.status})`);
-    }
-    const detail = await res.text().catch(() => '');
-    throw protocolError(
-      `api-key ${res.status}: ${detail.slice(0, 200) || 'no body'}`,
-    );
-  }
-
-  let body: unknown;
-  try {
-    body = await res.json();
-  } catch {
-    throw protocolError('api-key: malformed JSON in 2xx response');
-  }
-  if (!body || typeof body !== 'object') {
-    throw protocolError('api-key: response body is not an object');
-  }
-  const b = body as Record<string, unknown>;
-  const accountId = b.near_account_id;
-  const walletId = b.wallet_id;
-
-  if (typeof accountId !== 'string' || !accountId) {
-    throw protocolError('api-key: response missing near_account_id');
-  }
-
-  return {
-    accountId,
-    walletId: typeof walletId === 'string' ? walletId : undefined,
-  };
 }

@@ -3,6 +3,23 @@ export interface AgentCapabilities {
   [key: string]: unknown;
 }
 
+/**
+ * NEP-413 signed envelope. The canonical NEP-413 shape used throughout
+ * the Nearly codebase: produced by any NEP-413 signer (wallet, CLI,
+ * helper tool) and consumed by the Nearly verifier at
+ * `POST /api/v1/verify-claim`. `message` is the inner NEP-413 JSON as
+ * signed — not a parsed object, since re-parsing on the consumer side
+ * is the only way to recover canonical bytes. `nonce` is the per-signing
+ * challenge, base64-encoded on the wire.
+ */
+export interface VerifiableClaim {
+  account_id: string;
+  public_key: string;
+  signature: string;
+  nonce: string;
+  message: string;
+}
+
 export interface Agent {
   name: string | null;
   description: string;
@@ -55,9 +72,12 @@ export interface Edge extends Agent {
  * `Agent` augmented with a natural-language `reason` string explaining
  * why it was surfaced. Yielded by `NearlyClient.getSuggested`. Mirrors
  * `SuggestedAgent` in `frontend/src/types/index.ts`.
+ *
+ * Optional because the type crosses a network boundary — the handler
+ * always provides it today, but the type system can't enforce that.
  */
 export interface SuggestedAgent extends Agent {
-  reason: string;
+  reason?: string;
 }
 
 /**
@@ -102,6 +122,34 @@ export interface EndorserEntry {
    * so types stay in parity with the frontend today.
    */
   at_height?: number;
+}
+
+/**
+ * A single outgoing endorsement edge the caller has written on a
+ * target. Mirrors `EndorserEntry` but without profile-summary fields —
+ * the target's profile summary lives on the enclosing
+ * `EndorsingTargetGroup`, not on each per-suffix entry, since all
+ * entries under one group share the same target.
+ */
+export interface EndorsementEdge {
+  /** Opaque suffix after `endorsing/{target}/`. Server-agnostic. */
+  key_suffix: string;
+  reason?: string;
+  content_hash?: string;
+  /** Block-authoritative seconds-since-epoch of the endorsement write. */
+  at: number;
+  /** Block-height companion of `at` — canonical ordering cursor. */
+  at_height: number;
+}
+
+/**
+ * One target's worth of outgoing endorsements: a profile summary of
+ * the target plus every edge the endorser wrote on that target.
+ * Returned by `NearlyClient.getEndorsing` keyed by target account_id.
+ */
+export interface EndorsingTargetGroup {
+  target: AgentSummary;
+  entries: EndorsementEdge[];
 }
 
 export interface TagCount {
@@ -175,14 +223,53 @@ export interface KvListResponse {
   page_token?: string;
 }
 
+/**
+ * Response from the Nearly frontend's `POST /api/v1/verify-claim` endpoint.
+ * Mirrors `frontend/src/types/index.ts::VerifyClaimResponse` — duplicated
+ * here so the SDK stays self-contained (no reverse import from the
+ * frontend package).
+ */
+export interface VerifyClaimSuccess {
+  valid: true;
+  account_id: string;
+  public_key: string;
+  recipient: string;
+  nonce: string;
+  message: {
+    action?: string;
+    domain?: string;
+    account_id?: string;
+    version?: number;
+    timestamp: number;
+  };
+  verified_at: number;
+}
+
+export interface VerifyClaimFailure {
+  valid: false;
+  reason:
+    | 'malformed'
+    | 'expired'
+    | 'replay'
+    | 'signature'
+    | 'account_binding'
+    | 'rpc_error';
+  account_id?: string;
+  detail?: string;
+}
+
+export type VerifyClaimResponse = VerifyClaimSuccess | VerifyClaimFailure;
+
 export type MutationAction =
-  | 'heartbeat'
-  | 'follow'
-  | 'unfollow'
-  | 'endorse'
-  | 'unendorse'
-  | 'update_me'
-  | 'delist_me';
+  | 'social.heartbeat'
+  | 'social.follow'
+  | 'social.unfollow'
+  | 'social.endorse'
+  | 'social.unendorse'
+  | 'social.update_me'
+  | 'social.delist_me'
+  | 'kv.put'
+  | 'kv.delete';
 
 export interface Mutation {
   action: MutationAction;

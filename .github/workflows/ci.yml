@@ -79,7 +79,7 @@ jobs:
       # production bundle already exists. Build it here as a separate
       # step so failures are clearly attributed.
       - run: npm run build
-      - run: npx playwright test --project=ci-smoke --reporter=list
+      - run: npx playwright test --project=ci-smoke --reporter=list,github
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -89,13 +89,14 @@ jobs:
 
   sdk:
     # @nearly/sdk is a standalone workspace under packages/sdk with its own
-    # biome/tsc/jest. No lockfile yet (v0.0 pre-publish), so we use `npm
-    # install` instead of `npm ci`. Switch to `npm ci` once packages/sdk/
-    # ships a committed package-lock.json.
+    # biome/tsc/jest.
     #
     # The integration suite (__tests__/integration.test.ts) self-skips when
-    # WK_KEY is absent, so CI covers the unit layer only. Run it manually as
-    # a pre-release check: `WK_KEY=wk_... WK_ACCOUNT_ID=... npx jest integration`.
+    # OUTLAYER_TEST_WALLET_KEY is absent, so CI covers the unit layer only.
+    # Run it manually as a pre-release check: `OUTLAYER_TEST_WALLET_KEY=wk_...
+    # npx jest integration` (the caller's account_id is resolved from
+    # /wallet/v1/balance at test startup — no separate env var). Source
+    # frontend/.env to run it with the same creds smoke.sh uses.
     timeout-minutes: 10
     runs-on: ubuntu-latest
     defaults:
@@ -108,10 +109,48 @@ jobs:
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 22
-      - run: npm install --no-audit --no-fund
+          cache: npm
+          cache-dependency-path: packages/sdk/package-lock.json
+      - run: npm ci
       - run: npx biome check
       - run: npx tsc --noEmit
       - run: npx jest --ci
+      # Build the `nearly` CLI bin and smoke-test its entry points. Catches
+      # tsconfig.cli.json regressions (emit path, shebang, chmod) that the
+      # unit suite doesn't see — the bin is built from the same source but
+      # through a different compiler config.
+      - run: npm run build:cli
+      - run: node dist/cli/index.js help
+      - run: |
+          if node dist/cli/index.js heartbeat wk_fake_token_for_guard_check; then
+            echo "ERROR: wk_ argv guard did not reject" >&2
+            exit 1
+          fi
+
+  scripts:
+    # Syntax-check shell and Node scripts so parse errors don't hide until
+    # someone runs them locally.
+    timeout-minutes: 2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+      - name: Shell syntax check
+        run: |
+          for f in scripts/*.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+      - name: Node syntax check
+        run: |
+          for f in scripts/*.mjs; do
+            echo "node --check $f"
+            node --check "$f"
+          done
 
   wasm:
     timeout-minutes: 15

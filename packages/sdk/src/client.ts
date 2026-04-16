@@ -4,20 +4,8 @@ import {
   DEFAULT_OUTLAYER_URL,
   DEFAULT_TIMEOUT_MS,
 } from './constants';
-import { NearlyError } from './errors';
+import { NearlyError, rateLimitedError } from './errors';
 import { buildEndorsementCounts, foldProfile, foldProfileList } from './graph';
-import {
-  buildDelistMe,
-  buildEndorse,
-  buildFollow,
-  buildHeartbeat,
-  buildUnendorse,
-  buildUnfollow,
-  buildUpdateMe,
-  type EndorseOpts,
-  submit,
-  type UpdateMePatch,
-} from './mutations';
 import {
   defaultRateLimiter,
   noopRateLimiter,
@@ -35,6 +23,17 @@ import {
   type ReadTransport,
 } from './read';
 import {
+  buildDelistMe,
+  buildEndorse,
+  buildFollow,
+  buildHeartbeat,
+  buildUnendorse,
+  buildUnfollow,
+  buildUpdateMe,
+  type EndorseOpts,
+  type UpdateMePatch,
+} from './social';
+import {
   makeRng,
   scoreBySharedTags,
   shuffleWithinTiers,
@@ -47,6 +46,7 @@ import type {
   CapabilityCount,
   Edge,
   EndorserEntry,
+  EndorsingTargetGroup,
   FollowOpts,
   GetSuggestedResponse,
   KvEntry,
@@ -56,16 +56,15 @@ import type {
   TagCount,
   WriteResponse,
 } from './types';
-import { validateSeed } from './validate';
+import { validateKeySuffix } from './validate';
+import { getVrfSeed } from './vrf';
 import {
   type BalanceResponse,
+  createWallet,
   createWalletClient,
-  deriveSubAgentKey,
-  getVrfSeed,
-  getWalletBalance,
-  registerSubAgentKey,
-  registerWallet,
+  getBalance,
   type WalletClient,
+  writeEntries,
 } from './wallet';
 
 export interface ListAgentsOpts {
@@ -148,16 +147,29 @@ export interface UnfollowResult {
   target: string;
 }
 
+export interface SkippedKeySuffix {
+  key_suffix: string;
+  reason: string;
+}
+
 export interface EndorseResult {
   action: 'endorsed';
   target: string;
   key_suffixes: string[];
+  /** Present only if one or more inputs were rejected by per-suffix
+   *  validation. Mirrors the frontend handler's partial-success shape:
+   *  when the whole batch would otherwise be dropped for a single bad
+   *  key, `NearlyClient.endorse` partitions and writes the valid ones,
+   *  surfacing the rejected ones here so the caller can react. */
+  skipped?: SkippedKeySuffix[];
 }
 
 export interface UnendorseResult {
   action: 'unendorsed';
   target: string;
   key_suffixes: string[];
+  /** Same partial-success contract as `EndorseResult.skipped`. */
+  skipped?: SkippedKeySuffix[];
 }
 
 export interface DelistResult {
@@ -201,21 +213,6 @@ export interface RegisterResult {
   };
 }
 
-/**
- * Result of `NearlyClient.deriveSubAgent`. `client` is a ready-to-use
- * sub-agent bound to the derived `wk_`; `walletKey` is that derived
- * token (persist only if you want to avoid re-derivation — the
- * derivation is cheap and idempotent so persistence is optional);
- * `accountId` is the sub-wallet's NEAR account from the OutLayer
- * response. The parent client is not returned — the caller already
- * holds it (they called the method on it).
- */
-export interface SubAgentResult {
-  client: NearlyClient;
-  walletKey: string;
-  accountId: string;
-}
-
 export class NearlyClient {
   readonly accountId: string;
   private readonly read: ReadTransport;
@@ -245,6 +242,10 @@ export class NearlyClient {
       timeoutMs,
       wasmOwner: config.wasmOwner,
       wasmProject: config.wasmProject,
+      // Nearly-convention defaults — injected here so primitive modules
+      // (`claim.ts`, `vrf.ts`) stay free of `nearly.social` references.
+      claimDomain: 'nearly.social',
+      claimVersion: 1,
     });
     this.rateLimiter =
       config.rateLimiter ??
@@ -273,7 +274,7 @@ export class NearlyClient {
    */
   static async register(opts: RegisterOpts = {}): Promise<RegisterResult> {
     const outlayerUrl = opts.outlayerUrl ?? DEFAULT_OUTLAYER_URL;
-    const { walletKey, accountId, trial, handoffUrl } = await registerWallet({
+    const { walletKey, accountId, trial, handoffUrl } = await createWallet({
       outlayerUrl,
       fetch: opts.fetch,
       timeoutMs: opts.timeoutMs,
@@ -299,73 +300,17 @@ export class NearlyClient {
   }
 
   /**
-   * Derive a deterministic sub-agent custody wallet from this parent
-   * client and a caller-chosen `seed`. The sub-wallet's `wk_` is
-   * derived pure-functionally via SHA256 of `{seed}:0:{parent_wk}`,
-   * registered with OutLayer at `PUT /wallet/v1/api-key` using this
-   * client's Bearer token, and wrapped in a fresh `NearlyClient`
-   * inheriting this parent's connection config.
-   *
-   * Same `(parent, seed)` pair always produces the same sub-wallet —
-   * OutLayer handles idempotency server-side. Re-derivation is a
-   * valid alternative to persistence: throw away the returned
-   * `walletKey` and call again with the same seed to get it back.
-   *
-   * Zero new crypto primitives: SHA256 via Web Crypto API, no
-   * ed25519 signing, no NEP-413, no base58. Works identically in
-   * browser and Node 18+. Crucially, this means a human with a root
-   * custody wallet (from `NearlyClient.register()`) can manage N
-   * agents from one root without holding a NEAR private key — the
-   * browser NEP-413-only signing limitation does not apply here.
-   *
-   * Validation:
-   * - Empty `seed` → `VALIDATION_ERROR` (synchronous, before any HTTP)
-   * - `seed` > 256 chars → `VALIDATION_ERROR` (caller-sanity cap, not
-   *   an OutLayer rule — can be relaxed if users hit it)
-   *
-   * Wire errors:
-   * - Parent `wk_` rejected → `AUTH_FAILED`
-   * - Network / timeout → `NETWORK`
-   * - Other non-2xx or malformed response → `PROTOCOL`
-   */
-  async deriveSubAgent(opts: { seed: string }): Promise<SubAgentResult> {
-    const seedError = validateSeed(opts.seed);
-    if (seedError) throw seedError;
-
-    const parentKey = this.wallet.walletKey;
-    const { subKey, keyHash } = await deriveSubAgentKey(parentKey, opts.seed);
-    const { accountId } = await registerSubAgentKey({
-      outlayerUrl: this.wallet.outlayerUrl,
-      parentKey,
-      seed: opts.seed,
-      keyHash,
-      fetch: this.wallet.fetch,
-      timeoutMs: this.wallet.timeoutMs,
-    });
-
-    const client = new NearlyClient({
-      walletKey: subKey,
-      accountId,
-      fastdataUrl: this.read.fastdataUrl,
-      outlayerUrl: this.wallet.outlayerUrl,
-      namespace: this.wallet.namespace,
-      timeoutMs: this.wallet.timeoutMs,
-      fetch: this.wallet.fetch,
-    });
-    return { client, walletKey: subKey, accountId };
-  }
-
-  /**
    * Generic write primitive: rate-limit, submit, record. All sugar methods
    * (heartbeat, follow, and v0.1 additions) flow through here. Callers that
    * want full control over mutation construction can build their own
    * Mutation and pass it in.
    */
   async execute(mutation: Mutation): Promise<void> {
-    await submit(
-      { wallet: this.wallet, rateLimiter: this.rateLimiter },
-      mutation,
-    );
+    const rl = this.rateLimiter.check(mutation.action, mutation.rateLimitKey);
+    if (!rl.ok) throw rateLimitedError(mutation.action, rl.retryAfter);
+
+    await writeEntries(this.wallet, mutation.entries);
+    this.rateLimiter.record(mutation.action, mutation.rateLimitKey);
   }
 
   /**
@@ -453,12 +398,49 @@ export class NearlyClient {
    * does not interpret suffix structure — callers own the convention.
    */
   async endorse(target: string, opts: EndorseOpts): Promise<EndorseResult> {
-    // Builder validation runs first — synchronous throw on self-endorse
-    // or malformed key_suffixes means the caller gets a clear error
-    // without a network round-trip. The resulting mutation is reused
-    // verbatim after the target-existence check, so there's only one
-    // validation pass on the success path.
-    const mutation = buildEndorse(this.accountId, target, opts);
+    // Partition per-suffix at the client layer: dedup (first-occurrence
+    // wins, order preserved), validate each, split into valid/skipped.
+    // This mirrors `handleEndorse` in the frontend, which partitions
+    // rather than failing the whole batch on one bad key_suffix.
+    //
+    // `buildEndorse` is the source of truth for entry construction and
+    // stays strict — we call it with the pre-filtered list and it
+    // re-validates as a safety net. Invoking `buildEndorse` first also
+    // handles self-endorse / empty-array / over-limit rejections as
+    // synchronous throws before any network work.
+    const keyPrefix = `endorsing/${target}/`;
+    const valid: string[] = [];
+    const skipped: SkippedKeySuffix[] = [];
+    const seen = new Set<string>();
+    for (const ks of opts.keySuffixes) {
+      if (typeof ks !== 'string') {
+        throw new NearlyError({
+          code: 'VALIDATION_ERROR',
+          field: 'keySuffixes',
+          reason: 'must be strings',
+          message: 'Validation failed for keySuffixes: must be strings',
+        });
+      }
+      if (seen.has(ks)) continue;
+      seen.add(ks);
+      const e = validateKeySuffix(ks, keyPrefix);
+      if (e) skipped.push({ key_suffix: ks, reason: e.shape.message });
+      else valid.push(ks);
+    }
+
+    if (valid.length === 0) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'keySuffixes',
+        reason: 'no valid key_suffixes',
+        message: `Validation failed for keySuffixes: no valid entries (${skipped.length} skipped)`,
+      });
+    }
+
+    const mutation = buildEndorse(this.accountId, target, {
+      ...opts,
+      keySuffixes: valid,
+    });
 
     const targetProfile = await kvGetKey(this.read, target, 'profile');
     if (!targetProfile) {
@@ -473,8 +455,9 @@ export class NearlyClient {
       action: 'endorsed',
       target,
       key_suffixes: Object.keys(mutation.entries).map((k) =>
-        k.slice(`endorsing/${target}/`.length),
+        k.slice(keyPrefix.length),
       ),
+      ...(skipped.length > 0 && { skipped }),
     };
   }
 
@@ -490,14 +473,47 @@ export class NearlyClient {
     target: string,
     keySuffixes: readonly string[],
   ): Promise<UnendorseResult> {
-    const mutation = buildUnendorse(this.accountId, target, keySuffixes);
+    // Same partition pattern as `endorse`: dedup first-wins, validate
+    // each suffix, partition into valid/skipped. Symmetric with the
+    // frontend's `handleUnendorse` post-UE1 fix.
+    const keyPrefix = `endorsing/${target}/`;
+    const valid: string[] = [];
+    const skipped: SkippedKeySuffix[] = [];
+    const seen = new Set<string>();
+    for (const ks of keySuffixes) {
+      if (typeof ks !== 'string') {
+        throw new NearlyError({
+          code: 'VALIDATION_ERROR',
+          field: 'keySuffixes',
+          reason: 'must be strings',
+          message: 'Validation failed for keySuffixes: must be strings',
+        });
+      }
+      if (seen.has(ks)) continue;
+      seen.add(ks);
+      const e = validateKeySuffix(ks, keyPrefix);
+      if (e) skipped.push({ key_suffix: ks, reason: e.shape.message });
+      else valid.push(ks);
+    }
+
+    if (valid.length === 0) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'keySuffixes',
+        reason: 'no valid key_suffixes',
+        message: `Validation failed for keySuffixes: no valid entries (${skipped.length} skipped)`,
+      });
+    }
+
+    const mutation = buildUnendorse(this.accountId, target, valid);
     await this.execute(mutation);
     return {
       action: 'unendorsed',
       target,
       key_suffixes: Object.keys(mutation.entries).map((k) =>
-        k.slice(`endorsing/${target}/`.length),
+        k.slice(keyPrefix.length),
       ),
+      ...(skipped.length > 0 && { skipped }),
     };
   }
 
@@ -833,6 +849,85 @@ export class NearlyClient {
   }
 
   /**
+   * Outgoing-side inverse of `getEndorsers`: every endorsement this
+   * account has written on others, grouped by target. Walks the caller's
+   * own predecessor under `endorsing/` — a per-predecessor scan, not a
+   * cross-predecessor one — so the returned edges are exactly the keys
+   * this account authored. `key_suffix` stays opaque: the parser splits
+   * on the first slash after `endorsing/` so multi-segment suffixes like
+   * `task_completion/job_42` survive intact. Each target appears once
+   * with its profile summary plus every edge this account wrote on it;
+   * a target that has no profile blob yet surfaces with null name/image
+   * so callers see endorsements that predate the target's first
+   * heartbeat.
+   */
+  async getEndorsing(
+    accountId: string,
+  ): Promise<Record<string, EndorsingTargetGroup>> {
+    const entries = await drain(
+      kvListAgent(this.read, accountId, 'endorsing/'),
+    );
+    if (entries.length === 0) return {};
+
+    type ParsedEdge = {
+      target: string;
+      key_suffix: string;
+      entry: KvEntry;
+    };
+    const parsed: ParsedEdge[] = [];
+    const targets = new Set<string>();
+    for (const e of entries) {
+      if (!e.key.startsWith('endorsing/')) continue;
+      const tail = e.key.slice('endorsing/'.length);
+      const slash = tail.indexOf('/');
+      if (slash <= 0) continue;
+      const target = tail.slice(0, slash);
+      const keySuffix = tail.slice(slash + 1);
+      if (!keySuffix) continue;
+      parsed.push({ target, key_suffix: keySuffix, entry: e });
+      targets.add(target);
+    }
+    if (parsed.length === 0) return {};
+
+    const profileEntries = await fetchProfilesByIds(this.read, [...targets]);
+    const profileById = new Map<string, Agent>();
+    for (const a of foldProfileList(profileEntries)) {
+      profileById.set(a.account_id, a);
+    }
+
+    const result: Record<string, EndorsingTargetGroup> = {};
+    for (const edge of parsed) {
+      const profile = profileById.get(edge.target);
+      const summary: AgentSummary = profile
+        ? {
+            account_id: profile.account_id,
+            name: profile.name,
+            description: profile.description,
+            image: profile.image ?? null,
+          }
+        : {
+            account_id: edge.target,
+            name: null,
+            description: '',
+            image: null,
+          };
+      const meta = (edge.entry.value ?? {}) as Record<string, unknown>;
+      if (!result[edge.target]) {
+        result[edge.target] = { target: summary, entries: [] };
+      }
+      result[edge.target].entries.push({
+        key_suffix: edge.key_suffix,
+        reason: typeof meta.reason === 'string' ? meta.reason : undefined,
+        content_hash:
+          typeof meta.content_hash === 'string' ? meta.content_hash : undefined,
+        at: Math.floor(edge.entry.block_timestamp / 1e9),
+        at_height: edge.entry.block_height,
+      });
+    }
+    return result;
+  }
+
+  /**
    * All tags with agent counts, sorted by count descending. Tags are
    * derived from the `tag/{tag}` existence index written by each agent,
    * not from profile blobs — so a tag on an agent that hasn't heartbeat
@@ -1076,6 +1171,30 @@ export class NearlyClient {
     return { agents, vrf };
   }
 
+  // -------------------------------------------------------------------------
+  // Generic KV reads — mirrors buildKvPut/buildKvDelete on the read side.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Read a single KV entry for a given account. Returns the raw `KvEntry`
+   * or null if the key is missing or tombstoned.
+   */
+  async kvGet(accountId: string, key: string): Promise<KvEntry | null> {
+    return kvGetKey(this.read, accountId, key);
+  }
+
+  /**
+   * Prefix scan for a given account's keys. Returns an async iterable of
+   * live `KvEntry` values, paginated automatically.
+   */
+  kvList(
+    accountId: string,
+    prefix: string,
+    limit?: number,
+  ): AsyncIterable<KvEntry> {
+    return kvListAgent(this.read, accountId, prefix, limit);
+  }
+
   /**
    * Read the caller's custody wallet balance on a given chain (default
    * `near`). Returns the chain-native minimum-unit value as a string
@@ -1089,7 +1208,7 @@ export class NearlyClient {
    * SDK's write budgets.
    */
   async getBalance(opts: { chain?: string } = {}): Promise<BalanceResponse> {
-    return getWalletBalance(this.wallet, opts);
+    return getBalance(this.wallet, opts);
   }
 }
 

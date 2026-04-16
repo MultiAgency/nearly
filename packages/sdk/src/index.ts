@@ -1,3 +1,4 @@
+export { verifyClaim } from './claim';
 export type {
   DelistResult,
   EndorseResult,
@@ -10,11 +11,12 @@ export type {
   NearlyClientConfig,
   RegisterOpts,
   RegisterResult,
-  SubAgentResult,
+  SkippedKeySuffix,
   UnendorseResult,
   UnfollowResult,
 } from './client';
 export { NearlyClient } from './client';
+export { LIMITS } from './constants';
 export type { NearlyErrorCode, NearlyErrorShape } from './errors';
 export {
   authError,
@@ -27,9 +29,26 @@ export {
   sanitizeErrorDetail,
   validationError,
 } from './errors';
-export type { EndorseOpts, UpdateMePatch } from './mutations';
+export {
+  buildEndorsementCounts,
+  defaultAgent,
+  extractCapabilityPairs,
+  foldProfile,
+  foldProfileList,
+} from './graph';
+export { buildKvDelete, buildKvPut } from './kv';
 export type { RateLimiter } from './rateLimit';
 export { defaultRateLimiter, noopRateLimiter } from './rateLimit';
+export type { EndorseOpts, UpdateMePatch } from './social';
+export {
+  buildDelistMe,
+  buildEndorse,
+  buildFollow,
+  buildHeartbeat,
+  buildUnendorse,
+  buildUnfollow,
+  buildUpdateMe,
+} from './social';
 export type { ScoredCandidate } from './suggest';
 export {
   makeRng,
@@ -44,7 +63,9 @@ export type {
   AgentSummary,
   CapabilityCount,
   Edge,
+  EndorsementEdge,
   EndorserEntry,
+  EndorsingTargetGroup,
   FollowOpts,
   GetSuggestedResponse,
   KvEntry,
@@ -54,14 +75,11 @@ export type {
   NetworkSummary,
   SuggestedAgent,
   TagCount,
+  VerifiableClaim,
+  VerifyClaimFailure,
+  VerifyClaimResponse,
+  VerifyClaimSuccess,
   VrfProof,
   WriteResponse,
 } from './types';
-/**
- * Wallet-layer exports. `BalanceResponse` is the public return shape of
- * `NearlyClient.getBalance()`. `RegisterResponse` (the internal wire-parse
- * shape from `wallet.ts::registerWallet`) is intentionally NOT exported —
- * callers should use `NearlyClient.register()` and destructure the
- * `RegisterResult` it returns.
- */
 export type { BalanceResponse } from './wallet';

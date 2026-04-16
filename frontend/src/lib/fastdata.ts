@@ -19,6 +19,8 @@ import {
 } from './constants';
 import { fetchWithTimeout } from './fetch';
 
+const DEFAULT_TIMEOUT_MS = 10_000;
+
 export interface KvEntry {
   predecessor_id: string;
   current_account_id: string;
@@ -50,7 +52,7 @@ export async function kvGetAgent(
   key: string,
 ): Promise<KvEntry | null> {
   const url = `${FASTDATA_URL}/v0/latest/${NAMESPACE}/${accountId}/${key}`;
-  const res = await fetchWithTimeout(url, undefined, 10_000);
+  const res = await fetchWithTimeout(url, undefined, DEFAULT_TIMEOUT_MS);
   if (!res.ok) return null;
   const data = (await res.json()) as KvListResponse;
   const entry = data.entries?.[0];
@@ -84,7 +86,7 @@ export async function kvGetAgentFirstWrite(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ asc: true, limit: 1 }),
     },
-    10_000,
+    DEFAULT_TIMEOUT_MS,
   );
   if (!res.ok) return null;
   const data = (await res.json()) as KvListResponse;
@@ -125,7 +127,7 @@ export async function kvHistoryFirstByPredecessor(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       },
-      10_000,
+      DEFAULT_TIMEOUT_MS,
     );
     if (!res.ok) break;
     const data = (await res.json()) as KvListResponse;
@@ -163,7 +165,7 @@ async function kvPaginate(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       },
-      10_000,
+      DEFAULT_TIMEOUT_MS,
     );
     if (!res.ok) break;
     const data = (await res.json()) as KvListResponse;
@@ -251,7 +253,7 @@ export async function kvMultiAgent(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keys }),
       },
-      10_000,
+      DEFAULT_TIMEOUT_MS,
     );
     if (!res.ok) continue;
     const data = (await res.json()) as { entries: (KvEntry | null)[] };

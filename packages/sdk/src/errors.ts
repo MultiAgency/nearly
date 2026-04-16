@@ -3,6 +3,7 @@ export type NearlyErrorCode =
   | 'RATE_LIMITED'
   | 'VALIDATION_ERROR'
   | 'SELF_FOLLOW'
+  | 'SELF_UNFOLLOW'
   | 'SELF_ENDORSE'
   | 'NOT_FOUND'
   | 'AUTH_FAILED'
@@ -29,6 +30,10 @@ interface ValidationErrorShape {
 }
 interface SelfFollowError {
   code: 'SELF_FOLLOW';
+  message: string;
+}
+interface SelfUnfollowError {
+  code: 'SELF_UNFOLLOW';
   message: string;
 }
 interface SelfEndorseError {
@@ -68,6 +73,7 @@ export type NearlyErrorShape =
   | RateLimitedError
   | ValidationErrorShape
   | SelfFollowError
+  | SelfUnfollowError
   | SelfEndorseError
   | NotFoundError
   | AuthError
@@ -112,6 +118,9 @@ export class NearlyError extends Error {
 const WK_KEY_PATTERN = /wk_[A-Za-z0-9_]+/g;
 const SAFE_DETAIL_MAX = 200;
 
+// Every error-constructor helper threads its user-visible fields through
+// this — the wk_-never-in-messages guarantee must hold even if a future
+// caller interpolates user-sourced data into `field` / `reason` / `action`.
 export function sanitizeErrorDetail(detail: string): string {
   return detail
     .replace(WK_KEY_PATTERN, '[REDACTED_WK]')
@@ -119,11 +128,6 @@ export function sanitizeErrorDetail(detail: string): string {
 }
 
 export function validationError(field: string, reason: string): NearlyError {
-  // Defensive: every current call site passes structural literals (field
-  // names like 'seed' / 'api_key', reason strings like 'must not be empty'),
-  // but sanitize on the way in so the whole error constructor family has
-  // the same wk_-never-in-messages guarantee. Symmetric with
-  // authError/networkError/protocolError.
   const safeField = sanitizeErrorDetail(field);
   const safeReason = sanitizeErrorDetail(reason);
   return new NearlyError({
@@ -157,9 +161,6 @@ export function rateLimitedError(
   action: string,
   retryAfter: number,
 ): NearlyError {
-  // `action` is controlled (a `MutationAction` enum today), but sanitize
-  // on the way in so a future caller that interpolates user-sourced data
-  // can't leak a wk_ through the error surface.
   const safeAction = sanitizeErrorDetail(action);
   return new NearlyError({
     code: 'RATE_LIMITED',

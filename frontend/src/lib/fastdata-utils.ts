@@ -7,9 +7,13 @@
  *   cap/{ns}/{value}     → true (existence index)
  */
 
+import {
+  extractCapabilityPairs,
+  foldProfile,
+  buildEndorsementCounts as sdkBuildEndorsementCounts,
+} from '@nearly/sdk';
 import type { Agent } from '@/types';
 import { getCached, setCache } from './cache';
-import { OUTLAYER_ADMIN_ACCOUNT } from './constants';
 import {
   type KvEntry,
   kvGetAgent,
@@ -18,6 +22,7 @@ import {
   kvListAgent,
   kvMultiAgent,
 } from './fastdata';
+import { resolveAdminWriterAccount } from './outlayer-server';
 
 // ---------------------------------------------------------------------------
 // Admin hidden-account set (cached 60s)
@@ -25,14 +30,19 @@ import {
 
 const HIDDEN_SET_KEY = '__hidden_accounts__';
 
-/** Set of account IDs the admin has hidden. Cached 60s. */
-export async function getHiddenSet(): Promise<Set<string>> {
-  if (!OUTLAYER_ADMIN_ACCOUNT) return new Set();
-  const cached = getCached(HIDDEN_SET_KEY);
-  if (cached) return cached as Set<string>;
-  const entries = await kvListAgent(OUTLAYER_ADMIN_ACCOUNT, 'hidden/');
+/** Set of account IDs the admin has hidden. Cached 60s unless bypassed. */
+export async function getHiddenSet(skipCache = false): Promise<Set<string>> {
+  const writerAccount = await resolveAdminWriterAccount();
+  if (!writerAccount) return new Set();
+  if (!skipCache) {
+    const cached = getCached(HIDDEN_SET_KEY);
+    if (cached) return cached as Set<string>;
+  }
+  const entries = await kvListAgent(writerAccount, 'hidden/');
   const set = new Set(entries.map((e) => e.key.replace('hidden/', '')));
-  setCache('hidden', HIDDEN_SET_KEY, set);
+  if (!skipCache) {
+    setCache('hidden', HIDDEN_SET_KEY, set);
+  }
   return set;
 }
 
@@ -66,83 +76,13 @@ export async function liveNetworkCounts(
 // ---------------------------------------------------------------------------
 
 /**
- * Fold a KvEntry into an Agent, enforcing FastData's trust boundary with
- * two on-read overrides:
+ * If the first-history call fails, `created_at` / `created_height` stay
+ * undefined — falling back to caller-asserted values would mix trust
+ * models in one field and reintroduce a manipulation gap.
  *
- * - `account_id` — replaced with `entry.predecessor_id`. FastData attributes
- *   each key to whoever wrote it, so the authoritative id comes from who
- *   wrote the blob, not from whatever `account_id` field the caller put
- *   inside the stored value.
- * - `last_active` — replaced with `Math.floor(entry.block_timestamp / 1e9)`.
- *   The caller-asserted `last_active` on the blob is not verified — an
- *   agent could write `last_active: 9_999_999_999` and appear eternally
- *   fresh in sort=active. The block timestamp is the real wall-clock of
- *   the write as indexed by FastData, so using it closes that manipulation
- *   hole without touching writers.
- *
- * Returns null for non-object blobs. The `!Array.isArray` guard matters:
- * `typeof [] === 'object'` is true, so without it an array stored under a
- * `profile` key would spread to `{0: ..., 1: ..., ..., account_id: id}` —
- * a valid-looking Agent with numeric-string keys.
- *
- * Symmetric with `foldProfile` in `@nearly/sdk`; the two live in different
- * packages but enforce the same contract.
- */
-function applyTrustBoundary(entry: KvEntry): Agent | null {
-  const blob = entry.value;
-  if (!blob || typeof blob !== 'object' || Array.isArray(blob)) return null;
-  // Destructure-and-rebuild instead of spread-and-override. Every trust-
-  // boundary and derived field is pulled out of the blob so `safe` carries
-  // only canonical self-authored content (name, description, image, tags,
-  // capabilities); the authoritative block-derived values are added back in
-  // the return. `created_at` / `created_height` are NOT added back here —
-  // only read paths that fetch history (`fetchProfile`, `handleListAgents`
-  // with `sort=newest`) repopulate them. Count / endorsement fields are
-  // also stripped: the write side removes them before storage, and any
-  // legacy blob that still carries them would otherwise leak stale values
-  // into list reads that don't overlay live counts. Mirrors the write-side
-  // strip in `agentEntries` and stays symmetric with `foldProfile` in
-  // `@nearly/sdk::graph`.
-  const {
-    account_id: _aid,
-    last_active: _la,
-    last_active_height: _lah,
-    created_at: _ca,
-    created_height: _ch,
-    follower_count: _fc,
-    following_count: _fgc,
-    endorsements: _e,
-    endorsement_count: _ec,
-    ...safe
-  } = blob as Agent;
-  return {
-    ...safe,
-    account_id: entry.predecessor_id,
-    last_active: entryBlockSecs(entry),
-    last_active_height: entryBlockHeight(entry),
-  };
-}
-
-/**
- * Fetch a single profile by known account ID with trust-boundary
- * overrides applied. Returns null if the profile does not exist or the
- * stored blob is non-object.
- *
- * Fetches the latest profile entry and the first historical entry in
- * parallel. The latest entry drives `last_active` via the standard
- * trust-boundary override; the first entry drives `created_at` /
- * `created_height` via its own block_timestamp and block_height. All
- * three are block-authoritative and ungameable. If the history call
- * fails or returns no entries, `created_at` / `created_height` are
- * left undefined — we intentionally do not fall back to caller-asserted
- * values, because mixing trust models in one field reintroduces the
- * manipulation gap the audit closed.
- *
- * Count fields (`follower_count`, `following_count`, `endorsements`,
- * `endorsement_count`) are NOT populated here — `applyTrustBoundary`
- * strips them and this function does not overlay. Callers that want
- * live counts must wrap the result with `withLiveCounts` (see
- * `fastdata-dispatch::handleGetProfile`).
+ * Count fields are not populated: `foldProfile` strips them and this
+ * function does not overlay. Callers that need live counts wrap with
+ * `withLiveCounts` (see `fastdata-dispatch::handleGetProfile`).
  */
 export async function fetchProfile(accountId: string): Promise<Agent | null> {
   const [latest, firstWrite] = await Promise.all([
@@ -150,7 +90,7 @@ export async function fetchProfile(accountId: string): Promise<Agent | null> {
     kvGetAgentFirstWrite(accountId, 'profile'),
   ]);
   if (!latest) return null;
-  const agent = applyTrustBoundary(latest);
+  const agent = foldProfile(latest);
   if (agent && firstWrite) {
     agent.created_at = entryBlockSecs(firstWrite);
     agent.created_height = entryBlockHeight(firstWrite);
@@ -159,10 +99,9 @@ export async function fetchProfile(accountId: string): Promise<Agent | null> {
 }
 
 /**
- * Batch-fetch profiles for a list of known account IDs. Returns Agents
- * in the same order as the input, with missing/corrupt entries dropped.
  * The trust boundary fires per entry, so list views sorting on
- * `last_active` are block-authoritative even under tag/capability filters.
+ * `last_active` stay block-authoritative even under tag/capability
+ * filters.
  */
 export async function fetchProfiles(
   accountIds: readonly string[],
@@ -174,96 +113,27 @@ export async function fetchProfiles(
   const out: Agent[] = [];
   for (const e of entries) {
     if (!e) continue;
-    const agent = applyTrustBoundary(e);
+    const agent = foldProfile(e);
     if (agent) out.push(agent);
   }
   return out;
 }
 
-/**
- * Fetch every profile in the namespace via `kvGetAll('profile')`.
- */
 export async function fetchAllProfiles(): Promise<Agent[]> {
   const entries = await kvGetAll('profile');
   const out: Agent[] = [];
   for (const e of entries) {
-    const agent = applyTrustBoundary(e);
+    const agent = foldProfile(e);
     if (agent) out.push(agent);
   }
   return out;
 }
 
-/**
- * Build endorsement counts from cross-predecessor endorsement entries.
- * Takes entries from kvListAll(`endorsing/${accountId}/`) and returns a
- * flat `{key_suffix: endorser_count}` map — keyed by the full opaque
- * suffix (e.g. `tags/ai`, `skills.languages/rust`, or a single-segment
- * suffix chosen by a caller). The server does not interpret the shape
- * of the suffix; it only counts endorsers per distinct suffix.
- */
 export function buildEndorsementCounts(
   entries: KvEntry[],
   accountId: string,
 ): Record<string, number> {
-  const counts: Record<string, number> = {};
-  const prefix = endorsePrefix(accountId);
-  for (const e of entries) {
-    const suffix = e.key.startsWith(prefix)
-      ? e.key.slice(prefix.length)
-      : e.key;
-    counts[suffix] = (counts[suffix] ?? 0) + 1;
-  }
-  return counts;
-}
-
-/** Build per-agent KV entries for profile, tags, and capabilities.
- *  Strips derived fields (counts, endorsement breakdown) AND time fields
- *  (`last_active`, `created_at`) — those are read-derived from FastData's
- *  block timestamps via the trust boundary, never written to stored
- *  blobs. Stored profiles contain only canonical self-authored content. */
-export function agentEntries(agent: Agent): Record<string, unknown> {
-  const {
-    follower_count: _fc,
-    following_count: _fgc,
-    endorsements: _e,
-    endorsement_count: _ec,
-    last_active: _la,
-    last_active_height: _lah,
-    created_at: _ca,
-    created_height: _ch,
-    ...rest
-  } = agent;
-  const entries: Record<string, unknown> = { profile: rest };
-  for (const tag of agent.tags) {
-    entries[composeKey('tag/', tag)] = true;
-  }
-  for (const [ns, val] of extractCapabilityPairs(agent.capabilities)) {
-    entries[composeKey('cap/', `${ns}/${val}`)] = true;
-  }
-  return entries;
-}
-
-/**
- * Walk nested capabilities JSON and extract (namespace, value) pairs.
- */
-export function extractCapabilityPairs(caps: unknown): [string, string][] {
-  const pairs: [string, string][] = [];
-  function walk(val: unknown, prefix: string, depth: number) {
-    if (depth > 4) return;
-    if (typeof val === 'string' && prefix) {
-      pairs.push([prefix, val.toLowerCase()]);
-    } else if (Array.isArray(val)) {
-      for (const item of val) {
-        if (typeof item === 'string') pairs.push([prefix, item.toLowerCase()]);
-      }
-    } else if (val && typeof val === 'object') {
-      for (const [key, child] of Object.entries(val)) {
-        walk(child, prefix ? `${prefix}.${key}` : key, depth + 1);
-      }
-    }
-  }
-  if (caps) walk(caps, '', 0);
-  return pairs;
+  return sdkBuildEndorsementCounts(entries, endorsePrefix(accountId));
 }
 
 /** Compose a FastData KV key from a convention-fixed key_prefix and a
@@ -372,20 +242,12 @@ const CAP_POINTS_PER_PAIR = 10;
 const CAP_MAX_PAIRS = 3;
 
 /**
- * Compute profile completeness from agent data.
+ * `profileGaps()` stays binary so each `agentActions()` entry fires on
+ * first absence and disappears on first engagement — any drift between
+ * the gap detector and this scorer breaks the onboarding action loop.
  *
- * Binary fields (name, description, image) contribute their full weight
- * when present, 0 when absent. `profileGaps()` drives presence detection
- * and is kept binary so each `agentActions()` entry fires on first
- * absence and disappears on first engagement.
- *
- * Continuous fields (tags, capabilities) scale per-item so the progress
- * signal is fine-grained — adding one tag nudges the score by 2, adding
- * one capability pair nudges it by 10. Both cap at their respective
- * maximums so the total never exceeds 100.
- *
- * A score of 100 therefore means "richly populated" (name, description,
- * image, ≥10 tags, ≥3 capability pairs), not just "minimally filled."
+ * A score of 100 means "richly populated" (every field + ≥10 tags + ≥3
+ * capability pairs), not "minimally filled."
  */
 export function profileCompleteness(
   agent: Parameters<typeof profileGaps>[0],
@@ -393,16 +255,13 @@ export function profileCompleteness(
   const gaps = new Set(profileGaps(agent));
 
   let score = 0;
-  // Binary fields.
   if (!gaps.has('name')) score += GAP_SCORE.name;
   if (!gaps.has('description')) score += GAP_SCORE.description;
   if (!gaps.has('image')) score += GAP_SCORE.image;
 
-  // Continuous: tags.
   const tagCount = Array.isArray(agent.tags) ? agent.tags.length : 0;
   score += Math.min(tagCount, TAG_MAX_ITEMS) * TAG_POINTS_PER_ITEM;
 
-  // Continuous: capabilities.
   const capPairs =
     agent.capabilities && typeof agent.capabilities === 'object'
       ? extractCapabilityPairs(agent.capabilities).length

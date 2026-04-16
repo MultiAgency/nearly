@@ -20,17 +20,13 @@ const EVICTION_INTERVAL = 500;
 
 /** Per-action rate limit configuration. */
 const LIMITS: Record<string, { limit: number; windowSecs: number }> = {
-  follow: { limit: 10, windowSecs: 60 },
-  unfollow: { limit: 10, windowSecs: 60 },
-  endorse: { limit: 20, windowSecs: 60 },
-  unendorse: { limit: 20, windowSecs: 60 },
-  update_me: { limit: 10, windowSecs: 60 },
-  heartbeat: { limit: 5, windowSecs: 60 },
-  delist_me: { limit: 1, windowSecs: 300 },
-  // Operator-claim writes are NEP-413 auth'd (no `wk_`), so the rate-limit
-  // key is the verified operator's account_id, not the request IP.
-  claim_operator: { limit: 5, windowSecs: 60 },
-  unclaim_operator: { limit: 5, windowSecs: 60 },
+  'social.follow': { limit: 10, windowSecs: 60 },
+  'social.unfollow': { limit: 10, windowSecs: 60 },
+  'social.endorse': { limit: 20, windowSecs: 60 },
+  'social.unendorse': { limit: 20, windowSecs: 60 },
+  'social.update_me': { limit: 10, windowSecs: 60 },
+  'social.heartbeat': { limit: 5, windowSecs: 60 },
+  'social.delist_me': { limit: 1, windowSecs: 300 },
   verify_claim: { limit: 60, windowSecs: 60 },
   hidden_list: { limit: 120, windowSecs: 60 },
   list_platforms: { limit: 120, windowSecs: 60 },
@@ -102,9 +98,8 @@ export function incrementRateLimit(
     store.set(key, { window: targetWindow, count: 1 });
     return;
   }
-  // entry.window > targetWindow: a late increment for an old window whose
-  // entry has already been replaced. The request happened, but its budget is
-  // stale — dropping it is safer than double-counting in the current bucket.
+  // `entry.window > targetWindow`: drop late increments from a replaced
+  // bucket — counting them against the current window would double-bill.
 }
 
 /**

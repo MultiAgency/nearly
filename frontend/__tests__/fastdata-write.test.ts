@@ -3,9 +3,7 @@
  */
 
 import * as fastdata from '@/lib/fastdata';
-import { agentEntries } from '@/lib/fastdata-utils';
 import {
-  dispatchNep413Write,
   dispatchWrite,
   handleDelistMe,
   handleEndorse,
@@ -14,12 +12,13 @@ import {
   handleUnendorse,
   handleUnfollow,
   handleUpdateMe,
+  INVALIDATION_MAP,
+  WRITE_ACTIONS,
   writeToFastData,
 } from '@/lib/fastdata-write';
 import * as fetchLib from '@/lib/fetch';
 import * as rateLimit from '@/lib/rate-limit';
-import type { VerifiableClaim } from '@/types';
-import { mockAgent } from './fixtures';
+import { mockAgent, profileEntry } from './fixtures';
 
 jest.mock('@/lib/fastdata');
 jest.mock('@/lib/fetch');
@@ -32,33 +31,6 @@ const mockKvMultiAgent = fastdata.kvMultiAgent as jest.MockedFunction<
   typeof fastdata.kvMultiAgent
 >;
 
-/**
- * Wrap a profile value as a KvEntry so fetchProfile's trust-boundary
- * override (last_active := block_timestamp / 1e9) produces a value that
- * matches mockAgent's default `last_active: 2000`. That keeps the
- * existing delta-test epoch (edges written "since" a 2000-second caller)
- * working without rescaling every fixture: 2000s × 1e9 = 2e12 ns.
- */
-function profileEntry(
-  accountId: string,
-  value: unknown,
-  blockSecs = 2000,
-): fastdata.KvEntry {
-  return {
-    predecessor_id: accountId,
-    current_account_id: 'contextual.near',
-    // Mirror blockSecs into block_height so heartbeat delta tests can
-    // drive both the seconds (`last_active`) and height
-    // (`last_active_height`) cursors with a single `blockSecs` argument.
-    // The trust-boundary override populates `last_active_height` from
-    // this value, making it the caller's `previousActiveHeight` for the
-    // block-height delta comparison.
-    block_height: blockSecs,
-    block_timestamp: blockSecs * 1_000_000_000,
-    key: 'profile',
-    value,
-  };
-}
 const mockFetchWithTimeout = fetchLib.fetchWithTimeout as jest.MockedFunction<
   typeof fetchLib.fetchWithTimeout
 >;
@@ -215,40 +187,6 @@ describe('writeToFastData', () => {
 
     const outcome = await writeToFastData(WK, { profile: { name: 'x' } });
     expect(outcome).toEqual({ ok: false, reason: 'storage_error' });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// agentEntries — trust-boundary write-side strip (regression guard)
-// ---------------------------------------------------------------------------
-
-describe('agentEntries trust-boundary strip', () => {
-  it('omits every read-derived field from the written profile blob', () => {
-    const agent = {
-      ...mockAgent('alice.near'),
-      follower_count: 42,
-      following_count: 17,
-      endorsements: { 'tags/rust': 3 },
-      endorsement_count: 3,
-      last_active: 1_700_000_000,
-      last_active_height: 123_456_789,
-      created_at: 1_690_000_000,
-      created_height: 100_000_000,
-    };
-    const entries = agentEntries(agent);
-    const profile = entries.profile as Record<string, unknown>;
-    for (const forbidden of [
-      'follower_count',
-      'following_count',
-      'endorsements',
-      'endorsement_count',
-      'last_active',
-      'last_active_height',
-      'created_at',
-      'created_height',
-    ]) {
-      expect(profile).not.toHaveProperty(forbidden);
-    }
   });
 });
 
@@ -563,7 +501,7 @@ describe('handleUpdateMe index cleanup', () => {
     expect(result).toMatchObject({ success: true });
 
     const args = writeArgs();
-    // agentEntries rewrites the existence indexes as `true`; the cleanup
+    // `buildUpdateMe` rewrites the existence indexes as `true`; the cleanup
     // blocks only emit `null` when body.tags / body.capabilities is present.
     expect(args['tag/ai']).toBe(true);
     expect(args['cap/skills/rust']).toBe(true);
@@ -816,7 +754,7 @@ describe('heartbeat delta', () => {
 // (f) Delist Me
 // ---------------------------------------------------------------------------
 
-describe('delist_me', () => {
+describe('social.delist_me', () => {
   it('null-writes agent keys, follow edges, endorsement edges, and capability keys', async () => {
     mockKvGetAgent.mockImplementation(async (id: string, key: string) => {
       if (key === 'profile' && id === 'alice.near') {
@@ -894,7 +832,7 @@ describe('delist_me', () => {
 describe('handleFollow batch (via dispatchWrite)', () => {
   it('rejects empty targets', async () => {
     const result = await dispatchWrite(
-      'follow',
+      'social.follow',
       { targets: [] },
       WK,
       resolveAccountId,
@@ -905,7 +843,7 @@ describe('handleFollow batch (via dispatchWrite)', () => {
   it('rejects targets exceeding max batch size', async () => {
     const targets = Array.from({ length: 21 }, (_, i) => `agent${i}.near`);
     const result = await dispatchWrite(
-      'follow',
+      'social.follow',
       { targets },
       WK,
       resolveAccountId,
@@ -918,7 +856,7 @@ describe('handleFollow batch (via dispatchWrite)', () => {
     mockProfile('charlie.near');
 
     const result = await dispatchWrite(
-      'follow',
+      'social.follow',
       { targets: ['bob.near', 'charlie.near'] },
       WK,
       resolveAccountId,
@@ -939,7 +877,7 @@ describe('handleFollow batch (via dispatchWrite)', () => {
     mockProfile('bob.near');
 
     const result = await dispatchWrite(
-      'follow',
+      'social.follow',
       { targets: ['alice.near', 'bob.near'] },
       WK,
       resolveAccountId,
@@ -961,7 +899,7 @@ describe('handleFollow batch (via dispatchWrite)', () => {
 
   it('skips targets with no profile', async () => {
     const result = await dispatchWrite(
-      'follow',
+      'social.follow',
       { targets: ['nobody.near'] },
       WK,
       resolveAccountId,
@@ -990,7 +928,7 @@ describe('handleFollow batch (via dispatchWrite)', () => {
     mockProfile('charlie.near');
 
     const result = await dispatchWrite(
-      'follow',
+      'social.follow',
       { targets: ['bob.near', 'charlie.near'] },
       WK,
       resolveAccountId,
@@ -1019,7 +957,7 @@ describe('handleFollow batch (via dispatchWrite)', () => {
     } as Response);
 
     const result = await dispatchWrite(
-      'follow',
+      'social.follow',
       { targets: ['bob.near'] },
       WK,
       resolveAccountId,
@@ -1048,7 +986,7 @@ function parseWriteArgs(): Record<string, unknown> {
 describe('handleEndorse key_suffixes', () => {
   it('rejects empty targets', async () => {
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: [], key_suffixes: ['tags/ai'] },
       WK,
       resolveAccountId,
@@ -1058,7 +996,7 @@ describe('handleEndorse key_suffixes', () => {
 
   it('rejects when key_suffixes missing or empty', async () => {
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: ['bob.near'] },
       WK,
       resolveAccountId,
@@ -1066,7 +1004,7 @@ describe('handleEndorse key_suffixes', () => {
     expect(result).toMatchObject({ success: false, code: 'VALIDATION_ERROR' });
 
     const result2 = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: ['bob.near'], key_suffixes: [] },
       WK,
       resolveAccountId,
@@ -1077,7 +1015,7 @@ describe('handleEndorse key_suffixes', () => {
   it('rejects when key_suffixes exceeds the per-call cap of 20', async () => {
     const tooMany = Array.from({ length: 21 }, (_, i) => `tags/k${i}`);
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: ['bob.near'], key_suffixes: tooMany },
       WK,
       resolveAccountId,
@@ -1094,7 +1032,7 @@ describe('handleEndorse key_suffixes', () => {
     mockKvMultiAgent.mockResolvedValue([null]);
 
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: ['bob.near'], key_suffixes: ['task_completion/job_123'] },
       WK,
       resolveAccountId,
@@ -1124,7 +1062,7 @@ describe('handleEndorse key_suffixes', () => {
     mockKvMultiAgent.mockResolvedValue([]);
 
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       {
         targets: ['bob.near'],
         key_suffixes: ['/absolute/path', 'has\u0000null'],
@@ -1156,7 +1094,7 @@ describe('handleEndorse key_suffixes', () => {
     const huge = 'a'.repeat(1100);
 
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: ['bob.near'], key_suffixes: [huge] },
       WK,
       resolveAccountId,
@@ -1176,7 +1114,7 @@ describe('handleEndorse key_suffixes', () => {
 
   it('rejects endorsement when the target does not exist', async () => {
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: ['nobody.near'], key_suffixes: ['tags/ai'] },
       WK,
       resolveAccountId,
@@ -1200,7 +1138,7 @@ describe('handleEndorse key_suffixes', () => {
     mockKvMultiAgent.mockResolvedValue([null, null, null]);
 
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       {
         targets: ['bob.near'],
         key_suffixes: ['tags/rust', 'tags/security', 'skills/audit'],
@@ -1236,7 +1174,7 @@ describe('handleEndorse key_suffixes', () => {
     mockKvMultiAgent.mockResolvedValue([null]);
 
     await dispatchWrite(
-      'endorse',
+      'social.endorse',
       {
         targets: ['bob.near'],
         key_suffixes: ['task/job_42'],
@@ -1264,7 +1202,7 @@ describe('handleEndorse key_suffixes', () => {
     ]);
 
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       {
         targets: ['bob.near'],
         key_suffixes: ['task/job_42'],
@@ -1302,7 +1240,7 @@ describe('handleEndorse key_suffixes', () => {
     ]);
 
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       {
         targets: ['bob.near'],
         key_suffixes: ['task/job_42'],
@@ -1328,7 +1266,7 @@ describe('handleEndorse key_suffixes', () => {
 
   it('skips self-endorse with per-item error', async () => {
     const result = await dispatchWrite(
-      'endorse',
+      'social.endorse',
       { targets: ['alice.near'], key_suffixes: ['tags/ai'] },
       WK,
       resolveAccountId,
@@ -1362,7 +1300,7 @@ describe('handleUnendorse key_suffixes', () => {
     });
 
     const result = await dispatchWrite(
-      'unendorse',
+      'social.unendorse',
       {
         targets: ['bob.near'],
         key_suffixes: ['tags/ai', 'task/job_1', 'task/not_there'],
@@ -1390,260 +1328,39 @@ describe('handleUnendorse key_suffixes', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// NEP-413 write dispatch — `dispatchNep413Write` covering `claim_operator`
-// and `unclaim_operator`. These tests target the handler layer directly,
-// bypassing the route-layer `verifyClaim` step (claim verification is
-// covered by `verify-claim.test.ts`). The handler assumes its caller has
-// already verified the envelope and packed it into `Nep413WriteContext`.
-// ---------------------------------------------------------------------------
+describe('INVALIDATION_MAP completeness', () => {
+  // `WRITE_ACTIONS` is the authoritative list of mutation actions across
+  // the two dispatch paths (dispatchWrite and direct writeToFastData from
+  // route.ts). Every entry must have an `INVALIDATION_MAP` row —
+  // otherwise the fall-through at `INVALIDATION_MAP[action] ?? null`
+  // turns into "clear everything", which is safe but silently loses
+  // fine-grained caching until someone notices the cache hit rate. These
+  // two tests catch that class of miss at CI time instead of in production.
 
-describe('dispatchNep413Write (claim_operator / unclaim_operator)', () => {
-  const SERVICE_WK = 'wk_operator_claims_service';
-  const OPERATOR = 'alice.near';
-  const AGENT = 'bot.near';
-  const CLAIM: VerifiableClaim = {
-    account_id: OPERATOR,
-    public_key: 'ed25519:testpubkey',
-    signature: 'ed25519:testsig',
-    nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-    message: JSON.stringify({
-      action: 'claim_operator',
-      domain: 'nearly.social',
-      account_id: OPERATOR,
-      version: 1,
-      timestamp: 1_700_000_000_000,
-    }),
-  };
-  const CTX = { operatorAccountId: OPERATOR, claim: CLAIM };
-
-  let savedEnv: string | undefined;
-  beforeEach(() => {
-    savedEnv = process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
-    process.env.OUTLAYER_OPERATOR_CLAIMS_WK = SERVICE_WK;
-    // Rate limit open by default; individual tests override.
-    mockCheckRateLimit.mockReturnValue({ ok: true, window: 0 });
-    // Successful write by default; individual tests override.
-    mockFetchWithTimeout.mockResolvedValue({
-      ok: true,
-      status: 200,
-    } as Response);
-  });
-  afterEach(() => {
-    if (savedEnv === undefined) {
-      delete process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
-    } else {
-      process.env.OUTLAYER_OPERATOR_CLAIMS_WK = savedEnv;
-    }
-  });
-
-  describe('claim_operator', () => {
-    it('writes the full NEP-413 envelope under the composed operator key', async () => {
-      const result = await dispatchNep413Write(
-        'claim_operator',
-        { account_id: AGENT },
-        CTX,
-      );
-
-      expect(result).toMatchObject({
-        success: true,
-        data: {
-          action: 'claimed',
-          operator_account_id: OPERATOR,
-          agent_account_id: AGENT,
-        },
-      });
-
-      // `parseWriteArgs` pulls the body.args object from the first
-      // fetchWithTimeout POST to `/wallet/v1/call`. Assert the composed
-      // key and the full envelope shape on the stored value — the
-      // "publicly verifiable" property requires all four envelope fields.
-      const args = parseWriteArgs();
-      const key = `operator/${OPERATOR}/${AGENT}`;
-      expect(args[key]).toEqual({
-        message: CLAIM.message,
-        signature: CLAIM.signature,
-        public_key: CLAIM.public_key,
-        nonce: CLAIM.nonce,
-      });
-
-      // The write is signed by the service key, not the operator's own key
-      // (operators don't have `wk_` keys — that's the whole point of this
-      // dispatch path).
-      const writeCall = mockFetchWithTimeout.mock.calls[0];
-      const headers = writeCall[1]!.headers as Record<string, string>;
-      expect(headers.Authorization).toBe(`Bearer ${SERVICE_WK}`);
-    });
-
-    it('stores an optional reason alongside the envelope', async () => {
-      await dispatchNep413Write(
-        'claim_operator',
-        { account_id: AGENT, reason: 'my primary code-review bot' },
-        CTX,
-      );
-
-      const args = parseWriteArgs();
-      const key = `operator/${OPERATOR}/${AGENT}`;
-      expect(args[key]).toMatchObject({ reason: 'my primary code-review bot' });
-    });
-
-    it('returns 503 NOT_CONFIGURED when the service key is unset', async () => {
-      delete process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
-
-      const result = await dispatchNep413Write(
-        'claim_operator',
-        { account_id: AGENT },
-        CTX,
-      );
-
-      expect(result).toMatchObject({
-        success: false,
-        code: 'NOT_CONFIGURED',
-        status: 503,
-      });
-      // No write attempted when the service key is missing.
-      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
-    });
-
-    it('returns 429 when the rate limit is exhausted', async () => {
-      mockCheckRateLimit.mockReturnValue({ ok: false, retryAfter: 42 });
-
-      const result = await dispatchNep413Write(
-        'claim_operator',
-        { account_id: AGENT },
-        CTX,
-      );
-
-      expect(result).toMatchObject({
-        success: false,
-        code: 'RATE_LIMITED',
-        status: 429,
-        retryAfter: 42,
-      });
-      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
-    });
-
-    it('rate-limits on the verified operator account, not request IP', async () => {
-      // Verifies the handler passes the operator account to checkRateLimit
-      // (not some other value) — abuse mitigation is operator-scoped.
-      await dispatchNep413Write('claim_operator', { account_id: AGENT }, CTX);
-      expect(mockCheckRateLimit).toHaveBeenCalledWith(
-        'claim_operator',
-        OPERATOR,
-      );
-    });
-
-    it('rejects a missing agent account_id with VALIDATION_ERROR', async () => {
-      const result = await dispatchNep413Write('claim_operator', {}, CTX);
-      expect(result).toMatchObject({
-        success: false,
-        code: 'VALIDATION_ERROR',
-      });
-      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
-    });
-
-    it('rejects an agent account_id containing null bytes', async () => {
-      const result = await dispatchNep413Write(
-        'claim_operator',
-        { account_id: 'bot\0.near' },
-        CTX,
-      );
-      expect(result).toMatchObject({
-        success: false,
-        code: 'VALIDATION_ERROR',
-      });
-      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
-    });
-
-    it('rejects an oversized reason', async () => {
-      const result = await dispatchNep413Write(
-        'claim_operator',
-        { account_id: AGENT, reason: 'x'.repeat(500) },
-        CTX,
-      );
-      expect(result).toMatchObject({
-        success: false,
-        code: 'VALIDATION_ERROR',
-      });
-      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
-    });
-
-    it('attaches the operator-claim invalidation targets on success', async () => {
-      const result = await dispatchNep413Write(
-        'claim_operator',
-        { account_id: AGENT },
-        CTX,
-      );
-      expect(result).toMatchObject({
-        success: true,
-        invalidates: ['agent_claims'],
-      });
-    });
-  });
-
-  describe('unclaim_operator', () => {
-    it('null-writes the composed operator key via the service key', async () => {
-      const result = await dispatchNep413Write(
-        'unclaim_operator',
-        { account_id: AGENT },
-        CTX,
-      );
-
-      expect(result).toMatchObject({
-        success: true,
-        data: {
-          action: 'unclaimed',
-          operator_account_id: OPERATOR,
-          agent_account_id: AGENT,
-        },
-      });
-
-      const args = parseWriteArgs();
-      const key = `operator/${OPERATOR}/${AGENT}`;
-      expect(args[key]).toBeNull();
-    });
-
-    it('returns 503 NOT_CONFIGURED when the service key is unset', async () => {
-      delete process.env.OUTLAYER_OPERATOR_CLAIMS_WK;
-
-      const result = await dispatchNep413Write(
-        'unclaim_operator',
-        { account_id: AGENT },
-        CTX,
-      );
-
-      expect(result).toMatchObject({
-        success: false,
-        code: 'NOT_CONFIGURED',
-        status: 503,
-      });
-      expect(mockFetchWithTimeout).not.toHaveBeenCalled();
-    });
-
-    it('attaches the operator-claim invalidation targets on success', async () => {
-      const result = await dispatchNep413Write(
-        'unclaim_operator',
-        { account_id: AGENT },
-        CTX,
-      );
-      expect(result).toMatchObject({
-        success: true,
-        invalidates: ['agent_claims'],
-      });
-    });
-  });
-
-  it('returns VALIDATION_ERROR for an unknown action passed to the NEP-413 dispatcher', async () => {
-    // Guards against a regression where a new route entry routes through
-    // NEP413_WRITE_ACTIONS but forgets to add a handler case in the switch.
-    const result = await dispatchNep413Write(
-      'unknown_nep413_action',
-      { account_id: AGENT },
-      CTX,
+  it('every WRITE_ACTIONS entry has a row in INVALIDATION_MAP', () => {
+    const missing = WRITE_ACTIONS.filter(
+      (action) => !(action in INVALIDATION_MAP),
     );
-    expect(result).toMatchObject({
-      success: false,
-      code: 'VALIDATION_ERROR',
-    });
+    expect(missing).toEqual([]);
+  });
+
+  it('every INVALIDATION_MAP key is a known WRITE_ACTIONS entry', () => {
+    const known = new Set<string>(WRITE_ACTIONS);
+    const stale = Object.keys(INVALIDATION_MAP).filter((k) => !known.has(k));
+    expect(stale).toEqual([]);
+  });
+
+  it('all INVALIDATION_MAP rows reference non-empty target lists', () => {
+    // A row with an empty array means "invalidate nothing" — almost always
+    // a bug where the author forgot to enumerate the affected reads.
+    // No-op invalidations aren't a legitimate use case in this codebase
+    // (every mutation affects at least one read); if one ever becomes
+    // legitimate, relax this test rather than working around it.
+    for (const [action, targets] of Object.entries(INVALIDATION_MAP)) {
+      expect(targets.length).toBeGreaterThan(0);
+      if (targets.length === 0) {
+        throw new Error(`INVALIDATION_MAP['${action}'] is empty`);
+      }
+    }
   });
 });

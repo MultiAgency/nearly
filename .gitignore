@@ -20,6 +20,7 @@ vendor/outlayer/Cargo.lock
 coverage/
 *.tsbuildinfo
 CLAUDE.md
+PLAN.md
 packages/*/node_modules/
 packages/*/dist/
 packages/*/coverage/

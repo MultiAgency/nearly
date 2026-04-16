@@ -2,39 +2,23 @@ import { LIMITS } from './constants';
 import type { Agent, KvEntry } from './types';
 
 /**
- * Fold a single KvEntry into an Agent, applying FastData's trust boundary:
+ * Project a KV entry into a trusted Agent. Returns null for non-object
+ * blobs (`!Array.isArray` catches arrays, which `typeof` reports as
+ * `'object'`).
  *
- * - `account_id` — overridden with the entry's `predecessor_id`, because
- *   FastData attributes each key to whoever wrote it, not to whatever the
- *   caller wrote into the stored blob.
- * - `last_active` / `last_active_height` — overridden with the block-time
- *   and block-height of the entry, because caller-asserted activity time
- *   is manipulable. An agent could write `last_active: 9999999999` into
- *   their profile blob and appear eternally fresh in `sort=active`;
- *   overriding on read closes that hole without touching writers.
- *   `last_active_height` is the canonical monotonic cursor; `last_active`
- *   is its seconds-since-epoch display companion.
- *
- * Returns null for non-object blobs. The `!Array.isArray` guard matters:
- * `typeof [] === 'object'` is true, so without it an array stored under
- * `profile` would spread into `{0: ..., 1: ..., account_id: id}` — a
- * valid-looking Agent with numeric-string keys.
+ * Trust-boundary overrides: `account_id` comes from `entry.predecessor_id`
+ * (FastData attributes each key to who wrote it), and `last_active` /
+ * `last_active_height` come from the entry's block time and height —
+ * otherwise an agent could write `last_active: 9999999999` and game
+ * `sort=active`. `created_at` / `created_height` are not repopulated
+ * here; callers that need them fetch first-write history separately.
  */
 export function foldProfile(entry: KvEntry): Agent | null {
   const blob = entry.value;
   if (!blob || typeof blob !== 'object' || Array.isArray(blob)) return null;
-  // Destructure-and-rebuild instead of spread-and-override. Every trust-
-  // boundary and derived field is pulled out of the blob so `safe` carries
-  // only canonical self-authored content (name, description, image, tags,
-  // capabilities); the authoritative block-derived values are added back in
-  // the return. `created_at` / `created_height` are NOT added back here —
-  // only read paths that fetch first-write history (`getAgent`, `listAgents`
-  // with `sort=newest`) repopulate them. Count / endorsement fields are
-  // also stripped: the write side removes them before storage, and any
-  // legacy blob that still carries them would otherwise leak stale values
-  // into list reads that don't overlay live counts. Mirrors the write-side
-  // strip in `profileEntries` and stays symmetric with `applyTrustBoundary`
-  // in `frontend/src/lib/fastdata-utils`.
+  // Destructure every caller-asserted / derived field out explicitly
+  // rather than spread-and-override — a new Agent field added without
+  // an explicit strip would silently leak the stored value through.
   const {
     account_id: _aid,
     last_active: _la,
@@ -68,6 +52,7 @@ export function defaultAgent(accountId: string): Agent {
     image: null,
     tags: [],
     capabilities: {},
+    endorsements: {},
     account_id: accountId,
   };
 }

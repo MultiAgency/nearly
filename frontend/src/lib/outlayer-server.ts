@@ -1,6 +1,9 @@
+import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import {
   LIMITS,
+  OUTLAYER_ADMIN_ACCOUNT,
+  OUTLAYER_ADMIN_NEAR_KEY,
   OUTLAYER_API_URL,
   OUTLAYER_PROJECT_NAME,
   OUTLAYER_PROJECT_OWNER,
@@ -104,48 +107,129 @@ export function getOutlayerPaymentKey(): string {
   return key;
 }
 
-/**
- * Server-held custody wallet key used to write NEP-413-verified operator
- * claims on behalf of signed-in humans. Scope expansion of the
- * `OUTLAYER_PAYMENT_KEY` pattern (see CLAUDE.md Architecture bullet on
- * "server-held operational secrets") — another named operational secret
- * Nearly's server uses to initiate its own writes. Critically, this is
- * NOT a user credential: Nearly never holds a human's NEAR private key,
- * never signs anything the human didn't NEP-413-authorize, and never
- * derives access from user secrets. The operator-claims writer key only
- * signs `operator/{operator_account_id}/{agent_account_id}` writes after
- * the handler has already verified the human's NEP-413 claim envelope.
- *
- * Returns an empty string when unset — unlike `getOutlayerPaymentKey`,
- * this helper does NOT throw in production. The operator-claim write
- * handler maps the empty return to a 503 `NOT_CONFIGURED` response so
- * deployments that don't run the Lightweight sign-in feature can leave
- * the key unset and the rest of the API stays green. Deployments that
- * DO want the feature enforce the secret's presence at deploy time
- * (startup health check, config audit, whatever) — not at request time.
- */
-export function getOperatorClaimsWriterKey(): string {
-  return process.env.OUTLAYER_OPERATOR_CLAIMS_WK || '';
+// ---------------------------------------------------------------------------
+// Admin near: token helpers — sign admin writes as hack.near via OutLayer's
+// deterministic wallet. The server holds hack.near's NEAR ed25519 key as
+// OUTLAYER_ADMIN_NEAR_KEY, builds a fresh near:<base64url> token per write
+// (±30s window), and submits via writeToFastData the same way wk_ auth does.
+// ---------------------------------------------------------------------------
+
+const B58_ALPHA = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function b58decode(str: string): Uint8Array {
+  const bytes = [0];
+  for (const ch of str) {
+    const val = B58_ALPHA.indexOf(ch);
+    if (val < 0) throw new Error(`invalid base58 char: ${ch}`);
+    let carry = val;
+    for (let i = 0; i < bytes.length; i++) {
+      carry += bytes[i] * 58;
+      bytes[i] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  for (const ch of str) {
+    if (ch === '1') bytes.push(0);
+    else break;
+  }
+  return Uint8Array.from(bytes.reverse());
 }
 
-/**
- * Resolve the NEAR account_id of the operator-claims writer account from its
- * `wk_` key, memoized. Used by `handleAgentClaims` to pick the predecessor
- * namespace it scans for operator-claim entries. Returns an empty string
- * when the writer key is unset — the caller interprets "no writer key
- * configured" as "no claims can exist yet" and returns an empty list,
- * keeping the read path live on deployments that haven't enabled the
- * lightweight sign-in feature.
- *
- * The lookup goes through `resolveAccountId` (OutLayer sign-message), which
- * is cached per-key for the life of the process. One sign-message at boot
- * is the cost; every subsequent call is a Map lookup.
- */
-export async function getOperatorClaimsWriterAccount(): Promise<string> {
-  const key = getOperatorClaimsWriterKey();
-  if (!key) return '';
-  const accountId = await resolveAccountId(key);
-  return accountId ?? '';
+function b58encode(bytes: Uint8Array): string {
+  const digits = [0];
+  for (const b of bytes) {
+    let carry = b;
+    for (let i = 0; i < digits.length; i++) {
+      carry += digits[i] << 8;
+      digits[i] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let out = '';
+  for (let i = digits.length - 1; i >= 0; i--) {
+    out += B58_ALPHA[digits[i]];
+  }
+  for (const b of bytes) {
+    if (b === 0) out = `1${out}`;
+    else break;
+  }
+  return out || '1';
+}
+
+const ADMIN_SEED = 'admin';
+const DER_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+let adminKeyParsed: {
+  privateKey: ReturnType<typeof createPrivateKey>;
+  pubkeyB58: string;
+  accountId: string;
+} | null = null;
+
+function parseAdminNearKey(): typeof adminKeyParsed {
+  if (adminKeyParsed) return adminKeyParsed;
+  if (!OUTLAYER_ADMIN_NEAR_KEY) return null;
+  const b58 = OUTLAYER_ADMIN_NEAR_KEY.replace(/^ed25519:/, '');
+  const expanded = b58decode(b58);
+  if (expanded.length !== 64) return null;
+  const seed32 = expanded.slice(0, 32);
+  const pub32 = expanded.slice(32);
+  const privateKey = createPrivateKey({
+    key: Buffer.concat([DER_PREFIX, seed32]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const pubkeyB58 = `ed25519:${b58encode(pub32)}`;
+  const accountId = process.env.OUTLAYER_ADMIN_ACCOUNT || '';
+  adminKeyParsed = { privateKey, pubkeyB58, accountId };
+  return adminKeyParsed;
+}
+
+export function buildAdminNearToken(): string | null {
+  const parsed = parseAdminNearKey();
+  if (!parsed) return null;
+  const ts = Math.floor(Date.now() / 1000);
+  const message = `auth:${ADMIN_SEED}:${ts}`;
+  const sigBytes = cryptoSign(null, Buffer.from(message), parsed.privateKey);
+  const signatureB58 = b58encode(new Uint8Array(sigBytes));
+  const payload = JSON.stringify({
+    account_id: parsed.accountId,
+    seed: ADMIN_SEED,
+    pubkey: parsed.pubkeyB58,
+    timestamp: ts,
+    signature: signatureB58,
+  });
+  return `near:${Buffer.from(payload).toString('base64url')}`;
+}
+
+let adminWriterAccountCached: string | null = null;
+
+export async function resolveAdminWriterAccount(): Promise<string | null> {
+  if (adminWriterAccountCached) return adminWriterAccountCached;
+  const token = buildAdminNearToken();
+  if (token) {
+    const fromBalance = await accountIdFromBalance(token);
+    if (fromBalance) {
+      adminWriterAccountCached = fromBalance;
+      return fromBalance;
+    }
+  }
+  // Fallback: OUTLAYER_ADMIN_ACCOUNT is the custody wallet's account_id
+  // (what /wallet/v1/balance returns for the admin wk_). Works without
+  // OUTLAYER_ADMIN_NEAR_KEY — the env var is set to the same value the
+  // near: token path would resolve to.
+  if (OUTLAYER_ADMIN_ACCOUNT) {
+    adminWriterAccountCached = OUTLAYER_ADMIN_ACCOUNT;
+    return OUTLAYER_ADMIN_ACCOUNT;
+  }
+  return null;
 }
 
 // Claims can't be cached — NEP-413 nonces are single-use. Account IDs can —
@@ -262,20 +346,9 @@ export async function resolveAccountId(
   const cached = accountCache.get(walletKey);
   if (cached) return cached;
 
-  // For `wk_` custody wallet keys, prefer the cheap GET
-  // /wallet/v1/balance?chain=near — it returns account_id in its 2xx
-  // body, so a full NEP-413 sign round-trip is unnecessary for identity
-  // discovery. Falls back to sign-message if the balance path fails, so
-  // a transient outage on one endpoint doesn't block identity resolution.
-  //
-  // The wk_ gate exists because `near:` tokens can legitimately reach
-  // this function via the `register_platforms` passthrough path in
-  // route.ts (`near:` is only rejected for DIRECT_WRITE_ACTIONS, not
-  // PASSTHROUGH_WRITE_ACTIONS). `signMessage` is known to accept
-  // `near:` tokens (confirmed 2026-04-04, see CLAUDE.md "Auth" bullet);
-  // whether `/wallet/v1/balance` accepts them is not documented, so we
-  // route `near:` callers straight to the known-good path without
-  // paying an extra failed HTTP round-trip.
+  // wk_ only: balance is cheaper than sign-message. near: tokens can
+  // reach here via register_platforms passthrough; sign-message accepts
+  // them (CLAUDE.md Auth), balance's near: support is undocumented.
   if (walletKey.startsWith('wk_')) {
     const fromBalance = await accountIdFromBalance(walletKey);
     if (fromBalance) {
@@ -293,11 +366,8 @@ export async function resolveAccountId(
 }
 
 /**
- * Ask OutLayer to NEP-413 sign a canonical claim message for this wallet
- * key. Returns the signed `VerifiableClaim` packaged with account_id,
- * public_key, signature, nonce, and the exact signed message. The caller
- * is responsible for forwarding the claim — this function only produces
- * the signature, it does not submit anything.
+ * Produces the signed `VerifiableClaim` but does not submit it — the
+ * caller forwards the claim to whoever needs to verify it.
  */
 export async function signClaimForWalletKey(
   walletKey: string,

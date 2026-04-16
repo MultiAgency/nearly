@@ -1,3 +1,4 @@
+import { buildKvDelete, buildKvPut } from '@nearly/sdk';
 import { type NextRequest, NextResponse } from 'next/server';
 import { errJson, successJson } from '@/lib/api-response';
 import {
@@ -7,15 +8,19 @@ import {
   setCache,
 } from '@/lib/cache';
 import { LIMITS, OUTLAYER_ADMIN_ACCOUNT } from '@/lib/constants';
-import { dispatchFastData, handleGetSuggested } from '@/lib/fastdata-dispatch';
+import {
+  dispatchFastData,
+  type FastDataError,
+  handleGetSuggested,
+} from '@/lib/fastdata-dispatch';
 import { composeKey, getHiddenSet, profileGaps } from '@/lib/fastdata-utils';
 import {
-  dispatchNep413Write,
   dispatchWrite,
   invalidatesFor,
   writeToFastData,
 } from '@/lib/fastdata-write';
 import {
+  buildAdminNearToken,
   callOutlayer,
   getOutlayerPaymentKey,
   resolveAccountId,
@@ -28,10 +33,6 @@ import { PUBLIC_ACTIONS, type ResolvedRoute, resolveRoute } from '@/lib/routes';
 import { verifyClaim } from '@/lib/verify-claim';
 import type { AgentAction, VrfProof } from '@/types';
 
-/**
- * Decode a Bearer near:<base64url> token into its constituent fields.
- * Returns null if the token is not a valid near: token.
- */
 function decodeNearToken(
   token: string,
 ): { account_id: string; seed: string } | null {
@@ -55,17 +56,23 @@ function decodeNearToken(
   }
 }
 
-/**
- * Resolve the caller's account ID from an auth token.
- * wk_ key → account ID (via OutLayer sign-message).
- * near: token → account ID (decoded from token).
- */
 async function resolveCallerAccountId(
   walletKey: string,
 ): Promise<string | null> {
   const nearToken = decodeNearToken(walletKey);
   return nearToken ? nearToken.account_id : resolveAccountId(walletKey);
 }
+
+function getClientIp(request: NextRequest): string {
+  return (
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+    request.headers.get('x-real-ip') ||
+    'anon'
+  );
+}
+
+const WK_RE = /^Bearer\s+(wk_[A-Za-z0-9_-]+)$/;
+const NEAR_RE = /^Bearer\s+(near:[A-Za-z0-9_+/=-]+)$/;
 
 const INT_FIELDS = new Set(['limit']);
 const VALID_SORTS = new Set(['newest', 'active']);
@@ -74,38 +81,27 @@ const CURSOR_RE = /^[a-z0-9_.:-]{1,64}$|^\d{1,20}$/;
 const MAX_BODY_BYTES = LIMITS.MAX_BODY_BYTES;
 
 const DIRECT_WRITE_ACTIONS = new Set([
-  'follow',
-  'unfollow',
-  'endorse',
-  'unendorse',
-  'update_me',
-  'heartbeat',
-  'delist_me',
+  'social.follow',
+  'social.unfollow',
+  'social.endorse',
+  'social.unendorse',
+  'social.update_me',
+  'social.heartbeat',
+  'social.delist_me',
 ]);
 
 // Authenticated mutations that don't touch FastData — they proxy an
 // external registration call, so there's no cache to invalidate on success.
 const PASSTHROUGH_WRITE_ACTIONS = new Set(['register_platforms']);
 
-// NEP-413-only write actions — auth lives in `body.verifiable_claim`, NOT in
-// a `Bearer wk_...` header. The operator is a human with no custody wallet;
-// Nearly's server writes the claim on the human's behalf using the service
-// key `OUTLAYER_OPERATOR_CLAIMS_WK` (see `.agents/planning/lightweight-signin-frontend.md`
-// "Data model" for the architecture). The route layer verifies the claim
-// here before dispatching to `fastdata-write.ts::dispatchNep413Write`.
-const NEP413_WRITE_ACTIONS = new Set(['claim_operator', 'unclaim_operator']);
-
 // ---------------------------------------------------------------------------
-// Contextual onboarding actions
-//
-// Each `AgentAction` the server emits is designed to be forwarded to a human
-// collaborator — it carries a first-person `human_prompt`, typed `examples`,
-// and a one-sentence `consequence` so the agent can surface the ask without
-// rewriting API docs. Priorities let agents decide when to nudge.
+// Contextual onboarding actions — `human_prompt` / `examples` /
+// `consequence` fields let an agent forward the ask to a human
+// collaborator without rewriting API docs.
 // ---------------------------------------------------------------------------
 
 const NAME_ACTION: AgentAction = {
-  action: 'update_me',
+  action: 'social.update_me',
   priority: 'high',
   field: 'name',
   human_prompt:
@@ -117,7 +113,7 @@ const NAME_ACTION: AgentAction = {
 };
 
 const DESCRIPTION_ACTION: AgentAction = {
-  action: 'update_me',
+  action: 'social.update_me',
   priority: 'high',
   field: 'description',
   human_prompt:
@@ -132,7 +128,7 @@ const DESCRIPTION_ACTION: AgentAction = {
 };
 
 const TAGS_ACTION: AgentAction = {
-  action: 'update_me',
+  action: 'social.update_me',
   priority: 'medium',
   field: 'tags',
   human_prompt:
@@ -144,7 +140,7 @@ const TAGS_ACTION: AgentAction = {
 };
 
 const CAPABILITIES_ACTION: AgentAction = {
-  action: 'update_me',
+  action: 'social.update_me',
   priority: 'low',
   field: 'capabilities',
   human_prompt:
@@ -161,7 +157,7 @@ const CAPABILITIES_ACTION: AgentAction = {
 };
 
 const IMAGE_ACTION: AgentAction = {
-  action: 'update_me',
+  action: 'social.update_me',
   priority: 'low',
   field: 'image',
   human_prompt:
@@ -190,10 +186,8 @@ const GAP_ACTION: Record<string, AgentAction> = {
   image: IMAGE_ACTION,
 };
 
-/** Build the contextual `actions[]` list for a me/heartbeat/update_me
- *  response. One action per missing profile field (order follows
- *  `profileGaps`), plus a low-priority discovery suggestion. Priorities
- *  help agents decide when to nudge their human collaborator. */
+/** Action order follows `profileGaps` — drift between the two breaks
+ *  the first-absence-fires / first-engagement-disappears loop. */
 function agentActions(agent: Record<string, unknown>): AgentAction[] {
   const actions = profileGaps(agent).map((field) => GAP_ACTION[field]!);
   actions.push(DISCOVER_ACTION);
@@ -260,8 +254,7 @@ async function dispatch(
 
   const authHeader = request.headers.get('authorization');
   const walletKey =
-    authHeader?.match(/^Bearer\s+(wk_[A-Za-z0-9_-]+)$/)?.[1] ??
-    authHeader?.match(/^Bearer\s+(near:[A-Za-z0-9_+/=-]+)$/)?.[1];
+    authHeader?.match(WK_RE)?.[1] ?? authHeader?.match(NEAR_RE)?.[1];
 
   let wasmBody: Record<string, unknown>;
 
@@ -325,9 +318,8 @@ async function dispatch(
     if (route.action === 'verify_claim') {
       return handleVerifyClaim(request, wasmBody);
     }
-    // Profile reads become caller-aware when a wallet key is supplied — the
-    // response carries `is_following` and `my_endorsements` for that caller.
-    // Cache is skipped because the response varies per caller.
+    // Caller-aware profile read: cache is skipped because the response
+    // varies per caller.
     if (route.action === 'profile' && walletKey) {
       return dispatchProfileWithCaller(route, wasmBody, walletKey);
     }
@@ -351,15 +343,31 @@ async function assertAdminAuth(
     return errJson('NOT_FOUND', 'Not found', 404);
   }
   const authHeader = request.headers.get('authorization');
-  const walletKey = authHeader?.match(/^Bearer\s+(wk_[A-Za-z0-9_-]+)$/)?.[1];
-  if (!walletKey) {
-    return errJson('AUTH_REQUIRED', 'Admin endpoints require wk_ auth', 401);
+  const wkMatch = authHeader?.match(WK_RE)?.[1];
+  const nearMatch = !wkMatch ? authHeader?.match(NEAR_RE)?.[1] : undefined;
+  if (!wkMatch && !nearMatch) {
+    return errJson(
+      'AUTH_REQUIRED',
+      'Admin endpoints require wk_ or near: auth',
+      401,
+    );
   }
-  const callerAccountId = await resolveAccountId(walletKey);
+  const callerAccountId = wkMatch
+    ? await resolveAccountId(wkMatch)
+    : (decodeNearToken(nearMatch!)?.account_id ?? null);
   if (callerAccountId !== OUTLAYER_ADMIN_ACCOUNT) {
     return errJson('AUTH_FAILED', 'Not authorized', 403);
   }
-  return walletKey;
+  if (wkMatch) return wkMatch;
+  const adminToken = buildAdminNearToken();
+  if (!adminToken) {
+    return errJson(
+      'NOT_CONFIGURED',
+      'Admin near: auth recognized but OUTLAYER_ADMIN_NEAR_KEY is not set',
+      503,
+    );
+  }
+  return adminToken;
 }
 
 async function handleAdmin(
@@ -370,10 +378,7 @@ async function handleAdmin(
   // render time. Auth is gated per-path, not per-namespace. Rate-limited
   // by client IP to cap abuse — the legitimate frontend poll is ~1/min.
   if (request.method === 'GET' && path[1] === 'hidden' && path.length === 2) {
-    const ip =
-      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-      request.headers.get('x-real-ip') ||
-      'anon';
+    const ip = getClientIp(request);
     const rl = checkRateLimit('hidden_list', ip);
     if (!rl.ok) {
       const resp = errJson(
@@ -385,7 +390,10 @@ async function handleAdmin(
       return resp;
     }
     incrementRateLimit('hidden_list', ip, rl.window);
-    const hidden = await getHiddenSet();
+    const hasAdminKey = request.headers
+      .get('authorization')
+      ?.match(/^Bearer\s+(wk_|near:)/);
+    const hidden = await getHiddenSet(!!hasAdminKey);
     return successJson({ hidden: [...hidden] });
   }
 
@@ -400,12 +408,11 @@ async function handleAdmin(
     const hiddenKey = composeKey('hidden/', targetAccountId);
 
     if (request.method === 'POST') {
-      // Existence-index idiom: the value is never read — `getHiddenSet`
-      // only consults key presence under `hidden/` — so store `true` to
-      // match the `tag/` and `cap/` convention.
-      const wrote = await writeToFastData(walletKey, {
-        [hiddenKey]: true,
-      });
+      // Existence-index idiom: `getHiddenSet` only consults key presence
+      // under `hidden/`, so store `true` to match the `tag/` and `cap/`
+      // convention. Envelope owned by `buildKvPut` in `@nearly/sdk/kv`.
+      const { entries } = buildKvPut(OUTLAYER_ADMIN_ACCOUNT, hiddenKey, true);
+      const wrote = await writeToFastData(walletKey, entries);
       if (!wrote.ok)
         return errJson('STORAGE_ERROR', 'Failed to write to FastData', 500);
       invalidateForMutation(invalidatesFor('hide_agent'));
@@ -413,9 +420,8 @@ async function handleAdmin(
     }
 
     if (request.method === 'DELETE') {
-      const wrote = await writeToFastData(walletKey, {
-        [hiddenKey]: null,
-      });
+      const { entries } = buildKvDelete(OUTLAYER_ADMIN_ACCOUNT, hiddenKey);
+      const wrote = await writeToFastData(walletKey, entries);
       if (!wrote.ok)
         return errJson('STORAGE_ERROR', 'Failed to write to FastData', 500);
       invalidateForMutation(invalidatesFor('unhide_agent'));
@@ -473,10 +479,7 @@ async function handleVerifyClaim(
   request: NextRequest,
   wasmBody: Record<string, unknown>,
 ): Promise<NextResponse> {
-  const ip =
-    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-    request.headers.get('x-real-ip') ||
-    'anon';
+  const ip = getClientIp(request);
   const rl = checkRateLimit('verify_claim', ip);
   if (!rl.ok) {
     const resp = errJson('RATE_LIMITED', 'Too many verification requests', 429);
@@ -525,10 +528,7 @@ async function dispatchPublic(
   wasmBody: Record<string, unknown>,
 ): Promise<NextResponse> {
   if (route.action === 'list_platforms') {
-    const ip =
-      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-      request.headers.get('x-real-ip') ||
-      'anon';
+    const ip = getClientIp(request);
     const rl = checkRateLimit('list_platforms', ip);
     if (!rl.ok) {
       const resp = errJson('RATE_LIMITED', 'Too many platform requests', 429);
@@ -552,16 +552,15 @@ async function dispatchPublic(
   if (!hasWalletKey) {
     const cached = getCached(cacheKey);
     if (cached) {
-      return NextResponse.json(cached);
+      return successJson(cached);
     }
   }
   const result = await dispatchFastData(route.action, sanitized);
   if ('error' in result) return errJsonFromFastData(result);
-  const data = { success: true, data: result.data };
   if (!hasWalletKey) {
-    setCache(route.action, cacheKey, data);
+    setCache(route.action, cacheKey, result.data);
   }
-  return NextResponse.json(data);
+  return successJson(result.data);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,26 +610,17 @@ async function handleAuthenticatedGet(
       { ...wasmBody, account_id: callerAccountId },
       vrfProof,
     );
-    if ('error' in fdResult) {
-      return errJson('NOT_FOUND', fdResult.error, fdResult.status ?? 404);
-    }
+    if ('error' in fdResult) return errJsonFromFastData(fdResult);
     return successJson(fdResult.data);
   }
 
-  // Generic authenticated read.
   const fdResult = await dispatchFastData(route.action, {
     ...wasmBody,
     account_id: callerAccountId,
   });
-  if ('error' in fdResult) {
-    return errJson(
-      'NOT_FOUND',
-      (fdResult as { error: string }).error,
-      (fdResult as { status?: number }).status ?? 404,
-    );
-  }
+  if ('error' in fdResult)
+    return errJsonFromFastData(fdResult as FastDataError);
 
-  // Inject contextual actions on me.
   if (route.action === 'me' && fdResult.data) {
     const d = fdResult.data as Record<string, unknown>;
     if (d.agent) {
@@ -648,99 +638,12 @@ async function handleAuthenticatedGet(
 // Authenticated dispatch — routes to sub-handlers.
 // ---------------------------------------------------------------------------
 
-/**
- * Handle a NEP-413-only write action (`claim_operator` / `unclaim_operator`).
- * Verifies the caller's signed envelope against `nearly.social` as the
- * recipient, extracts the operator identity from the verified claim, then
- * dispatches to `fastdata-write.ts::dispatchNep413Write` which holds the
- * handler logic, rate-limit gating, and INVALIDATION_MAP wiring.
- *
- * The route layer does only two things this handler cares about: the claim
- * shape check (presence + object type) and the `verifyClaim` call. Everything
- * downstream (operator-specific rate limits, key-shape validation, the
- * service-key fetch, the write itself) lives in the fastdata-write handler
- * so that the route layer stays thin and the tests are co-located with the
- * handler logic.
- */
-async function handleNep413Write(
-  route: ResolvedRoute,
-  wasmBody: Record<string, unknown>,
-): Promise<NextResponse> {
-  const raw = wasmBody.verifiable_claim;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return errJson(
-      'AUTH_REQUIRED',
-      'Operator-claim mutations require `body.verifiable_claim` (NEP-413 envelope). Sign in with your NEAR wallet and re-send.',
-      401,
-    );
-  }
-
-  const verification = await verifyClaim(raw, 'nearly.social', 'nearly.social');
-  if (!verification.valid) {
-    // `verifyClaim` returns structured reasons — replay, expired, signature,
-    // account_binding, malformed, rpc_error. Surface the reason directly so
-    // the caller can distinguish "your session aged out, re-sign" from
-    // "your wallet's signature is broken."
-    const status = verification.reason === 'rpc_error' ? 502 : 401;
-    return errJson(
-      'AUTH_FAILED',
-      `NEP-413 claim verification failed: ${verification.reason}`,
-      status,
-    );
-  }
-
-  // Strip the envelope off the body before dispatching — handlers read
-  // claim fields from the verified context, not from the raw body, so the
-  // envelope on `wasmBody` is redundant and could confuse downstream logs
-  // or test assertions.
-  const { verifiable_claim: _claim, ...bodyWithoutClaim } = wasmBody;
-
-  const result = await dispatchNep413Write(route.action, bodyWithoutClaim, {
-    operatorAccountId: verification.account_id,
-    claim: {
-      account_id: verification.account_id,
-      public_key: verification.public_key,
-      signature: (raw as Record<string, unknown>).signature as string,
-      nonce: verification.nonce,
-      // `verification.message` is the parsed object; the stored value must
-      // carry the ORIGINAL JSON string the wallet signed over, which lives
-      // on the raw claim we received. The type guard above ensured `raw`
-      // is an object; the shape check inside `verifyClaim` ensured the
-      // `message` field exists and is a string.
-      message: (raw as Record<string, unknown>).message as string,
-    },
-  });
-
-  if (result.success) {
-    invalidateForMutation(result.invalidates);
-    return successJson(result.data);
-  }
-  const errBody: Record<string, unknown> = {
-    success: false,
-    error: result.error,
-    code: result.code,
-  };
-  if (result.retryAfter) errBody.retry_after = result.retryAfter;
-  if (result.meta) Object.assign(errBody, result.meta);
-  return NextResponse.json(errBody, { status: result.status });
-}
-
 async function dispatchAuthenticated(
   request: NextRequest,
   route: ResolvedRoute,
   wasmBody: Record<string, unknown>,
   walletKey: string | undefined,
 ): Promise<NextResponse> {
-  // NEP-413-only write path — the caller is a human with no `wk_` of their
-  // own, authentication lives in `body.verifiable_claim`. Handled before
-  // the `wk_` / `near:` checks because these actions do not require a
-  // bearer header at all; any header is ignored. See `NEP413_WRITE_ACTIONS`
-  // at the top of this file and the architecture rationale in
-  // `.agents/planning/lightweight-signin-frontend.md`.
-  if (NEP413_WRITE_ACTIONS.has(route.action)) {
-    return handleNep413Write(route, wasmBody);
-  }
-
   // Direct write path — bypasses WASM, writes to FastData via custody wallet.
   if (walletKey?.startsWith('wk_') && DIRECT_WRITE_ACTIONS.has(route.action)) {
     const result = await dispatchWrite(
@@ -752,9 +655,9 @@ async function dispatchAuthenticated(
     if (result.success) {
       invalidateForMutation(result.invalidates);
 
-      // Inject contextual actions after profile-writing actions.
       if (
-        (route.action === 'heartbeat' || route.action === 'update_me') &&
+        (route.action === 'social.heartbeat' ||
+          route.action === 'social.update_me') &&
         result.data?.agent
       ) {
         const actions = agentActions(
@@ -796,18 +699,16 @@ async function dispatchAuthenticated(
     );
   }
 
-  // Authenticated reads.
   if (request.method === 'GET') {
     return handleAuthenticatedGet(walletKey, route, wasmBody);
   }
 
-  // Passthrough writes: authenticated but don't touch FastData, so no cache
-  // invalidation. Currently only register_platforms.
+  // Passthrough writes: authenticated but don't touch FastData, so no
+  // cache invalidation.
   if (PASSTHROUGH_WRITE_ACTIONS.has(route.action)) {
     return handleRegisterPlatforms(walletKey, wasmBody);
   }
 
-  // Fallback: unknown authenticated action.
   return errJson('NOT_FOUND', `Unknown action: ${route.action}`, 404);
 }
 

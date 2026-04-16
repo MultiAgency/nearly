@@ -1,17 +1,15 @@
 import type {
   Agent,
-  AgentClaimsResponse,
-  ClaimOperatorResult,
   Edge,
   EdgesResponse,
   EndorsersResponse,
+  EndorsingResponse,
   GetMeResponse,
   GetProfileResponse,
   HeartbeatResponse,
   PlatformResult,
   SuggestedResponse,
   TagsResponse,
-  VerifiableClaim,
 } from '@/types';
 import { API_TIMEOUT_MS, LIMITS } from './constants';
 import { fetchWithRetry, fetchWithTimeout } from './fetch';
@@ -65,51 +63,29 @@ class ApiError extends Error {
 
 class ApiClient {
   private apiKey: string | null = null;
-  // Staged for non-custody NEAR accounts: a caller holding their own key signs
-  // a NEP-413 claim client-side and we forward it as `body.verifiable_claim`.
-  // route.ts does not yet validate the field — adding that is the only server
-  // work needed to light this path up. Not dead code.
-  private auth: VerifiableClaim | null = null;
 
   setApiKey(key: string | null) {
     this.apiKey = key;
   }
 
-  setAuth(auth: VerifiableClaim | null) {
-    this.auth = auth;
-  }
-
   clearCredentials() {
     this.apiKey = null;
-    this.auth = null;
   }
 
   private async requestRaw(
     action: string,
     args: Record<string, unknown> = {},
-    authMode: 'wk' | 'claim' | 'none' = 'wk',
+    authMode: 'wk' | 'none' = 'wk',
   ): Promise<{ data: unknown }> {
     const { method, url } = routeFor(action, args);
 
     const headers: Record<string, string> = {};
-    // `wk` mode: Bearer wk_ header required. The proxy's direct-write path
-    // authenticates off the header and won't accept a claim as a substitute.
-    // `claim` mode: NEP-413 envelope travels in body.verifiable_claim, no
-    // header auth. Used by operator-claim writes (claim_operator /
-    // unclaim_operator) where the caller is a human with no wk_ of their own.
-    // `none`: public reads. Any stashed credentials are ignored.
+    // `wk` mode: Bearer wk_ header required. `none`: public reads.
     if (authMode === 'wk') {
       if (this.apiKey) {
         headers.Authorization = `Bearer ${this.apiKey}`;
       } else {
         throw new ApiError(401, 'API key not set');
-      }
-    } else if (authMode === 'claim') {
-      if (!this.auth) {
-        throw new ApiError(
-          401,
-          'Verifiable claim not set — call setAuth() with a fresh NEP-413 claim before this request',
-        );
       }
     }
 
@@ -119,20 +95,11 @@ class ApiClient {
       if (hasPathParam(action, 'accountId')) {
         delete bodyArgs.accountId;
       }
-      // `wk` mode: stashed claim is forwarded alongside the bearer header —
-      // the proxy's existing "claim piggybacks on wk_ auth" path (staged for
-      // non-custody callers that want to assert a secondary identity).
-      // `claim` mode: the claim IS the auth, so always include it.
-      if ((authMode === 'wk' || authMode === 'claim') && this.auth) {
-        bodyArgs.verifiable_claim = this.auth;
-      }
       body = JSON.stringify(bodyArgs);
       headers['Content-Type'] = 'application/json';
     }
 
-    // Retry policy follows whether the request is a public read (`none`) or
-    // an authenticated one — reads can be retried freely, writes can't. A
-    // claim-auth request is a write, so it uses the no-retry path.
+    // Reads can be retried freely, writes can't.
     const doFetch = authMode === 'none' ? fetchWithRetry : fetchWithTimeout;
     const response = await doFetch(
       url,
@@ -163,7 +130,7 @@ class ApiClient {
   private async request<T>(
     action: string,
     args: Record<string, unknown> = {},
-    authMode: 'wk' | 'claim' | 'none' = 'wk',
+    authMode: 'wk' | 'none' = 'wk',
   ): Promise<T> {
     const { data } = await this.requestRaw(action, args, authMode);
     if (data === undefined || data === null) {
@@ -226,7 +193,7 @@ class ApiClient {
   }
 
   async heartbeat() {
-    return this.request<HeartbeatResponse>('heartbeat', {});
+    return this.request<HeartbeatResponse>('social.heartbeat', {});
   }
 
   private async listByRelation(
@@ -268,50 +235,12 @@ class ApiClient {
   }
 
   /**
-   * Public read — operators who have filed NEP-413-signed claims on the
-   * given agent. The returned `operators[]` carry display fields plus the
-   * full claim envelope, so any client (not just Nearly's UI) can
-   * independently re-verify each assertion against NEAR RPC.
+   * Outgoing-side endorsements: everything this account has endorsed
+   * on others, grouped by target. Inverse of `getEndorsers`. Public
+   * read — no auth.
    */
-  async getAgentClaims(accountId: string) {
-    return this.request<AgentClaimsResponse>(
-      'agent_claims',
-      { accountId },
-      'none',
-    );
-  }
-
-  /**
-   * NEP-413-authed write — file an operator claim on `accountId` using the
-   * claim currently stashed via `setAuth`. The caller is responsible for
-   * minting a fresh claim (via `signClaim` in `lib/sign-claim.ts`) and
-   * calling `setAuth(claim)` immediately before this call. The claim is
-   * consumed per-request — freshness + replay protection live server-side.
-   *
-   * The stashed claim is not cleared after the call; callers that want
-   * claim-per-request semantics should call `clearCredentials()` themselves
-   * or mint a fresh claim for the next write.
-   */
-  async claimOperator(accountId: string, opts: { reason?: string } = {}) {
-    return this.request<ClaimOperatorResult>(
-      'claim_operator',
-      { accountId, ...(opts.reason != null && { reason: opts.reason }) },
-      'claim',
-    );
-  }
-
-  /**
-   * NEP-413-authed write — retract an existing operator claim on
-   * `accountId`. Same auth / freshness contract as `claimOperator`. A
-   * retract on an absent claim is a no-op server-side (symmetric with the
-   * `endorse`/`unendorse` tolerance).
-   */
-  async unclaimOperator(accountId: string) {
-    return this.request<ClaimOperatorResult>(
-      'unclaim_operator',
-      { accountId },
-      'claim',
-    );
+  async getEndorsing(accountId: string) {
+    return this.request<EndorsingResponse>('endorsing', { accountId }, 'none');
   }
 }
 

@@ -36,7 +36,6 @@ import {
   profileCompleteness,
   profileSummary,
 } from './fastdata-utils';
-import { getOperatorClaimsWriterAccount } from './outlayer-server';
 export type FastDataError = { error: string; status?: number };
 type FastDataResult = { data: unknown } | FastDataError;
 
@@ -101,12 +100,12 @@ export async function dispatchFastData(
         return await handleGetEdges(body);
       case 'endorsers':
         return await handleGetEndorsers(body);
+      case 'endorsing':
+        return await handleGetEndorsing(body);
       case 'activity':
         return await handleGetActivity(body);
       case 'network':
         return await handleGetNetwork(body);
-      case 'agent_claims':
-        return await handleAgentClaims(body);
       default:
         return { error: `Unsupported action: ${action}` };
     }
@@ -171,11 +170,6 @@ async function handleGetProfile(
   };
 }
 
-/**
- * Look up the caller's stance toward a target agent: whether they follow them,
- * and which key_suffixes they have endorsed on the target. Returns
- * `{ is_following, my_endorsements }` for inclusion in the profile response.
- */
 async function fetchCallerContext(
   callerAccountId: string,
   targetAccountId: string,
@@ -239,14 +233,9 @@ async function handleListAgents(
   const tag = body.tag as string | undefined;
   const capability = body.capability as string | undefined;
 
-  // Profile reads go through `fetchProfiles` / `fetchAllProfiles`,
-  // which enforce the FastData trust boundary (authoritative account
-  // IDs come from the predecessor namespace, never the stored blob).
-  // For sort=newest we additionally walk the namespace-wide profile
-  // history once to derive each agent's first-write block_timestamp,
-  // joined into the agent list before sorting. sort=active doesn't
-  // need this — `last_active` is already block-authoritative on the
-  // latest read path.
+  // `sort=newest` needs a namespace-wide history walk to derive each
+  // agent's first-write `created_at`; `sort=active` doesn't, because
+  // `last_active` is already block-authoritative on the latest read.
   const [allAgents, firstSeenMap] = await Promise.all([
     capability || tag
       ? kvGetAll(
@@ -276,7 +265,6 @@ async function handleListAgents(
   const sortFn = sortComparator(sort);
   allAgents.sort(sortFn);
 
-  // Cursor-based pagination.
   const { page, nextCursor, cursorReset } = cursorPaginate(
     allAgents,
     cursor,
@@ -294,19 +282,11 @@ async function handleListAgents(
 }
 
 /**
- * Sort agents by activity recency or registration order, both
- * block-authoritative.
- *
- * - `sort=active` uses `last_active`, populated from the latest profile
- *   entry's `block_timestamp` via `applyTrustBoundary`.
- * - `sort=newest` uses `created_at`, populated from the FIRST profile
- *   entry's `block_timestamp` via `kvHistoryFirstByPredecessor` joined
- *   into the agent list before sorting (see `handleListAgents`).
- *
- * Both are derived from FastData history, ungameable by caller-asserted
- * values. Agents missing a `created_at` (history call failed, or the
- * entry was indexed too recently to be retrievable) sort last under
- * `sort=newest` — we treat undefined as 0 to keep the comparator total.
+ * Both sort modes derive from FastData block history and are
+ * ungameable by caller-asserted values. Agents missing a `created_at`
+ * (history call failed, or the entry was indexed too recently to be
+ * retrievable) sort last under `sort=newest` — treat undefined as 0
+ * to keep the comparator total.
  */
 function sortComparator(sort: string): (a: Agent, b: Agent) => number {
   switch (sort) {
@@ -371,7 +351,6 @@ async function handleGetFollowing(
     (a) => a,
   );
 
-  // Fetch profiles directly by account ID — no resolution needed.
   const agents = await fetchProfiles(page);
 
   return {
@@ -420,7 +399,6 @@ export async function handleGetSuggested(
   const { accountId } = resolved;
   const limit = Math.min(Number(body.limit) || 10, 50);
 
-  // Caller context.
   const [callerAgent, followEntries] = await Promise.all([
     fetchProfile(accountId),
     kvListAgent(accountId, 'graph/follow/'),
@@ -430,7 +408,6 @@ export async function handleGetSuggested(
   );
   followSet.add(accountId);
 
-  // Candidates: all agents, excluding already-followed.
   const allAgents = await fetchAllProfiles();
   const candidates = allAgents.filter((a) => !followSet.has(a.account_id));
 
@@ -472,7 +449,6 @@ async function handleGetEdges(
   const wantIncoming = direction === 'incoming' || direction === 'both';
   const wantOutgoing = direction === 'outgoing' || direction === 'both';
 
-  // Parallel: fetch incoming and outgoing raw data at once
   const [incomingEntries, outgoingEntries] = await Promise.all([
     wantIncoming ? kvGetAll(`graph/follow/${accountId}`) : Promise.resolve([]),
     wantOutgoing
@@ -488,8 +464,7 @@ async function handleGetEdges(
   const allAccountIds = [
     ...new Set([...incomingAccountIds, ...outgoingAccountIds]),
   ];
-  // Edges are identity views — no count overlay. `fetchProfiles`
-  // enforces the trust-boundary override for every agent.
+  // Edges are identity views — no count overlay.
   const profileMap = new Map<string, Agent>();
   for (const a of await fetchProfiles(allAccountIds)) {
     profileMap.set(a.account_id, a);
@@ -577,12 +552,9 @@ async function handleGetEndorsers(
       image: profile.image ?? null,
       reason: meta.reason as string | undefined,
       content_hash: meta.content_hash as string | undefined,
-      // Block-authoritative timestamp — the endorser cannot backdate or
-      // forward-date by lying in their value blob. The caller-asserted
-      // `meta.at` is discarded here; if a legacy consumer ever needs it,
-      // read the entry value directly via kvListAll. `at_height` is the
-      // canonical "when" value per step 3 of the block-height transition —
-      // `at` stays emitted in parallel for consumers not yet migrated.
+      // Block-authoritative — endorsers cannot backdate or forward-date
+      // by lying in the value blob. `at_height` is the canonical "when";
+      // `at` is emitted alongside for consumers not yet on `at_height`.
       at: entryBlockSecs(e),
       at_height: entryBlockHeight(e),
     });
@@ -592,6 +564,113 @@ async function handleGetEndorsers(
     data: {
       account_id: accountId,
       endorsers,
+    },
+  };
+}
+
+/**
+ * Targets with no profile blob surface with a null-fielded summary —
+ * endorsements can exist before the target ever heartbeats, and the
+ * envelope is the authoritative record.
+ *
+ * No cross-predecessor filter is needed: `kvListAgent(accountId, ...)`
+ * already scopes the scan to keys the caller wrote under their own
+ * namespace, so the endorser's identity is implicit in the query.
+ */
+async function handleGetEndorsing(
+  body: Record<string, unknown>,
+): Promise<FastDataResult> {
+  const resolved = await requireAgent(body);
+  if ('error' in resolved) return resolved;
+  const { accountId } = resolved;
+
+  const entries = await kvListAgent(accountId, 'endorsing/');
+  if (entries.length === 0) {
+    return { data: { account_id: accountId, endorsing: {} } };
+  }
+
+  // Parse `endorsing/{target}/{key_suffix}` keys. Split on the FIRST
+  // slash after the `endorsing/` prefix so suffixes that themselves
+  // contain slashes (e.g. `tags/rust`, `task_completion/job_42`)
+  // survive verbatim. A bare `endorsing/bob.near/` with no suffix is
+  // dropped — the server does not store or surface empty suffixes.
+  type ParsedEdge = {
+    target: string;
+    key_suffix: string;
+    value: Record<string, unknown>;
+    entry: KvEntry;
+  };
+  const parsed: ParsedEdge[] = [];
+  const targets = new Set<string>();
+  for (const e of entries) {
+    if (!e.key.startsWith('endorsing/')) continue;
+    const tail = e.key.slice('endorsing/'.length);
+    const slash = tail.indexOf('/');
+    if (slash <= 0) continue;
+    const target = tail.slice(0, slash);
+    const keySuffix = tail.slice(slash + 1);
+    if (!keySuffix) continue;
+    parsed.push({
+      target,
+      key_suffix: keySuffix,
+      value: (e.value ?? {}) as Record<string, unknown>,
+      entry: e,
+    });
+    targets.add(target);
+  }
+  if (parsed.length === 0) {
+    return { data: { account_id: accountId, endorsing: {} } };
+  }
+
+  // Batch-fetch target profiles. Targets that have never heartbeated
+  // return no profile — synthesize a null-fielded summary below.
+  const profiles = await fetchProfiles([...targets]);
+  const profileMap = new Map<string, ReturnType<typeof profileSummary>>();
+  for (const p of profiles) profileMap.set(p.account_id, profileSummary(p));
+
+  const endorsing: Record<
+    string,
+    {
+      target: ReturnType<typeof profileSummary>;
+      entries: Array<{
+        key_suffix: string;
+        reason?: string;
+        content_hash?: string;
+        at: number;
+        at_height: number;
+      }>;
+    }
+  > = {};
+
+  for (const edge of parsed) {
+    const summary = profileMap.get(edge.target) ?? {
+      account_id: edge.target,
+      name: null,
+      description: '',
+      image: null,
+    };
+    if (!endorsing[edge.target]) {
+      endorsing[edge.target] = { target: summary, entries: [] };
+    }
+    endorsing[edge.target].entries.push({
+      key_suffix: edge.key_suffix,
+      reason:
+        typeof edge.value.reason === 'string' ? edge.value.reason : undefined,
+      content_hash:
+        typeof edge.value.content_hash === 'string'
+          ? edge.value.content_hash
+          : undefined,
+      // Block-authoritative — the endorser cannot backdate by lying in
+      // the stored value blob.
+      at: entryBlockSecs(edge.entry),
+      at_height: entryBlockHeight(edge.entry),
+    });
+  }
+
+  return {
+    data: {
+      account_id: accountId,
+      endorsing,
     },
   };
 }
@@ -607,12 +686,8 @@ async function handleGetActivity(
   if ('error' in resolved) return resolved;
   const { accountId } = resolved;
 
-  // Delta-query cursor: opaque block_height. Callers pass back the `cursor`
-  // from the previous response to receive only entries strictly after it.
-  // Absence means "everything" — no wall-clock default. This is the step 4
-  // landing of the block-height transition: the contract no longer depends
-  // on wall clock at all, so the legacy 24-hour seconds-based default is
-  // gone with it.
+  // Opaque `block_height` cursor; absent cursor means "everything" — no
+  // wall-clock default, so the feed can't depend on server time.
   const cursorRaw = body.cursor;
   let cursor: number | undefined;
   if (cursorRaw !== undefined) {
@@ -629,10 +704,8 @@ async function handleGetActivity(
     cursor = parsed;
   }
 
-  // New followers: predecessors who wrote graph/follow/{accountId} strictly
-  // after the caller-supplied cursor (or all entries if no cursor). Trust the
-  // FastData-indexed `block_height`, not caller-asserted value fields — the
-  // activity feed cannot be gamed by backdating edges.
+  // Trust FastData-indexed `block_height` over caller-asserted value
+  // fields — the activity feed can't be gamed by backdating edges.
   const [followerEntries, followingEntries] = await Promise.all([
     kvGetAll(`graph/follow/${accountId}`),
     kvListAgent(accountId, 'graph/follow/'),
@@ -658,7 +731,6 @@ async function handleGetActivity(
     }
   }
 
-  // Batch-fetch profiles for summaries (parallel).
   const [followerAgents, followingAgents] = await Promise.all([
     fetchProfiles(newFollowerAccounts),
     fetchProfiles(newFollowingAccountIds),
@@ -691,7 +763,6 @@ async function handleGetNetwork(
   if ('error' in resolved) return resolved;
   const { accountId } = resolved;
 
-  // Profile + graph data in parallel.
   const [agent, followerEntries, followingEntries] = await Promise.all([
     fetchProfile(accountId),
     kvGetAll(`graph/follow/${accountId}`),
@@ -722,135 +793,4 @@ async function handleGetNetwork(
       created_height: agent.created_height,
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// Operator-claim read handlers (Lightweight sign-in feature)
-//
-// Operator claims are NEP-413-verified attestations that a human NEAR
-// account operates a particular `wk_` agent wallet. Writes land under a
-// service-writer predecessor (see `handleClaimOperator` in fastdata-write.ts)
-// keyed as `operator/{operator_account_id}/{agent_account_id}`; the stored
-// value is the full NEP-413 envelope so any reader can independently
-// re-verify against NEAR RPC.
-//
-// The by-operator companion handler (`operator_claims`) is deferred until
-// the /dashboard view re-expands — see `.agents/planning/lightweight-signin-frontend.md`
-// "Deferred / re-expand triggers" for the contract. Adding it later is
-// trivial (single-prefix scan) and has no impact on this handler.
-// ---------------------------------------------------------------------------
-
-/**
- * List the operators who have claimed a given agent. Public read — no auth
- * required. Scans the operator-claims writer's predecessor namespace for
- * entries whose key_suffix ends with the target agent's account_id, parses
- * each entry's inner NEP-413 message to extract the authoritative operator
- * identity, and joins operator profiles for display summaries.
- *
- * Trust boundary note: `predecessor_id` on these entries is the service
- * writer account (not the operator), so the usual "predecessor owns this
- * key" attribution does not apply. The authoritative operator identity
- * lives in the stored envelope's inner-message `account_id` field. A
- * malformed envelope — message is missing, not a string, not JSON, or
- * carries no `account_id` — is silently dropped from the list rather than
- * surfaced as an error; the write handler rejects those at ingest, so
- * their presence in storage would indicate either a legacy entry or
- * deliberate tampering by a party with the service writer key.
- *
- * Scale caveat: O(total operator-claim entries in the namespace), bounded
- * structurally by FastData's 10k-page cap (same as `kvHistoryFirstByPredecessor`).
- * Revisit when operator-claim count grows past ~1K. Future scale work can
- * replace the scan with a mirror key `operator-of/{agent}/{operator}`
- * written at claim time without changing this read's external contract.
- *
- * Deployment note: when `OUTLAYER_OPERATOR_CLAIMS_WK` is unset on a given
- * deployment (the lightweight sign-in feature is disabled), there are no
- * claims by construction, so the handler returns an empty `operators`
- * array rather than erroring. Reads stay live even when writes 503.
- */
-async function handleAgentClaims(
-  body: Record<string, unknown>,
-): Promise<FastDataResult> {
-  const resolved = await requireAgent(body);
-  if ('error' in resolved) return resolved;
-  const { accountId } = resolved;
-
-  const writerAccount = await getOperatorClaimsWriterAccount();
-  if (!writerAccount) {
-    return { data: { account_id: accountId, operators: [] } };
-  }
-
-  // Full-scan over every operator-claim entry under the service writer.
-  // `kvListAgent` paginates across pages and respects the same structural
-  // caps as other namespace scans.
-  const claimEntries = await kvListAgent(writerAccount, 'operator/');
-  if (claimEntries.length === 0) {
-    return { data: { account_id: accountId, operators: [] } };
-  }
-
-  // Filter: keys are `operator/{operator_account_id}/{agent_account_id}`;
-  // we want the ones whose trailing segment matches the target accountId.
-  // `endsWith('/' + accountId)` is safe because account IDs cannot contain
-  // slashes, so the trailing-slash boundary is unambiguous.
-  const agentSuffix = `/${accountId}`;
-  const matched = claimEntries.filter((e) => e.key.endsWith(agentSuffix));
-  if (matched.length === 0) {
-    return { data: { account_id: accountId, operators: [] } };
-  }
-
-  // Parse each entry's inner NEP-413 envelope to extract the authoritative
-  // operator identity. Entries whose envelope is malformed are dropped
-  // silently — the write handler would have rejected them at ingest.
-  const parsed: Array<{
-    entry: KvEntry;
-    operatorAccountId: string;
-    value: Record<string, unknown>;
-  }> = [];
-  for (const e of matched) {
-    const value = (e.value ?? {}) as Record<string, unknown>;
-    const message = value.message;
-    if (typeof message !== 'string') continue;
-    let inner: Record<string, unknown>;
-    try {
-      inner = JSON.parse(message) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    const opId = inner.account_id;
-    if (typeof opId !== 'string' || !opId) continue;
-    parsed.push({ entry: e, operatorAccountId: opId, value });
-  }
-  if (parsed.length === 0) {
-    return { data: { account_id: accountId, operators: [] } };
-  }
-
-  // Batch-fetch operator profiles for the summary fields. A missing profile
-  // (operator has never heartbeated) still surfaces as a valid claim entry —
-  // the envelope proves the claim regardless of whether the operator has
-  // joined the directory. Fall back to null/empty display fields.
-  const operatorIds = [...new Set(parsed.map((p) => p.operatorAccountId))];
-  const operatorProfiles = await fetchProfiles(operatorIds);
-  const profileMap = new Map<string, Agent>();
-  for (const p of operatorProfiles) {
-    profileMap.set(p.account_id, p);
-  }
-
-  const operators = parsed.map(({ entry, operatorAccountId, value }) => {
-    const profile = profileMap.get(operatorAccountId);
-    return {
-      account_id: operatorAccountId,
-      name: profile?.name ?? null,
-      description: profile?.description ?? '',
-      image: profile?.image ?? null,
-      message: value.message as string,
-      signature: value.signature as string,
-      public_key: value.public_key as string,
-      nonce: value.nonce as string,
-      reason: typeof value.reason === 'string' ? value.reason : undefined,
-      at: entryBlockSecs(entry),
-      at_height: entryBlockHeight(entry),
-    };
-  });
-
-  return { data: { account_id: accountId, operators } };
 }

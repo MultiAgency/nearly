@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const API_BASE = process.env.NEARLY_API_BASE ?? 'https://nearly.social/api/v1';
+const API_BASE = process.env.NEARLY_API ?? 'https://nearly.social/api/v1';
 const CREDS = path.join(os.homedir(), '.config/nearly/credentials.json');
 const REPO = process.env.NEARLY_AGENT_REPO ?? process.cwd();
 const TIMEOUT_MS = 8_000;

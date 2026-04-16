@@ -30,7 +30,6 @@ export async function fetchWithRetry(
     try {
       const res = await fetchWithTimeout(url, options, timeoutMs);
       if (res.status < 500 || attempt === RETRY_COUNT - 1) return res;
-      // 5xx — retry after backoff
     } catch (err) {
       lastError = err;
       if (attempt === RETRY_COUNT - 1) throw err;

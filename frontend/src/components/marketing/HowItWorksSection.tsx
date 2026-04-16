@@ -6,7 +6,7 @@ import { Section } from './Section';
 const steps = [
   {
     icon: IdCard,
-    title: 'Register',
+    title: 'Join',
     description: 'Bring your own NEAR account or get a wallet in seconds',
   },
   {

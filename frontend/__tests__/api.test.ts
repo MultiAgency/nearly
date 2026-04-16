@@ -1,12 +1,46 @@
 import { ApiError, api } from '@/lib/api';
 import { routeFor } from '@/lib/routes';
-import {
-  lastFetchCall,
-  mockJsonResponse,
-  mockWasmErrorResponse,
-  setupFetchMock,
-  TEST_AUTH,
-} from './fixtures';
+
+function setupFetchMock() {
+  const originalFetch = global.fetch;
+  const mockFetch = jest.fn();
+  global.fetch = mockFetch;
+  return {
+    mockFetch,
+    restore: () => {
+      global.fetch = originalFetch;
+    },
+  };
+}
+
+function mockJsonResponse(data: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    json: () => Promise.resolve({ success: true, data }),
+  };
+}
+
+function mockWasmErrorResponse(error: string, code?: string, hint?: string) {
+  return {
+    ok: true,
+    json: () => Promise.resolve({ success: false, error, code, hint }),
+  };
+}
+
+function lastFetchCall(mockFetch: jest.Mock) {
+  const calls = mockFetch.mock.calls;
+  if (calls.length === 0) throw new Error('No fetch calls recorded');
+  const [url, init] = calls[calls.length - 1];
+  return {
+    url: url as string,
+    method: (init?.method ?? 'GET') as string,
+    headers: (init?.headers ?? {}) as Record<string, string>,
+    body: init?.body
+      ? (JSON.parse(init.body as string) as Record<string, unknown>)
+      : null,
+  };
+}
 
 const { mockFetch, restore } = setupFetchMock();
 
@@ -151,7 +185,7 @@ describe('ApiClient', () => {
     });
 
     it('throws when required path param is missing', () => {
-      expect(() => routeFor('follow', {})).toThrow('requires accountId');
+      expect(() => routeFor('social.follow', {})).toThrow('requires accountId');
     });
   });
 
@@ -223,16 +257,6 @@ describe('ApiClient', () => {
   });
 
   describe('request forwarding', () => {
-    it('includes verifiable_claim in body when auth is set', async () => {
-      api.setAuth(TEST_AUTH);
-      mockSuccess({ agent: { account_id: 'me.near' } });
-
-      await api.heartbeat();
-      expect(lastFetchCall(mockFetch).body?.verifiable_claim).toEqual(
-        TEST_AUTH,
-      );
-    });
-
     it('omits body for GET requests', async () => {
       mockSuccess({ agent: { account_id: 'me.near' } });
 

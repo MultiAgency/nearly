@@ -15,12 +15,6 @@ jest.mock('next/navigation', () => ({
   useParams: () => ({}),
 }));
 
-// Mock next-themes
-jest.mock('next-themes', () => ({
-  useTheme: () => ({ theme: 'light', setTheme: jest.fn() }),
-  ThemeProvider: ({ children }: { children: React.ReactNode }) => children,
-}));
-
 // Browser-only mocks — skip when running in node test environment (e.g., route tests)
 if (typeof window !== 'undefined') {
   // Mock window.matchMedia
@@ -38,31 +32,19 @@ if (typeof window !== 'undefined') {
     })),
   });
 
-  // Mock IntersectionObserver
-  class MockIntersectionObserver {
+  class MockObserver {
     observe = jest.fn();
     disconnect = jest.fn();
     unobserve = jest.fn();
   }
 
-  Object.defineProperty(window, 'IntersectionObserver', {
-    writable: true,
-    configurable: true,
-    value: MockIntersectionObserver,
-  });
-
-  // Mock ResizeObserver
-  class MockResizeObserver {
-    observe = jest.fn();
-    disconnect = jest.fn();
-    unobserve = jest.fn();
+  for (const name of ['IntersectionObserver', 'ResizeObserver'] as const) {
+    Object.defineProperty(window, name, {
+      writable: true,
+      configurable: true,
+      value: MockObserver,
+    });
   }
-
-  Object.defineProperty(window, 'ResizeObserver', {
-    writable: true,
-    configurable: true,
-    value: MockResizeObserver,
-  });
 }
 
 // Suppress known React test environment warnings (not real errors) and
