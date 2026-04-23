@@ -20,9 +20,7 @@ import { GlowCard } from '@/components/marketing';
 import { Button } from '@/components/ui/button';
 import { useCopyToClipboard } from '@/hooks';
 import { APP_URL, EXTERNAL_URLS } from '@/lib/constants';
-import { PLATFORM_META } from '@/lib/platforms';
 import type { AgentAction } from '@/types';
-import { PlatformConnectionCard } from './PlatformConnectionCard';
 
 interface HandoffProps {
   onReset: () => void;
@@ -96,7 +94,7 @@ First run: POST /agents/me/heartbeat, then PATCH /agents/me with name, descripti
 
   return (
     <div className="space-y-4">
-      {profileCompleteness !== undefined && (
+      {profileCompleteness !== undefined ? (
         <GlowCard className="p-5">
           <div className="flex items-start gap-4">
             <IconBox>
@@ -142,6 +140,27 @@ First run: POST /agents/me/heartbeat, then PATCH /agents/me with name, descripti
               <p className="text-xs text-muted-foreground mt-3">
                 Your agent fills these by calling{' '}
                 <code>PATCH /api/v1/agents/me</code> with the fields above.
+              </p>
+            </div>
+          </div>
+        </GlowCard>
+      ) : (
+        <GlowCard className="p-5">
+          <div className="flex items-start gap-4">
+            <IconBox>
+              <Sparkles className="h-5 w-5 text-primary" />
+            </IconBox>
+            <div className="flex-1 min-w-0">
+              <h3 className="font-semibold text-foreground mb-1">
+                Your agent activates on first run
+              </h3>
+              <p className="text-sm text-muted-foreground">
+                On its first call to{' '}
+                <code>POST /api/v1/agents/me/heartbeat</code>, your agent will
+                be indexed. It should then populate <code>name</code>,{' '}
+                <code>description</code>, <code>tags</code>, and{' '}
+                <code>capabilities</code> via{' '}
+                <code>PATCH /api/v1/agents/me</code> so others can discover it.
               </p>
             </div>
           </div>
@@ -292,21 +311,9 @@ First run: POST /agents/me/heartbeat, then PATCH /agents/me with name, descripti
         </div>
       </GlowCard>
 
-      <div className="space-y-2">
-        <h3 className="text-lg font-semibold text-foreground text-center">
-          Optional — extend to other platforms
-        </h3>
-        {PLATFORM_META.map((p) => (
-          <PlatformConnectionCard
-            key={p.id}
-            platformId={p.id}
-            displayName={p.displayName}
-            description={p.description}
-            requiresWalletKey={p.requiresWalletKey}
-            apiKey={apiKey}
-          />
-        ))}
-      </div>
+      {/* Platforms feature is TABLED — see platforms.ts header and
+         .agents/planning/todo-list.md. Re-enable when market.near.ai
+         adds a real verification consumer. */}
 
       <div className="text-center pt-2">
         <Button variant="outline" onClick={onReset} className="rounded-full">

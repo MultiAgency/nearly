@@ -1,5 +1,5 @@
 import { COMMANDS } from '../../src/cli/commands';
-import { NearlyClient } from '../../src/client';
+import { type BatchItemError, NearlyClient } from '../../src/client';
 import { NearlyError, type NearlyErrorShape } from '../../src/errors';
 import { runCli } from './_harness';
 
@@ -41,14 +41,45 @@ const ERROR_SHAPES: NearlyErrorShape[] = [
   { code: 'PROTOCOL', hint: 'bad response', message: 'protocol error' },
 ];
 
-// (command argv, NearlyClient method to stub). Methods that return
-// AsyncIterable<T> are stubbed with a generator that throws. Methods
-// that return Promise<T> are stubbed with mockRejectedValue.
-interface Case {
-  argv: string[];
-  method: keyof NearlyClient;
-  iterator?: boolean;
-}
+// Names of callable instance methods on `NearlyClient`. `keyof NearlyClient`
+// also includes non-method fields (`accountId`, etc.) which fail
+// `jest.spyOn`'s `FunctionPropertyNames` constraint — this filter keeps
+// only the spyable keys.
+type ClientMethodName = {
+  [K in keyof NearlyClient]: NearlyClient[K] extends (
+    ...args: never[]
+  ) => unknown
+    ? K
+    : never;
+}[keyof NearlyClient];
+
+// Split by return shape so each `Case` variant pairs a method name with the
+// `iterator` discriminant the stub builder needs. This turns a whole class
+// of bugs — adding a new command with the wrong `iterator` flag — into a
+// compile error. A false-green in the leakage sweep is the exact failure
+// mode the sweep exists to prevent (an `AsyncIterable` awaited as a Promise
+// never throws and never matches `WK_PATTERN`).
+type IteratorMethodName = {
+  [K in keyof NearlyClient]: NearlyClient[K] extends (
+    ...args: never[]
+  ) => AsyncIterable<unknown>
+    ? K
+    : never;
+}[keyof NearlyClient];
+
+type BatchMethodName = Extract<ClientMethodName, `${string}Many`>;
+type SingleMethodName = Exclude<
+  ClientMethodName,
+  IteratorMethodName | BatchMethodName
+>;
+
+// (command argv, NearlyClient method to stub). Discriminated by return
+// shape: iterator methods get a throwing `AsyncIterable`, batch methods
+// resolve with one `BatchItemError` row, single-target methods reject.
+type Case =
+  | { argv: string[]; method: IteratorMethodName; iterator: true }
+  | { argv: string[]; method: BatchMethodName; iterator?: false }
+  | { argv: string[]; method: SingleMethodName; iterator?: false };
 
 const CASES: Case[] = [
   { argv: ['activity'], method: 'getActivity' },
@@ -61,7 +92,12 @@ const CASES: Case[] = [
     argv: ['endorse', 'bob.near', '--key-suffix', 'tags/rust'],
     method: 'endorse',
   },
+  {
+    argv: ['endorse', 'a.near', 'b.near', '--key-suffix', 'tags/rust'],
+    method: 'endorseMany',
+  },
   { argv: ['follow', 'bob.near'], method: 'follow' },
+  { argv: ['follow', 'a.near', 'b.near'], method: 'followMany' },
   { argv: ['followers', 'bob.near'], method: 'getFollowers', iterator: true },
   { argv: ['following', 'bob.near'], method: 'getFollowing', iterator: true },
   { argv: ['heartbeat'], method: 'heartbeat' },
@@ -73,20 +109,25 @@ const CASES: Case[] = [
     argv: ['unendorse', 'bob.near', '--key-suffix', 'tags/rust'],
     method: 'unendorse',
   },
+  {
+    argv: ['unendorse', 'a.near', 'b.near', '--key-suffix', 'tags/rust'],
+    method: 'unendorseMany',
+  },
   { argv: ['unfollow', 'bob.near'], method: 'unfollow' },
+  { argv: ['unfollow', 'a.near', 'b.near'], method: 'unfollowMany' },
   { argv: ['update', '--name', 'Sweep'], method: 'updateMe' },
 ];
 
 const WK_PATTERN = /wk_[A-Za-z0-9_]+/;
 
-function stub(
-  method: keyof NearlyClient,
-  err: NearlyError,
-  iterator: boolean,
-): void {
-  // biome-ignore lint/suspicious/noExplicitAny: sweep spies by dynamic key.
-  const proto = NearlyClient.prototype as any;
-  if (iterator) {
+function isBatchMethod(
+  m: BatchMethodName | SingleMethodName,
+): m is BatchMethodName {
+  return m.endsWith('Many');
+}
+
+function stub(c: Case, err: NearlyError): void {
+  if (c.iterator) {
     // Return an object with a [Symbol.asyncIterator] that throws on
     // first `next()`. Equivalent to an async generator that throws
     // before its first yield — but biome flags yield-less generators,
@@ -101,10 +142,23 @@ function stub(
       },
     };
     jest
-      .spyOn(proto, method as never)
-      .mockImplementation(() => throwingIterable as never);
+      .spyOn(NearlyClient.prototype, c.method)
+      .mockImplementation(() => throwingIterable);
+  } else if (isBatchMethod(c.method)) {
+    // Batch methods catch per-target errors internally and resolve with
+    // an array of `BatchItemError` rows. Feed one row carrying the current
+    // shape's code/message so the batch renderer's stderr/stdout surface
+    // is exercised once per ERROR_SHAPE — same sweep granularity as the
+    // single-target `mockRejectedValue` path.
+    const batchItem: BatchItemError = {
+      account_id: 'b.near',
+      action: 'error',
+      code: err.shape.code,
+      error: err.shape.message,
+    };
+    jest.spyOn(NearlyClient.prototype, c.method).mockResolvedValue([batchItem]);
   } else {
-    jest.spyOn(proto, method as never).mockRejectedValue(err as never);
+    jest.spyOn(NearlyClient.prototype, c.method).mockRejectedValue(err);
   }
 }
 
@@ -115,15 +169,11 @@ describe('wallet-key leakage sweep', () => {
 
   test.each(
     CASES,
-  )('$argv.0 never leaks wk_ across all NearlyError shapes', async ({
-    argv,
-    method,
-    iterator,
-  }) => {
+  )('$argv.0 never leaks wk_ across all NearlyError shapes', async (c) => {
     for (const shape of ERROR_SHAPES) {
       const err = new NearlyError(shape);
-      stub(method, err, iterator ?? false);
-      const result = await runCli(argv, { env: ENV });
+      stub(c, err);
+      const result = await runCli(c.argv, { env: ENV });
       const combined = `${result.stdout}\n${result.stderr}`;
       expect(combined).not.toMatch(WK_PATTERN);
       jest.restoreAllMocks();

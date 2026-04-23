@@ -108,6 +108,15 @@ const CALLER = 'alice.near';
 const TARGET = 'bob.near';
 const resolveAccountId = jest.fn();
 
+// Seeds the default kvGetAgent mock so only the caller's profile resolves.
+// Shared across describes that need a caller-only seed; cases that also
+// need a follow/endorse edge or list result keep their bespoke mockImpl.
+function seedCallerProfile(agent: Agent): void {
+  mockKvGetAgent.mockImplementation(async (id: string, key: string) =>
+    key === 'profile' && id === CALLER ? profileEntry(CALLER, agent) : null,
+  );
+}
+
 /**
  * Extract the `args` field from the most recent OutLayer write call.
  * Returns `null` if no write has been captured yet. The outbound body is
@@ -267,6 +276,38 @@ describe('SDK envelope parity — social.endorse', () => {
     });
     expect(frontend).toEqual(sdk.entries);
   });
+
+  // Object-form targets[] — pins that per-target `key_suffixes`, `reason`,
+  // and `content_hash` overrides flow through to `buildEndorse` identically
+  // to the single-target path-param form. `runBatch` issues one
+  // `writeToFastData` call per target, so a single-element object-form
+  // targets[] is the minimal case that exercises the new deserialization
+  // path without fighting the batch loop's per-target capture semantics.
+  it('object-form targets[] with per-target overrides matches buildEndorse', async () => {
+    await handleEndorse(
+      WK,
+      {
+        targets: [
+          {
+            account_id: TARGET,
+            key_suffixes: ['tags/rust', 'skills/audit'],
+            reason: 'per-target override',
+            content_hash: 'sha256:def456',
+          },
+        ],
+      },
+      resolveAccountId,
+    );
+    const frontend = captureWriteEntries();
+    expect(frontend).not.toBeNull();
+
+    const sdk = buildEndorse(CALLER, TARGET, {
+      keySuffixes: ['tags/rust', 'skills/audit'],
+      reason: 'per-target override',
+      contentHash: 'sha256:def456',
+    });
+    expect(frontend).toEqual(sdk.entries);
+  });
 });
 
 describe('SDK envelope parity — social.unendorse', () => {
@@ -294,6 +335,46 @@ describe('SDK envelope parity — social.unendorse', () => {
     await handleUnendorse(
       WK,
       { account_id: TARGET, key_suffixes: ['tags/rust', 'skills/audit'] },
+      resolveAccountId,
+    );
+    const frontend = captureWriteEntries();
+    expect(frontend).not.toBeNull();
+
+    const sdk = buildUnendorse(CALLER, TARGET, ['tags/rust', 'skills/audit']);
+    expect(frontend).toEqual(sdk.entries);
+  });
+
+  it('object-form targets[] with per-target key_suffixes matches buildUnendorse', async () => {
+    // Seed existing endorsement entries so the handler doesn't short-circuit.
+    mockKvMultiAgent.mockImplementation(async (queries) =>
+      queries.map((q) => {
+        if (
+          q.key.startsWith(`endorsing/${TARGET}/`) &&
+          q.accountId === CALLER
+        ) {
+          return {
+            predecessor_id: CALLER,
+            current_account_id: 'contextual.near',
+            block_height: 1,
+            block_timestamp: 1_000_000_000,
+            key: q.key,
+            value: {},
+          } as fastdata.KvEntry;
+        }
+        return null;
+      }),
+    );
+
+    await handleUnendorse(
+      WK,
+      {
+        targets: [
+          {
+            account_id: TARGET,
+            key_suffixes: ['tags/rust', 'skills/audit'],
+          },
+        ],
+      },
       resolveAccountId,
     );
     const frontend = captureWriteEntries();
@@ -331,11 +412,7 @@ describe('SDK envelope parity — social.heartbeat', () => {
       capabilities: { skills: ['audit', 'refactor'] },
       account_id: CALLER,
     };
-    mockKvGetAgent.mockImplementation(async (id: string, key: string) => {
-      if (key === 'profile' && id === CALLER)
-        return profileEntry(CALLER, agent);
-      return null;
-    });
+    seedCallerProfile(agent);
 
     await handleHeartbeat(WK, resolveAccountId);
     const frontend = captureWriteEntries();
@@ -367,11 +444,7 @@ describe('SDK envelope parity — social.update_me', () => {
       ...mockAgent(CALLER),
       image: 'https://example.com/avatar.png',
     };
-    mockKvGetAgent.mockImplementation(async (id: string, key: string) => {
-      if (key === 'profile' && id === CALLER)
-        return profileEntry(CALLER, agent);
-      return null;
-    });
+    seedCallerProfile(agent);
 
     const patch = { image: null };
     await handleUpdateMe(WK, patch, resolveAccountId);
@@ -399,11 +472,7 @@ describe('SDK envelope parity — social.update_me', () => {
       },
       account_id: CALLER,
     };
-    mockKvGetAgent.mockImplementation(async (id: string, key: string) => {
-      if (key === 'profile' && id === CALLER)
-        return profileEntry(CALLER, agent);
-      return null;
-    });
+    seedCallerProfile(agent);
 
     const patch = {
       tags: ['rust', 'security'], // drops 'to-drop'
@@ -442,11 +511,7 @@ describe('SDK envelope parity — social.delist_me', () => {
     ];
     const outgoingEndorseKeys = [`endorsing/dave.near/tags/ai`];
 
-    mockKvGetAgent.mockImplementation(async (id: string, key: string) => {
-      if (key === 'profile' && id === CALLER)
-        return profileEntry(CALLER, agent);
-      return null;
-    });
+    seedCallerProfile(agent);
     mockKvListAgent.mockImplementation(async (id: string, prefix: string) => {
       if (id !== CALLER) return [];
       if (prefix === 'graph/follow/') {

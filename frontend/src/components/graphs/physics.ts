@@ -23,6 +23,52 @@ export interface Pulse {
   speed: number;
 }
 
+export function rgba(color: number[], alpha: number): string {
+  return `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
+}
+
+export function buildAdjacency(edges: GraphEdge[]): Map<string, Set<string>> {
+  const adjacency = new Map<string, Set<string>>();
+  for (const e of edges) {
+    if (!adjacency.has(e.from)) adjacency.set(e.from, new Set());
+    if (!adjacency.has(e.to)) adjacency.set(e.to, new Set());
+    adjacency.get(e.from)!.add(e.to);
+    adjacency.get(e.to)!.add(e.from);
+  }
+  return adjacency;
+}
+
+export function hitTestNode(
+  nodes: readonly Pick<GraphNode, 'id' | 'x' | 'y' | 'radius'>[],
+  mx: number,
+  my: number,
+): string | null {
+  for (const node of nodes) {
+    const dx = mx - node.x;
+    const dy = my - node.y;
+    if (dx * dx + dy * dy < (node.radius + 8) * (node.radius + 8)) {
+      return node.id;
+    }
+  }
+  return null;
+}
+
+export function filterGraphByHidden<
+  N extends { id: string },
+  E extends { from: string; to: string },
+>(
+  graph: { nodes: N[]; edges: E[] },
+  hiddenSet: Set<string>,
+): { nodes: N[]; edges: E[] } {
+  if (hiddenSet.size === 0) return graph;
+  const visibleNodes = graph.nodes.filter((n) => !hiddenSet.has(n.id));
+  const visibleIds = new Set(visibleNodes.map((n) => n.id));
+  const visibleEdges = graph.edges.filter(
+    (e) => visibleIds.has(e.from) && visibleIds.has(e.to),
+  );
+  return { nodes: visibleNodes, edges: visibleEdges };
+}
+
 const SPRING_STRENGTH = 0.0004;
 const SPRING_LENGTH = 120;
 const REPULSION = 800;

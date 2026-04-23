@@ -3,30 +3,7 @@ import { NearlyError } from '../src/errors';
 import type { FetchLike } from '../src/read';
 import type { Agent, CapabilityCount, TagCount } from '../src/types';
 import { aliceProfileBlob } from './fixtures/entries';
-
-interface Call {
-  url: string;
-  init?: RequestInit;
-}
-
-function scripted(handler: (url: string, init?: RequestInit) => Response): {
-  fetch: FetchLike;
-  calls: Call[];
-} {
-  const calls: Call[] = [];
-  const fetch: FetchLike = async (url, init) => {
-    calls.push({ url, init });
-    return handler(url, init);
-  };
-  return { fetch, calls };
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
+import { jsonResponse, scripted } from './fixtures/http';
 
 function profileEntryResponse(agent: Agent): Response {
   return jsonResponse({
@@ -57,23 +34,33 @@ function clientOf(fetch: FetchLike): NearlyClient {
 
 describe('NearlyClient constructor', () => {
   it('requires walletKey', () => {
-    expect(
-      () =>
-        new NearlyClient({
-          walletKey: '',
-          accountId: 'alice.near',
-        }),
-    ).toThrow(/walletKey/);
+    let err: unknown;
+    try {
+      new NearlyClient({ walletKey: '', accountId: 'alice.near' });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(NearlyError);
+    expect((err as NearlyError).shape).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      field: 'walletKey',
+      reason: 'empty walletKey',
+    });
   });
 
   it('requires accountId', () => {
-    expect(
-      () =>
-        new NearlyClient({
-          walletKey: 'wk_x',
-          accountId: '',
-        }),
-    ).toThrow(/accountId/);
+    let err: unknown;
+    try {
+      new NearlyClient({ walletKey: 'wk_x', accountId: '' });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(NearlyError);
+    expect((err as NearlyError).shape).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      field: 'accountId',
+      reason: 'empty accountId',
+    });
   });
 
   it('two instances have independent rate limiters', async () => {
@@ -1323,6 +1310,164 @@ describe('NearlyClient.getEndorsing', () => {
   });
 });
 
+describe('NearlyClient.getEndorsementGraph', () => {
+  it('returns zero degrees when both sides are empty', async () => {
+    const { fetch } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    const graph = await client.getEndorsementGraph('ghost.near');
+    expect(graph.account_id).toBe('ghost.near');
+    expect(graph.incoming).toEqual({});
+    expect(graph.outgoing).toEqual({});
+    expect(graph.degree).toEqual({ incoming: 0, outgoing: 0 });
+  });
+
+  it('counts distinct endorser account_ids across suffixes for degree.incoming', async () => {
+    // bob endorses alice under two suffixes — should count as 1 distinct endorser.
+    const { fetch } = scripted((url, init) => {
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        // getEndorsers: cross-predecessor scan under endorsing/alice.near/
+        if (body.key_prefix === 'endorsing/alice.near/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 101,
+                block_timestamp: 1_700_000_100 * 1e9,
+                key: 'endorsing/alice.near/skills/rust',
+                value: {},
+              },
+              {
+                predecessor_id: 'bob.near',
+                current_account_id: 'contextual.near',
+                block_height: 102,
+                block_timestamp: 1_700_000_200 * 1e9,
+                key: 'endorsing/alice.near/skills/go',
+                value: {},
+              },
+            ],
+          });
+        }
+        // getEndorsing: per-predecessor scan under alice.near's endorsing/
+        if (body.key_prefix === 'endorsing/') {
+          return jsonResponse({ entries: [] });
+        }
+      }
+      // Profile fetch for bob.near
+      if (url.endsWith('/bob.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'bob.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'profile',
+              value: { ...aliceProfileBlob, name: 'Bob' },
+            },
+          ],
+        });
+      }
+      return jsonResponse({ entries: [] });
+    });
+    const client = clientOf(fetch);
+    const graph = await client.getEndorsementGraph('alice.near');
+    // bob appears under both suffixes but counts once.
+    expect(graph.degree.incoming).toBe(1);
+    expect(graph.degree.outgoing).toBe(0);
+  });
+
+  it('counts distinct targets for degree.outgoing', async () => {
+    const { fetch } = scripted((url, init) => {
+      // getEndorsers: cross-predecessor scan — empty
+      if (url.endsWith('/v0/latest/contextual.near')) {
+        return jsonResponse({ entries: [] });
+      }
+      // getEndorsing: per-predecessor scan under alice.near
+      if (url.endsWith('/v0/latest/contextual.near/alice.near')) {
+        const body = JSON.parse(init?.body as string) as {
+          key_prefix?: string;
+        };
+        if (body.key_prefix === 'endorsing/') {
+          return jsonResponse({
+            entries: [
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 1,
+                block_timestamp: 1_700_000_000 * 1e9,
+                key: 'endorsing/bob.near/skills/rust',
+                value: {},
+              },
+              {
+                predecessor_id: 'alice.near',
+                current_account_id: 'contextual.near',
+                block_height: 2,
+                block_timestamp: 1_700_000_100 * 1e9,
+                key: 'endorsing/carol.near/skills/go',
+                value: {},
+              },
+            ],
+          });
+        }
+      }
+      // Profile fetches for targets
+      if (url.endsWith('/bob.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'bob.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'profile',
+              value: { ...aliceProfileBlob, name: 'Bob' },
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/carol.near/profile')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'carol.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'profile',
+              value: { ...aliceProfileBlob, name: 'Carol' },
+            },
+          ],
+        });
+      }
+      return jsonResponse({ entries: [] });
+    });
+    const client = clientOf(fetch);
+    const graph = await client.getEndorsementGraph('alice.near');
+    expect(graph.degree.incoming).toBe(0);
+    expect(graph.degree.outgoing).toBe(2);
+    expect(Object.keys(graph.outgoing).sort()).toEqual([
+      'bob.near',
+      'carol.near',
+    ]);
+  });
+
+  it('incoming and outgoing fields match standalone calls', async () => {
+    const { fetch } = scripted(() => jsonResponse({ entries: [] }));
+    const client = clientOf(fetch);
+    const [endorsers, endorsing, graph] = await Promise.all([
+      client.getEndorsers('x.near'),
+      client.getEndorsing('x.near'),
+      client.getEndorsementGraph('x.near'),
+    ]);
+    expect(graph.incoming).toEqual(endorsers);
+    expect(graph.outgoing).toEqual(endorsing);
+  });
+});
+
 describe('NearlyClient.listTags / listCapabilities', () => {
   it('listTags aggregates existence entries and sorts by count desc', async () => {
     const { fetch } = scripted((url, init) => {
@@ -2075,6 +2220,549 @@ describe('NearlyClient.endorse / unendorse', () => {
     const writeCall = calls.find((c) => c.url.includes('/wallet/v1/call'))!;
     const body = JSON.parse(writeCall.init!.body as string);
     expect(Object.keys(body.args)).toHaveLength(2);
+  });
+});
+
+describe('NearlyClient.followMany', () => {
+  it('empty targets returns empty array', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    expect(await client.followMany([])).toEqual([]);
+  });
+
+  it('single target happy path', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.followMany(['bob.near']);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'followed',
+    });
+  });
+
+  it('self-follow produces per-item error, batch continues', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.followMany(['alice.near', 'bob.near']);
+    expect(results[0]).toMatchObject({
+      account_id: 'alice.near',
+      action: 'error',
+      code: 'SELF_FOLLOW',
+    });
+    expect(results[1]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'followed',
+    });
+  });
+
+  it('already-following appears as per-item result', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/bob.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.followMany(['bob.near']);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'already_following',
+    });
+  });
+
+  it('INSUFFICIENT_BALANCE aborts the batch', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/wallet/v1/call'))
+        return new Response('<html>502 Bad Gateway</html>', {
+          status: 502,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    await expect(client.followMany(['bob.near'])).rejects.toMatchObject({
+      code: 'INSUFFICIENT_BALANCE',
+    });
+  });
+
+  // Pins the unified batch error classification: a NearlyError thrown from
+  // `writeEntries` (other than INSUFFICIENT_BALANCE) surfaces its own code
+  // rather than being flattened to STORAGE_ERROR. Mirrors the endorse/
+  // unendorse contract so callers can distinguish retryable classes.
+  it('non-INSUFFICIENT_BALANCE NearlyError surfaces its own code per-item', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/wallet/v1/call')) throw new Error('ECONNRESET');
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.followMany(['bob.near']);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'error',
+      code: 'NETWORK',
+    });
+  });
+
+  it('over MAX_BATCH_TARGETS throws VALIDATION_ERROR', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    const targets = Array.from({ length: 21 }, (_, i) => `agent${i}.near`);
+    await expect(client.followMany(targets)).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+    });
+  });
+
+  it('mixed results: followed + already_following + self-follow', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/graph/follow/carol.near')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/carol.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.followMany([
+      'alice.near',
+      'bob.near',
+      'carol.near',
+    ]);
+    expect(results[0]).toMatchObject({ action: 'error', code: 'SELF_FOLLOW' });
+    expect(results[1]).toMatchObject({ action: 'followed' });
+    expect(results[2]).toMatchObject({ action: 'already_following' });
+  });
+
+  it('rate-limit exhaustion mid-batch surfaces as a per-item RATE_LIMITED', async () => {
+    // Inject a stateful limiter that allows the first target and rejects
+    // the rest. Pins the "rate limit reached within batch" per-item error
+    // path without depending on real window timing.
+    let allowed = 1;
+    const limiter = {
+      check: () =>
+        allowed > 0
+          ? ({ ok: true } as const)
+          : ({ ok: false, retryAfter: 30 } as const),
+      record: () => {
+        allowed--;
+      },
+    };
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = new NearlyClient({
+      walletKey: 'wk_test',
+      accountId: 'alice.near',
+      fastdataUrl: 'https://kv.example',
+      outlayerUrl: 'https://outlayer.example',
+      namespace: 'contextual.near',
+      fetch,
+      rateLimiter: limiter,
+    });
+    const results = await client.followMany(['bob.near', 'carol.near']);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'followed',
+    });
+    expect(results[1]).toMatchObject({
+      account_id: 'carol.near',
+      action: 'error',
+      code: 'RATE_LIMITED',
+      error: 'rate limit reached within batch',
+    });
+  });
+
+  // Pins the builder-inside-try symmetry with endorseMany: a whitespace
+  // target passes batchTargetError's `!target` check (whitespace is
+  // truthy) but trips buildFollow's `!target.trim()` rejection. The
+  // throw must surface as a per-item VALIDATION_ERROR, not abort the
+  // batch — mirrors the oversize-suffix test in the endorseMany suite.
+  it('whitespace target surfaces as per-item VALIDATION_ERROR, batch continues', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/'))
+        return new Response(null, { status: 404 });
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.followMany(['   ', 'bob.near']);
+    expect(results[0]).toMatchObject({
+      account_id: '   ',
+      action: 'error',
+      code: 'VALIDATION_ERROR',
+    });
+    expect(results[1]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'followed',
+    });
+  });
+});
+
+describe('NearlyClient.unfollowMany', () => {
+  it('empty targets returns empty array', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    expect(await client.unfollowMany([])).toEqual([]);
+  });
+
+  it('unfollows existing edge', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/bob.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.unfollowMany(['bob.near']);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'unfollowed',
+    });
+  });
+
+  it('not_following appears as per-item result', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/bob.near'))
+        return new Response(null, { status: 404 });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.unfollowMany(['bob.near']);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'not_following',
+    });
+  });
+
+  it('self-unfollow produces per-item error', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    const results = await client.unfollowMany(['alice.near']);
+    expect(results[0]).toMatchObject({
+      action: 'error',
+      code: 'SELF_UNFOLLOW',
+    });
+  });
+
+  // Symmetry test: pins try-catch wrap on unfollowMany. Not a reachable
+  // real-world input — buildUnfollow rejects whitespace up front, and
+  // kvGetKey precedes the builder with a null short-circuit, so reaching
+  // the builder-throws branch requires the KV store to hold an edge at a
+  // whitespace key (essentially direct poisoning). See followMany
+  // whitespace test above for the reachable-input bug; this one guards
+  // regressions on the contract symmetry with that path.
+  // Both targets' kvGetKey lookups return an existing edge below so
+  // execution reaches the builder.
+  it('whitespace target surfaces as per-item VALIDATION_ERROR, batch continues', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/graph/follow/')) {
+        return jsonResponse({
+          entries: [
+            {
+              predecessor_id: 'alice.near',
+              current_account_id: 'contextual.near',
+              block_height: 1,
+              block_timestamp: 1,
+              key: 'graph/follow/bob.near',
+              value: {},
+            },
+          ],
+        });
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.unfollowMany(['   ', 'bob.near']);
+    expect(results[0]).toMatchObject({
+      account_id: '   ',
+      action: 'error',
+      code: 'VALIDATION_ERROR',
+    });
+    expect(results[1]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'unfollowed',
+    });
+  });
+});
+
+describe('NearlyClient.endorseMany', () => {
+  it('endorses two targets', async () => {
+    const { fetch } = scripted((url) => {
+      if (
+        url.endsWith('/bob.near/profile') ||
+        url.endsWith('/carol.near/profile')
+      ) {
+        const id = url.includes('bob.near') ? 'bob.near' : 'carol.near';
+        return profileEntryResponse({
+          ...aliceProfileBlob,
+          account_id: id,
+        } as Agent);
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.endorseMany([
+      { account_id: 'bob.near', keySuffixes: ['skills/rust'] },
+      { account_id: 'carol.near', keySuffixes: ['skills/rust'] },
+    ]);
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'endorsed',
+      key_suffixes: ['skills/rust'],
+    });
+    expect(results[1]).toMatchObject({
+      account_id: 'carol.near',
+      action: 'endorsed',
+    });
+  });
+
+  it('NOT_FOUND target produces per-item error, rest continues', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/bob.near/profile'))
+        return new Response(null, { status: 404 });
+      if (url.endsWith('/carol.near/profile')) {
+        return profileEntryResponse({
+          ...aliceProfileBlob,
+          account_id: 'carol.near',
+        } as Agent);
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.endorseMany([
+      { account_id: 'bob.near', keySuffixes: ['skills/rust'] },
+      { account_id: 'carol.near', keySuffixes: ['skills/rust'] },
+    ]);
+    expect(results[0]).toMatchObject({
+      action: 'error',
+      code: 'NOT_FOUND',
+    });
+    expect(results[1]).toMatchObject({
+      action: 'endorsed',
+    });
+  });
+
+  it('self-endorse produces per-item error', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    const results = await client.endorseMany([
+      { account_id: 'alice.near', keySuffixes: ['skills/rust'] },
+    ]);
+    expect(results[0]).toMatchObject({
+      action: 'error',
+      code: 'SELF_ENDORSE',
+    });
+  });
+
+  it('all-invalid key_suffixes throws before loop', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    await expect(
+      client.endorseMany([{ account_id: 'bob.near', keySuffixes: ['/bad'] }]),
+    ).resolves.toMatchObject([{ action: 'error', code: 'VALIDATION_ERROR' }]);
+  });
+
+  it('suffix valid under dummy prefix but over byte limit for long target becomes per-item error', async () => {
+    // endorsing/_/ = 12 bytes. A 1010-byte suffix fits (1022 < 1024).
+    // endorsing/abcdefghijklmnopqrst.near/ = 31 bytes. 31 + 1010 = 1041 > 1024.
+    const longTarget = 'abcdefghijklmnopqrst.near';
+    const longSuffix = 'x'.repeat(1010);
+    const { fetch } = scripted((url) => {
+      if (url.endsWith(`/${longTarget}/profile`)) {
+        return profileEntryResponse({
+          ...aliceProfileBlob,
+          account_id: longTarget,
+        } as Agent);
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.endorseMany([
+      { account_id: longTarget, keySuffixes: [longSuffix] },
+    ]);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      account_id: longTarget,
+      action: 'error',
+      code: 'VALIDATION_ERROR',
+    });
+  });
+
+  it('INSUFFICIENT_BALANCE aborts the batch', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/bob.near/profile')) {
+        return profileEntryResponse({
+          ...aliceProfileBlob,
+          account_id: 'bob.near',
+        } as Agent);
+      }
+      if (url.includes('/wallet/v1/call'))
+        return new Response('<html>502</html>', {
+          status: 502,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    await expect(
+      client.endorseMany([
+        { account_id: 'bob.near', keySuffixes: ['skills/rust'] },
+      ]),
+    ).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
+  });
+
+  // Pins the real-prefix partition: a suffix that would pass validation
+  // against a short placeholder prefix but exceed FASTDATA_MAX_KEY_BYTES
+  // when composed with `endorsing/{target}/` must land in `skipped`, not
+  // blow up the whole target inside buildEndorse's re-validation.
+  it('oversize suffix lands in skipped alongside valid ones', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.endsWith('/bob.near/profile')) {
+        return profileEntryResponse({
+          ...aliceProfileBlob,
+          account_id: 'bob.near',
+        } as Agent);
+      }
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    // 1010-byte suffix: 12 + 1010 = 1022 (under 1024 with placeholder
+    // 'endorsing/_/'), but 19 + 1010 = 1029 (over 1024 with the real
+    // prefix 'endorsing/bob.near/'). Pre-fix this would have thrown
+    // inside buildEndorse, failing the whole target.
+    const oversize = 'a'.repeat(1010);
+    const [result] = await client.endorseMany([
+      { account_id: 'bob.near', keySuffixes: ['tags/rust', oversize] },
+    ]);
+    expect(result).toMatchObject({
+      account_id: 'bob.near',
+      action: 'endorsed',
+      key_suffixes: ['tags/rust'],
+      skipped: [
+        { key_suffix: oversize, reason: expect.stringMatching(/1024-byte/) },
+      ],
+    });
+  });
+});
+
+describe('NearlyClient.unendorseMany', () => {
+  it('unendorses two targets', async () => {
+    const { fetch } = scripted((url) => {
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.unendorseMany([
+      { account_id: 'bob.near', keySuffixes: ['skills/rust'] },
+      { account_id: 'carol.near', keySuffixes: ['skills/rust'] },
+    ]);
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({
+      account_id: 'bob.near',
+      action: 'unendorsed',
+      key_suffixes: ['skills/rust'],
+    });
+    expect(results[1]).toMatchObject({
+      account_id: 'carol.near',
+      action: 'unendorsed',
+    });
+  });
+
+  it('self-unendorse produces per-item error', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    const results = await client.unendorseMany([
+      { account_id: 'alice.near', keySuffixes: ['skills/rust'] },
+    ]);
+    expect(results[0]).toMatchObject({
+      action: 'error',
+      code: 'SELF_UNENDORSE',
+    });
+  });
+
+  it('all-invalid key_suffixes throws before loop', async () => {
+    const { fetch } = scripted(() => jsonResponse({}));
+    const client = clientOf(fetch);
+    await expect(
+      client.unendorseMany([{ account_id: 'bob.near', keySuffixes: ['/bad'] }]),
+    ).resolves.toMatchObject([{ action: 'error', code: 'VALIDATION_ERROR' }]);
+  });
+
+  it('suffix valid under dummy prefix but over byte limit for long target becomes per-item error', async () => {
+    const longTarget = 'abcdefghijklmnopqrst.near';
+    const longSuffix = 'x'.repeat(1010);
+    const { fetch } = scripted((url) => {
+      if (url.includes('/wallet/v1/call')) return jsonResponse({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = clientOf(fetch);
+    const results = await client.unendorseMany([
+      { account_id: longTarget, keySuffixes: [longSuffix] },
+    ]);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      account_id: longTarget,
+      action: 'error',
+      code: 'VALIDATION_ERROR',
+    });
   });
 });
 

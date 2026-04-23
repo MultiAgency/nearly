@@ -49,14 +49,21 @@ const RECIPIENT = 'nearly.social';
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
+  const opts = { strict: false };
   for (const arg of argv) {
     if (arg === '-h' || arg === '--help') {
       console.log(
-        'Usage: node scripts/stress-sign.mjs\n' +
+        'Usage: node scripts/stress-sign.mjs [--strict]\n' +
+          '\n' +
+          'Flags:\n' +
+          '  --strict              abort on first preflight failure (default: soft-fail,\n' +
+          '                        drop the bad caller and continue)\n' +
           '\n' +
           'Env:\n' +
           `  DURATION_SECONDS      wall-clock budget (default: ${DEFAULT_DURATION_SECONDS})\n` +
-          `  CONCURRENCY           max in-flight requests (default: ${DEFAULT_CONCURRENCY})\n` +
+          `  CONCURRENCY           max in-flight requests (default: ${DEFAULT_CONCURRENCY};\n` +
+          '                        auto-raised to min(poolSize, 50) when OUTLAYER_WALLET_KEYS\n' +
+          '                        is set and below pool size, so every key gets exercised)\n' +
           `  OUTLAYER_API          base URL (default: ${DEFAULT_OUTLAYER_API})\n` +
           '  OUTLAYER_TEST_WALLET_KEY   single caller wk_ (shell env or frontend/.env fallback)\n' +
           '  OUTLAYER_WALLET_KEYS  comma-separated wk_ pool for cross-caller shape\n' +
@@ -64,8 +71,11 @@ function parseArgs(argv) {
           'No writes. No wallets minted. Pure load on OutLayer sign-message.\n',
       );
       process.exit(0);
+    } else if (arg === '--strict') {
+      opts.strict = true;
     }
   }
+  return opts;
 }
 
 function parsePositiveInt(name, raw, fallback) {
@@ -233,14 +243,14 @@ function formatMs(v) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  parseArgs(process.argv.slice(2));
+  const opts = parseArgs(process.argv.slice(2));
 
   const durationSeconds = parsePositiveInt(
     'DURATION_SECONDS',
     process.env.DURATION_SECONDS,
     DEFAULT_DURATION_SECONDS,
   );
-  const concurrency = parsePositiveInt(
+  let concurrency = parsePositiveInt(
     'CONCURRENCY',
     process.env.CONCURRENCY,
     DEFAULT_CONCURRENCY,
@@ -257,9 +267,11 @@ async function main() {
   }
 
   // Preflight: resolve account_id for every caller before spraying
-  // sign-message. Fails fast on any bad auth or unreachable base — a
-  // misconfigured key should not silently drop from the pool.
+  // sign-message. Default is soft-fail — drop the bad caller and continue
+  // with the rest, so one 429 doesn't kill a 38-key run. `--strict` keeps
+  // the old fail-fast behavior for config validation.
   const callers = [];
+  const droppedCallers = [];
   for (let i = 0; i < walletKeys.length; i++) {
     try {
       const accountId = await resolveAccountId(base, walletKeys[i]);
@@ -273,10 +285,38 @@ async function main() {
         errorBuckets: {},
       });
     } catch (err) {
+      if (opts.strict) {
+        console.error(
+          `stress-sign: preflight failed for caller #${i + 1} — ${err.message}`,
+        );
+        process.exit(1);
+      }
+      droppedCallers.push({ index: i + 1, reason: err.message });
       console.error(
-        `stress-sign: preflight failed for caller #${i + 1} — ${err.message}`,
+        `stress-sign: preflight dropped caller #${i + 1} — ${err.message}`,
       );
-      process.exit(1);
+    }
+  }
+  if (callers.length === 0) {
+    console.error(
+      `stress-sign: all ${walletKeys.length} callers failed preflight; cannot run`,
+    );
+    process.exit(1);
+  }
+
+  // Auto-raise concurrency when a pool is provided and the configured value
+  // is below pool size — otherwise the round-robin assignment silently
+  // leaves high-index callers untouched. Cap at 50 so a huge pool doesn't
+  // unintentionally saturate the endpoint.
+  const CONCURRENCY_CAP = 50;
+  let concurrencyNote = null;
+  if (process.env.OUTLAYER_WALLET_KEYS && concurrency < callers.length) {
+    const raised = Math.min(callers.length, CONCURRENCY_CAP);
+    if (raised > concurrency) {
+      concurrencyNote =
+        `auto-raised from ${concurrency} to exercise ${callers.length}-key pool` +
+        (raised < callers.length ? ` (capped at ${CONCURRENCY_CAP})` : '');
+      concurrency = raised;
     }
   }
 
@@ -285,13 +325,20 @@ async function main() {
   if (callers.length === 1) {
     console.log(`${DIM}caller:${RESET}      ${callers[0].accountId}`);
   } else {
-    console.log(`${DIM}callers:${RESET}     ${callers.length}`);
+    const droppedSuffix =
+      droppedCallers.length > 0
+        ? `${DIM} (${droppedCallers.length} dropped)${RESET}`
+        : '';
+    console.log(`${DIM}callers:${RESET}     ${callers.length}${droppedSuffix}`);
     callers.forEach((c, i) => {
       console.log(`  ${DIM}#${i + 1}:${RESET}        ${c.accountId}`);
     });
   }
   console.log(`${DIM}duration:${RESET}    ${durationSeconds}s`);
-  console.log(`${DIM}concurrency:${RESET} ${concurrency}`);
+  const concurrencySuffix = concurrencyNote
+    ? `${DIM} (${concurrencyNote})${RESET}`
+    : '';
+  console.log(`${DIM}concurrency:${RESET} ${concurrency}${concurrencySuffix}`);
   console.log('');
   console.log(
     `${DIM}No writes. Pure load on OutLayer sign-message. Ctrl-C to abort.${RESET}`,
@@ -348,15 +395,18 @@ async function main() {
   console.log(`  p99:       ${formatMs(percentile(sorted, 99))}`);
 
   // ── Per-caller breakdown (only when the pool has >1 caller) ────────────
+  // Skip callers that never fired a request — printing `total=0 ok=0` rows
+  // reads like a failure and is noise, especially when CONCURRENCY is
+  // below pool size.
   if (callers.length > 1) {
     console.log('');
     console.log(`${BOLD}per-caller${RESET}`);
     callers.forEach((c, i) => {
+      if (c.totals === 0) return;
       const callerSorted = c.successLatencies.slice().sort((a, b) => a - b);
       const callerThroughput = c.successes / elapsedSeconds;
       const p50 = formatMs(percentile(callerSorted, 50));
-      const successRate =
-        c.totals > 0 ? ((c.successes / c.totals) * 100).toFixed(1) : '—';
+      const successRate = ((c.successes / c.totals) * 100).toFixed(1);
       const errorSummary =
         Object.keys(c.errorBuckets).length === 0
           ? ''

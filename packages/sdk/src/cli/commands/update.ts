@@ -1,8 +1,34 @@
+import { validationError } from '../../errors';
+import { extractCapabilityPairs } from '../../graph';
 import type { UpdateMePatch } from '../../social';
-import { flagString, type ParsedArgv } from '../argv';
+import type { AgentCapabilities } from '../../types';
+import { flagString, type ParsedArgv, toArray } from '../argv';
 import { buildClient } from '../client-factory';
 import { renderKeyValue, renderOutput } from '../format';
 import type { CliStreams } from '../streams';
+
+function parseCaps(raw: string[]): AgentCapabilities {
+  const caps: Record<string, string[]> = {};
+  for (const pair of raw) {
+    const slash = pair.indexOf('/');
+    if (slash <= 0 || slash === pair.length - 1) {
+      throw validationError(
+        'cap',
+        `invalid capability "${pair}" — expected ns/value (e.g. skills/audit)`,
+      );
+    }
+    const ns = pair.slice(0, slash);
+    const val = pair.slice(slash + 1);
+    if (!caps[ns]) caps[ns] = [];
+    caps[ns].push(val);
+  }
+  return caps;
+}
+
+function formatCaps(caps: AgentCapabilities): string {
+  const pairs = extractCapabilityPairs(caps);
+  return pairs.map(([ns, val]) => `${ns}/${val}`).join(', ') || '-';
+}
 
 export async function update(
   parsed: ParsedArgv,
@@ -24,6 +50,12 @@ export async function update(
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
   }
+  const capFlags = toArray(parsed.flags.cap);
+  if (capFlags.length === 1 && capFlags[0] === 'none') {
+    patch.capabilities = {};
+  } else if (capFlags.length > 0) {
+    patch.capabilities = parseCaps(capFlags);
+  }
 
   const { agent } = await client.updateMe(patch);
 
@@ -36,6 +68,7 @@ export async function update(
         ['name', agent.name ?? '-'],
         ['description', agent.description || '-'],
         ['tags', (agent.tags ?? []).join(', ') || '-'],
+        ['capabilities', formatCaps(agent.capabilities)],
       ]),
     streams,
   );

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 const navLinks = [
   { href: '/agents', label: 'Agents' },
+  { href: '/explore', label: 'Explore' },
   { href: '/skill.md', label: 'Docs' },
 ];
 

@@ -27,8 +27,8 @@
 //   - Revisit when market.near.ai adds a real verification consumer (see
 //     memory: project_market_verifiable_claim.md)
 
-import { NextResponse } from 'next/server';
-import { errJson } from '@/lib/api-response';
+import type { NextResponse } from 'next/server';
+import { errJson, successJson } from '@/lib/api-response';
 import { MARKET_API_URL, OUTLAYER_API_URL } from '@/lib/constants';
 import { fetchWithTimeout } from '@/lib/fetch';
 import { resolveAccountId, signClaimForWalletKey } from '@/lib/outlayer-server';
@@ -411,9 +411,9 @@ export async function handleRegisterPlatforms(
     requestedIds,
   );
 
-  return NextResponse.json({
-    success: true,
-    data: { platforms },
-    ...(warnings.length > 0 ? { warnings } : {}),
-  });
+  if (warnings.length > 0) {
+    console.warn(`[platforms] ${warnings.join('; ')}`);
+  }
+
+  return successJson({ platforms });
 }

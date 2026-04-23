@@ -141,27 +141,42 @@ function writeFailureToResult(
     : fail('STORAGE_ERROR', 'Failed to write to FastData', 500);
 }
 
+// Batch-item errors live alongside successful result rows in a batch's
+// `results[]` array — a different shape from top-level `WriteResult`
+// failures, which become the response itself. `code` is deliberately a
+// plain string (not a narrowed union): the batch-result code namespace
+// is distinct from `NearlyErrorShape.code` in the SDK, and values like
+// `SELF_FOLLOW` / `RATE_LIMITED` appear only here.
+type BatchItemError = {
+  account_id: string;
+  action: 'error';
+  code: string;
+  error: string;
+};
+
+function batchItemError(
+  accountId: string,
+  code: string,
+  error: string,
+): BatchItemError {
+  return { account_id: accountId, action: 'error', code, error };
+}
+
 function targetGuardError(
   targetAccountId: string,
   callerAccountId: string,
   selfCode: string,
   verb: string,
-): Record<string, unknown> | null {
+): BatchItemError | null {
   if (!targetAccountId.trim()) {
-    return {
-      account_id: targetAccountId,
-      action: 'error',
-      code: 'VALIDATION_ERROR',
-      error: 'empty account_id',
-    };
+    return batchItemError(
+      targetAccountId,
+      'VALIDATION_ERROR',
+      'empty account_id',
+    );
   }
   if (targetAccountId === callerAccountId) {
-    return {
-      account_id: targetAccountId,
-      action: 'error',
-      code: selfCode,
-      error: `cannot ${verb} yourself`,
-    };
+    return batchItemError(targetAccountId, selfCode, `cannot ${verb} yourself`);
   }
   return null;
 }
@@ -174,8 +189,10 @@ export type WriteOutcome =
   | { ok: true }
   | { ok: false; reason: 'insufficient_balance' | 'storage_error' };
 
-// Fail-closed on ambiguity: HTTP failures and malformed bodies return
-// false so an upstream outage is never misclassified as a drained wallet.
+// Best-effort probe for `writeToFastData`'s 502 branch. Silent on error
+// and fail-closed (returns false) so an upstream outage is never
+// misclassified as a drained wallet — the caller logs and falls back
+// to STORAGE_ERROR.
 async function hasZeroNearBalance(walletKey: string): Promise<boolean> {
   try {
     const res = await fetchWithTimeout(
@@ -184,7 +201,10 @@ async function hasZeroNearBalance(walletKey: string): Promise<boolean> {
       BALANCE_CHECK_TIMEOUT_MS,
     );
     if (!res.ok) return false;
-    const data = (await res.json().catch(() => null)) as {
+    const data = (await res.json().catch((e: unknown) => {
+      console.error('[isUnfundedWallet] json parse failed', e);
+      return null;
+    })) as {
       balance?: string;
     } | null;
     return data?.balance === '0';
@@ -219,9 +239,7 @@ export async function writeToFastData(
     );
     if (res.ok) return { ok: true };
     const detail = await res.text().catch(() => '');
-    console.error(
-      `[fastdata-write] http ${res.status}: ${detail.slice(0, 200)}`,
-    );
+    console.error(`[fastdata-write] http ${res.status}: ${detail}`);
     // Zero-balance writes return 502 + text/plain (Cloudflare upstream),
     // so probe the balance endpoint to disambiguate a genuine outage from
     // an unfunded wallet — a funded wallet hitting a real outage must
@@ -279,7 +297,31 @@ async function resolveCallerOrInit(
 // Batch scaffolding shared by follow/unfollow/endorse/unendorse
 // ---------------------------------------------------------------------------
 
-const MAX_BATCH_SIZE = 20;
+// Reject non-string `targets[]` items at the boundary — a numeric item
+// would crash downstream handlers on `.trim()`. Empty/max-size gating
+// lives here too so `runBatch` can assume pre-validated input.
+function resolveTargets(body: Record<string, unknown>): string[] | WriteResult {
+  if (Array.isArray(body.targets)) {
+    if (body.targets.length === 0)
+      return fail('VALIDATION_ERROR', 'targets array must not be empty');
+    if (body.targets.length > LIMITS.MAX_BATCH_TARGETS)
+      return fail(
+        'VALIDATION_ERROR',
+        `Too many targets (max ${LIMITS.MAX_BATCH_TARGETS})`,
+      );
+    for (const t of body.targets) {
+      if (typeof t !== 'string') {
+        return fail('VALIDATION_ERROR', 'targets[] items must be strings');
+      }
+    }
+    return body.targets as string[];
+  }
+  const accountId = body.account_id;
+  if (typeof accountId !== 'string' || !accountId) {
+    return fail('VALIDATION_ERROR', 'account_id is required');
+  }
+  return [accountId];
+}
 
 type BatchAction =
   | 'social.follow'
@@ -301,7 +343,7 @@ interface BatchOptions {
   selfCode: string;
   verb: string;
   walletKey: string;
-  body: Record<string, unknown>;
+  targets: readonly string[];
   resolveAccountId: (wk: string) => Promise<string | null>;
   step: (target: string, caller: CallerIdentity) => Promise<BatchStep>;
   finalize?: (
@@ -315,12 +357,7 @@ interface BatchOptions {
 // subsequent target would succeed with an underfunded wallet, and the
 // caller needs the fund link, not N misleading STORAGE_ERROR items.
 async function runBatch(opts: BatchOptions): Promise<WriteResult> {
-  const targets = resolveTargets(opts.body);
-  if (!Array.isArray(targets)) return targets;
-  if (targets.length === 0)
-    return fail('VALIDATION_ERROR', 'Targets array must not be empty');
-  if (targets.length > MAX_BATCH_SIZE)
-    return fail('VALIDATION_ERROR', `Too many targets (max ${MAX_BATCH_SIZE})`);
+  const { targets } = opts;
 
   const caller = await resolveCallerOrInit(
     opts.walletKey,
@@ -353,12 +390,13 @@ async function runBatch(opts: BatchOptions): Promise<WriteResult> {
     }
 
     if (processed >= budget.remaining) {
-      results.push({
-        account_id: target,
-        action: 'error',
-        code: 'RATE_LIMITED',
-        error: 'rate limit reached within batch',
-      });
+      results.push(
+        batchItemError(
+          target,
+          'RATE_LIMITED',
+          'rate limit reached within batch',
+        ),
+      );
       continue;
     }
 
@@ -402,12 +440,15 @@ export async function handleFollow(
     if (e) return validationFail(e);
   }
 
+  const targets = resolveTargets(body);
+  if (!Array.isArray(targets)) return targets;
+
   return runBatch({
     action: 'social.follow',
     selfCode: 'SELF_FOLLOW',
     verb: 'follow',
     walletKey,
-    body,
+    targets,
     resolveAccountId,
     step: async (target, caller) => {
       const followKey = composeKey('graph/follow/', target);
@@ -459,12 +500,15 @@ export async function handleUnfollow(
   body: Record<string, unknown>,
   resolveAccountId: (wk: string) => Promise<string | null>,
 ): Promise<WriteResult> {
+  const targets = resolveTargets(body);
+  if (!Array.isArray(targets)) return targets;
+
   return runBatch({
     action: 'social.unfollow',
     selfCode: 'SELF_UNFOLLOW',
     verb: 'unfollow',
     walletKey,
-    body,
+    targets,
     resolveAccountId,
     // No target-exists check — you can remove an edge to a deleted account.
     step: async (target, caller) => {
@@ -501,9 +545,8 @@ export async function handleUnfollow(
 // ---------------------------------------------------------------------------
 
 function resolveKeySuffixes(
-  body: Record<string, unknown>,
+  raw: unknown,
 ): { keySuffixes: string[] } | WriteResult {
-  const raw = body.key_suffixes;
   if (!Array.isArray(raw) || raw.length === 0)
     return fail('VALIDATION_ERROR', 'key_suffixes array must not be empty');
   if (raw.length > LIMITS.MAX_KEY_SUFFIXES)
@@ -526,31 +569,188 @@ function resolveKeySuffixes(
   return { keySuffixes };
 }
 
-export async function handleEndorse(
-  walletKey: string,
-  body: Record<string, unknown>,
-  resolveAccountId: (wk: string) => Promise<string | null>,
-): Promise<WriteResult> {
-  const keySuffixesResult = resolveKeySuffixes(body);
-  if ('success' in keySuffixesResult) return keySuffixesResult;
-  const { keySuffixes } = keySuffixesResult;
+/** Per-target options for batch endorse/unendorse. Fields are `readonly`
+ *  so the record is safe to share across map entries (see the lazy
+ *  `flatResolved` cache in `resolveEndorseTargets`'s legacy branch). */
+interface EndorseTargetOpts {
+  readonly keySuffixes: readonly string[];
+  readonly reason?: string;
+  readonly contentHash?: string;
+}
 
+/**
+ * Parse the endorse/unendorse request body into a per-target map.
+ *
+ * Accepts three formats:
+ * 1. Per-target (new): `{ targets: [{ account_id, key_suffixes, reason?, content_hash? }] }`
+ * 2. Legacy batch: `{ targets: [account_id, ...], key_suffixes, reason?, content_hash? }` — shared body-level opts.
+ * 3. Single-target (path-param): `{ account_id, key_suffixes, reason?, content_hash? }`
+ *
+ * Returns a Map keyed by account_id and a plain string[] of target ids
+ * suitable for runBatch.
+ */
+function resolveEndorseTargets(body: Record<string, unknown>):
+  | {
+      targetIds: string[];
+      opts: Map<string, EndorseTargetOpts>;
+      usedFlatForm: boolean;
+    }
+  | WriteResult {
+  const opts = new Map<string, EndorseTargetOpts>();
+  let usedFlatForm = false;
+
+  if (Array.isArray(body.targets)) {
+    const targets = body.targets;
+    if (targets.length === 0)
+      return fail('VALIDATION_ERROR', 'targets array must not be empty');
+    if (targets.length > LIMITS.MAX_BATCH_TARGETS)
+      return fail(
+        'VALIDATION_ERROR',
+        `Too many targets (max ${LIMITS.MAX_BATCH_TARGETS})`,
+      );
+
+    const targetIds: string[] = [];
+    // Body-level key_suffixes / reason / content_hash are constant across
+    // flat-string entries. Resolve once on first encounter and reuse;
+    // can't hoist unconditionally since pure object-form calls don't
+    // carry these body-level fields.
+    let flatResolved: EndorseTargetOpts | null = null;
+    for (const t of targets) {
+      if (typeof t === 'string') {
+        // Legacy string[] format — read key_suffixes from body root.
+        // Deprecated per openapi.json / skill.md; handlers emit a one-shot
+        // `[endorse] deprecated flat-string targets form` warn keyed to
+        // caller.accountId when this branch is taken.
+        usedFlatForm = true;
+        if (!flatResolved) {
+          const ksResult = resolveKeySuffixes(body.key_suffixes);
+          if ('success' in ksResult) return ksResult;
+          const reason = body.reason as string | undefined;
+          if (reason != null) {
+            const e = validateReason(reason);
+            if (e) return validationFail(e);
+          }
+          flatResolved = {
+            keySuffixes: ksResult.keySuffixes,
+            reason,
+            contentHash: body.content_hash as string | undefined,
+          };
+        }
+        opts.set(t, flatResolved);
+        targetIds.push(t);
+      } else if (
+        t &&
+        typeof t === 'object' &&
+        typeof t.account_id === 'string'
+      ) {
+        const accountId = t.account_id as string;
+        const ksResult = resolveKeySuffixes(t.key_suffixes);
+        if ('success' in ksResult) return ksResult;
+        const reason = t.reason as string | undefined;
+        if (reason != null) {
+          const e = validateReason(reason);
+          if (e) return validationFail(e);
+        }
+        opts.set(accountId, {
+          keySuffixes: ksResult.keySuffixes,
+          reason,
+          contentHash: t.content_hash as string | undefined,
+        });
+        targetIds.push(accountId);
+      } else {
+        return fail(
+          'VALIDATION_ERROR',
+          'targets[] items must be strings or { account_id, key_suffixes } objects',
+        );
+      }
+    }
+    return { targetIds, opts, usedFlatForm };
+  }
+
+  // Single-target path-param form
+  const accountId = body.account_id;
+  if (typeof accountId !== 'string' || !accountId)
+    return fail('VALIDATION_ERROR', 'account_id is required');
+  const ksResult = resolveKeySuffixes(body.key_suffixes);
+  if ('success' in ksResult) return ksResult;
   const reason = body.reason as string | undefined;
   if (reason != null) {
     const e = validateReason(reason);
     if (e) return validationFail(e);
   }
-  const contentHash = body.content_hash as string | undefined;
+  opts.set(accountId, {
+    keySuffixes: ksResult.keySuffixes,
+    reason,
+    contentHash: body.content_hash as string | undefined,
+  });
+  return { targetIds: [accountId], opts, usedFlatForm };
+}
+
+type EndorseKeySuffixPartition =
+  | {
+      kind: 'ok';
+      keyPrefix: string;
+      validKeySuffixes: string[];
+      skipped: { key_suffix: string; reason: string }[];
+    }
+  | { kind: 'fail'; result: Record<string, unknown> };
+
+function partitionEndorseKeySuffixes(
+  target: string,
+  keySuffixes: readonly string[],
+): EndorseKeySuffixPartition {
+  const keyPrefix = endorsePrefix(target);
+  const validKeySuffixes: string[] = [];
+  const skipped: { key_suffix: string; reason: string }[] = [];
+  for (const ks of keySuffixes) {
+    const e = validateKeySuffix(ks, keyPrefix);
+    if (e) skipped.push({ key_suffix: ks, reason: e.message });
+    else validKeySuffixes.push(ks);
+  }
+
+  if (validKeySuffixes.length === 0) {
+    return {
+      kind: 'fail',
+      result: {
+        account_id: target,
+        action: 'error',
+        code: 'VALIDATION_ERROR',
+        error: 'no valid key_suffixes',
+        ...(skipped.length > 0 && { skipped }),
+      },
+    };
+  }
+
+  return { kind: 'ok', keyPrefix, validKeySuffixes, skipped };
+}
+
+export async function handleEndorse(
+  walletKey: string,
+  body: Record<string, unknown>,
+  resolveAccountId: (wk: string) => Promise<string | null>,
+): Promise<WriteResult> {
+  const resolved = resolveEndorseTargets(body);
+  if ('success' in resolved) return resolved;
+  const { targetIds, opts: targetOpts, usedFlatForm } = resolved;
+  let warnedLegacy = false;
 
   return runBatch({
     action: 'social.endorse',
     selfCode: 'SELF_ENDORSE',
     verb: 'endorse',
     walletKey,
-    body,
+    targets: targetIds,
     resolveAccountId,
     // Rate-limit unit: one per target regardless of key_suffixes count.
     step: async (target, caller) => {
+      if (usedFlatForm && !warnedLegacy) {
+        console.warn('[endorse] deprecated flat-string targets form', {
+          caller_account_id: caller.accountId,
+        });
+        warnedLegacy = true;
+      }
+      const tOpts = targetOpts.get(target)!;
+
       if ((await fetchProfile(target)) == null) {
         return {
           kind: 'fail',
@@ -563,27 +763,9 @@ export async function handleEndorse(
         };
       }
 
-      const keyPrefix = endorsePrefix(target);
-      const validKeySuffixes: string[] = [];
-      const skipped: { key_suffix: string; reason: string }[] = [];
-      for (const ks of keySuffixes) {
-        const e = validateKeySuffix(ks, keyPrefix);
-        if (e) skipped.push({ key_suffix: ks, reason: e.message });
-        else validKeySuffixes.push(ks);
-      }
-
-      if (validKeySuffixes.length === 0) {
-        return {
-          kind: 'fail',
-          result: {
-            account_id: target,
-            action: 'error',
-            code: 'VALIDATION_ERROR',
-            error: 'no valid key_suffixes',
-            ...(skipped.length > 0 && { skipped }),
-          },
-        };
-      }
+      const partition = partitionEndorseKeySuffixes(target, tOpts.keySuffixes);
+      if (partition.kind === 'fail') return partition;
+      const { keyPrefix, validKeySuffixes, skipped } = partition;
 
       const fullKeys = validKeySuffixes.map((ks) => composeKey(keyPrefix, ks));
       const existingEntries = await kvMultiAgent(
@@ -603,8 +785,8 @@ export async function handleEndorse(
           | null
           | undefined;
         const existingHash = existing?.content_hash;
-        const sameHash = contentHash
-          ? existingHash === contentHash
+        const sameHash = tOpts.contentHash
+          ? existingHash === tOpts.contentHash
           : existingHash == null;
         if (existing && sameHash) {
           alreadyEndorsed.push(ks);
@@ -618,8 +800,10 @@ export async function handleEndorse(
         suffixesToWrite.length > 0
           ? buildEndorse(caller.accountId, target, {
               keySuffixes: suffixesToWrite,
-              ...(reason != null && { reason }),
-              ...(contentHash != null && { contentHash }),
+              ...(tOpts.reason != null && { reason: tOpts.reason }),
+              ...(tOpts.contentHash != null && {
+                contentHash: tOpts.contentHash,
+              }),
             }).entries
           : {};
 
@@ -648,46 +832,36 @@ export async function handleUnendorse(
   body: Record<string, unknown>,
   resolveAccountId: (wk: string) => Promise<string | null>,
 ): Promise<WriteResult> {
-  const keySuffixesResult = resolveKeySuffixes(body);
-  if ('success' in keySuffixesResult) return keySuffixesResult;
-  const { keySuffixes } = keySuffixesResult;
+  const resolved = resolveEndorseTargets(body);
+  if ('success' in resolved) return resolved;
+  const { targetIds, opts: targetOpts, usedFlatForm } = resolved;
+  let warnedLegacy = false;
 
   return runBatch({
     action: 'social.unendorse',
     selfCode: 'SELF_UNENDORSE',
     verb: 'unendorse',
     walletKey,
-    body,
+    targets: targetIds,
     resolveAccountId,
     step: async (target, caller) => {
+      if (usedFlatForm && !warnedLegacy) {
+        console.warn('[unendorse] deprecated flat-string targets form', {
+          caller_account_id: caller.accountId,
+        });
+        warnedLegacy = true;
+      }
+      const tOpts = targetOpts.get(target)!;
+
       // Read only the caller's own keys — gating on the target's
       // current profile would break retraction after the target mutated,
       // and scanning every endorsement on this target is the high-fanout
       // cliff. Validation rules mirror endorse so a retract can't land
-      // on a key the endorse path would reject; partition into valid /
-      // skipped for per-suffix caller feedback. No "retract everything"
+      // on a key the endorse path would reject. No "retract everything"
       // path — callers compose the key_suffix list themselves.
-      const keyPrefix = endorsePrefix(target);
-      const validKeySuffixes: string[] = [];
-      const skipped: { key_suffix: string; reason: string }[] = [];
-      for (const ks of keySuffixes) {
-        const e = validateKeySuffix(ks, keyPrefix);
-        if (e) skipped.push({ key_suffix: ks, reason: e.message });
-        else validKeySuffixes.push(ks);
-      }
-
-      if (validKeySuffixes.length === 0) {
-        return {
-          kind: 'fail',
-          result: {
-            account_id: target,
-            action: 'error',
-            code: 'VALIDATION_ERROR',
-            error: 'no valid key_suffixes',
-            ...(skipped.length > 0 && { skipped }),
-          },
-        };
-      }
+      const partition = partitionEndorseKeySuffixes(target, tOpts.keySuffixes);
+      if (partition.kind === 'fail') return partition;
+      const { keyPrefix, validKeySuffixes, skipped } = partition;
 
       const fullKeys = validKeySuffixes.map((ks) => composeKey(keyPrefix, ks));
       const existingEntries = await kvMultiAgent(
@@ -1006,24 +1180,6 @@ export function invalidatesFor(action: string): readonly string[] | null {
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
-
-// Reject non-string `targets[]` items at the boundary — a numeric item
-// would crash downstream handlers on `.trim()`.
-function resolveTargets(body: Record<string, unknown>): string[] | WriteResult {
-  if (Array.isArray(body.targets)) {
-    for (const t of body.targets) {
-      if (typeof t !== 'string') {
-        return fail('VALIDATION_ERROR', 'targets[] items must be strings');
-      }
-    }
-    return body.targets as string[];
-  }
-  const accountId = body.account_id;
-  if (typeof accountId !== 'string' || !accountId) {
-    return fail('VALIDATION_ERROR', 'account_id is required');
-  }
-  return [accountId];
-}
 
 export async function dispatchWrite(
   action: string,

@@ -90,6 +90,8 @@ export interface SuggestedAgent extends Agent {
 export interface GetSuggestedResponse {
   agents: SuggestedAgent[];
   vrf: VrfProof | null;
+  /** When `vrf` is null, the error that prevented the VRF seed fetch. */
+  vrfError?: { code: string; message: string };
 }
 
 /**
@@ -150,6 +152,18 @@ export interface EndorsementEdge {
 export interface EndorsingTargetGroup {
   target: AgentSummary;
   entries: EndorsementEdge[];
+}
+
+/**
+ * Full 1-hop endorsement snapshot for a single account: both incoming
+ * endorsers and outgoing endorsements, plus degree counts. Returned by
+ * `NearlyClient.getEndorsementGraph`.
+ */
+export interface EndorsementGraphSnapshot {
+  account_id: string;
+  incoming: Record<string, EndorserEntry[]>;
+  outgoing: Record<string, EndorsingTargetGroup>;
+  degree: { incoming: number; outgoing: number };
 }
 
 export interface TagCount {

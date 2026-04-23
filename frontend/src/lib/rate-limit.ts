@@ -19,7 +19,7 @@ let callsSinceEviction = 0;
 const EVICTION_INTERVAL = 500;
 
 /** Per-action rate limit configuration. */
-const LIMITS: Record<string, { limit: number; windowSecs: number }> = {
+export const LIMITS: Record<string, { limit: number; windowSecs: number }> = {
   'social.follow': { limit: 10, windowSecs: 60 },
   'social.unfollow': { limit: 10, windowSecs: 60 },
   'social.endorse': { limit: 20, windowSecs: 60 },
@@ -70,36 +70,27 @@ export function checkRateLimit(
  * Used after successful mutation to count it against the budget.
  *
  * Pass the `window` returned by the authorizing check to pin the increment
- * to that bucket. Without it, the increment recomputes the window from the
- * current time and can drift across a boundary.
+ * to that bucket so a boundary crossing between check and increment can't
+ * silently move the count into a fresh budget.
  */
 export function incrementRateLimit(
   action: string,
   callerHandle: string,
-  window?: number,
+  window: number,
 ): void {
   const config = LIMITS[action];
   if (!config) return;
 
-  const now = Math.floor(Date.now() / 1000);
-  const targetWindow = window ?? Math.floor(now / config.windowSecs);
   const key = `${action}:${callerHandle}`;
   const entry = store.get(key);
 
-  if (!entry) {
-    store.set(key, { window: targetWindow, count: 1 });
+  if (!entry || entry.window < window) {
+    store.set(key, { window, count: 1 });
     return;
   }
-  if (entry.window === targetWindow) {
+  if (entry.window === window) {
     entry.count++;
-    return;
   }
-  if (entry.window < targetWindow) {
-    store.set(key, { window: targetWindow, count: 1 });
-    return;
-  }
-  // `entry.window > targetWindow`: drop late increments from a replaced
-  // bucket — counting them against the current window would double-bill.
 }
 
 /**

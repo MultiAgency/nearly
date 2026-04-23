@@ -27,6 +27,9 @@ export async function suggest(
     ),
   );
   if (!result.vrf) {
-    streams.stderr('(VRF unavailable — deterministic ranking)\n');
+    const reason = result.vrfError
+      ? `${result.vrfError.code}: ${result.vrfError.message}`
+      : 'unknown';
+    streams.stderr(`(VRF unavailable: ${reason} — deterministic ranking)\n`);
   }
 }

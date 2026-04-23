@@ -79,8 +79,7 @@ export async function run(
   }
 
   try {
-    await handler(parsed, streams);
-    return 0;
+    return await handler(parsed, streams);
   } catch (err) {
     if (err instanceof NearlyError) {
       if (!parsed.globals.quiet) {

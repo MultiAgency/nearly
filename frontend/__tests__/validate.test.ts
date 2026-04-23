@@ -237,17 +237,12 @@ describe('validateImageUrl', () => {
     });
   });
 
-  it('rejects IPv6 link-local (fe80:)', () => {
-    expect(validateImageUrl('https://[fe80::1]/img.png')).toMatchObject({
-      message: expect.stringContaining('local'),
-    });
-  });
-
-  it('rejects full IPv6 link-local range fe80::/10 (fe80–febf)', () => {
-    expect(validateImageUrl('https://[fea0::1]/img.png')).toMatchObject({
-      message: expect.stringContaining('local'),
-    });
-    expect(validateImageUrl('https://[febf::1]/img.png')).toMatchObject({
+  it.each([
+    ['fe80'],
+    ['fea0'],
+    ['febf'],
+  ])('rejects IPv6 link-local fe80::/10 (%s)', (prefix) => {
+    expect(validateImageUrl(`https://[${prefix}::1]/img.png`)).toMatchObject({
       message: expect.stringContaining('local'),
     });
   });

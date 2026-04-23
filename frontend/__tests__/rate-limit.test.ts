@@ -2,7 +2,14 @@ import {
   checkRateLimit,
   checkRateLimitBudget,
   incrementRateLimit,
+  LIMITS,
 } from '@/lib/rate-limit';
+
+function currentWindow(action: string): number {
+  const config = LIMITS[action];
+  if (!config) throw new Error(`unknown action: ${action}`);
+  return Math.floor(Date.now() / 1000 / config.windowSecs);
+}
 
 beforeEach(() => {
   jest.useFakeTimers();
@@ -18,16 +25,17 @@ describe('checkRateLimit', () => {
   it('allows requests within limit', () => {
     // follow limit is 10 per 60s
     for (let i = 0; i < 10; i++) {
-      expect(checkRateLimit('social.follow', 'alice.near')).toMatchObject({
-        ok: true,
-      });
-      incrementRateLimit('social.follow', 'alice.near');
+      const check = checkRateLimit('social.follow', 'alice.near');
+      expect(check.ok).toBe(true);
+      if (!check.ok) return;
+      incrementRateLimit('social.follow', 'alice.near', check.window);
     }
   });
 
   it('rejects requests exceeding limit', () => {
+    const window = currentWindow('social.follow');
     for (let i = 0; i < 10; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     const result = checkRateLimit('social.follow', 'alice.near');
     expect(result.ok).toBe(false);
@@ -38,8 +46,9 @@ describe('checkRateLimit', () => {
   });
 
   it('resets after window expires', () => {
+    const window = currentWindow('social.follow');
     for (let i = 0; i < 10; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     expect(checkRateLimit('social.follow', 'alice.near').ok).toBe(false);
 
@@ -52,8 +61,9 @@ describe('checkRateLimit', () => {
   });
 
   it('isolates by caller', () => {
+    const window = currentWindow('social.follow');
     for (let i = 0; i < 10; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     expect(checkRateLimit('social.follow', 'alice.near').ok).toBe(false);
     expect(checkRateLimit('social.follow', 'bob.near')).toMatchObject({
@@ -62,8 +72,9 @@ describe('checkRateLimit', () => {
   });
 
   it('isolates by action', () => {
+    const window = currentWindow('social.follow');
     for (let i = 0; i < 10; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     expect(checkRateLimit('social.follow', 'alice.near').ok).toBe(false);
     // endorse has its own limit (20), not exhausted
@@ -82,18 +93,19 @@ describe('checkRateLimit', () => {
 
 describe('incrementRateLimit', () => {
   it('starts a new window when none exists', () => {
-    incrementRateLimit('social.follow', 'alice.near');
+    const window = currentWindow('social.follow');
+    incrementRateLimit('social.follow', 'alice.near', window);
     // Should have counted 1, so 9 more are allowed
     for (let i = 0; i < 9; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     expect(checkRateLimit('social.follow', 'alice.near').ok).toBe(false);
   });
 
   it('ignores unknown actions', () => {
     // incrementRateLimit is a no-op for unmapped actions; checkRateLimit
-    // fails closed regardless.
-    incrementRateLimit('unknown_action', 'alice.near');
+    // fails closed regardless. Window value is unread in this branch.
+    incrementRateLimit('unknown_action', 'alice.near', 0);
     expect(checkRateLimit('unknown_action', 'alice.near')).toEqual({
       ok: false,
       retryAfter: 60,
@@ -124,6 +136,7 @@ describe('incrementRateLimit', () => {
   });
 
   it('drops a late increment whose pinned window is older than the current entry', () => {
+    // Advance to a clean state so prior test increments don't leak.
     jest.advanceTimersByTime(301_000);
 
     // Check + increment in window W populates the store at window W.
@@ -140,8 +153,11 @@ describe('incrementRateLimit', () => {
     incrementRateLimit('social.follow', 'carol.near', second.window);
 
     // Now a late increment arrives pinned to window W. The store is at W+1;
-    // the old window cannot be resurrected, and we should not pollute the
-    // current bucket, so the late increment is dropped.
+    // polluting the current bucket would double-bill the caller, so the
+    // late increment must be dropped. Implementation preserves this via
+    // the implicit fallthrough when `entry.window > window` — a future
+    // refactor that adds an `else` replacing the current bucket would be
+    // caught here.
     incrementRateLimit('social.follow', 'carol.near', first.window);
 
     // Current-window budget is still 9 (1 increment from `second`, not 2).
@@ -164,16 +180,18 @@ describe('checkRateLimitBudget', () => {
   });
 
   it('returns remaining budget after some requests', () => {
+    const window = currentWindow('social.follow');
     for (let i = 0; i < 3; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     const result = checkRateLimitBudget('social.follow', 'alice.near');
     expect(result).toMatchObject({ ok: true, remaining: 7 });
   });
 
   it('returns error when budget exhausted', () => {
+    const window = currentWindow('social.follow');
     for (let i = 0; i < 10; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     const result = checkRateLimitBudget('social.follow', 'alice.near');
     expect(result.ok).toBe(false);
@@ -188,8 +206,9 @@ describe('checkRateLimitBudget', () => {
   });
 
   it('resets budget after window expires', () => {
+    const window = currentWindow('social.follow');
     for (let i = 0; i < 10; i++) {
-      incrementRateLimit('social.follow', 'alice.near');
+      incrementRateLimit('social.follow', 'alice.near', window);
     }
     expect(checkRateLimitBudget('social.follow', 'alice.near').ok).toBe(false);
 
@@ -207,13 +226,48 @@ describe('checkRateLimitBudget', () => {
       remaining: 1,
     });
 
-    incrementRateLimit('social.delist_me', 'alice.near');
+    const window = currentWindow('social.delist_me');
+    incrementRateLimit('social.delist_me', 'alice.near', window);
 
     const result = checkRateLimitBudget('social.delist_me', 'alice.near');
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.retryAfter).toBeGreaterThan(0);
       expect(result.retryAfter).toBeLessThanOrEqual(300);
+    }
+  });
+});
+
+describe('LIMITS completeness', () => {
+  // Authoritative set of rate-limited actions. Two groups:
+  // - social.* write actions (user-facing mutations)
+  // - read-side actions rate-limited in route.ts
+  // Admin write actions (hide_agent, unhide_agent) bypass rate limiting.
+  //
+  // If you add a new rate-limited action, add it here — the assertions
+  // below will fail if LIMITS and this list drift apart.
+  const EXPECTED_ACTIONS = [
+    'social.follow',
+    'social.unfollow',
+    'social.endorse',
+    'social.unendorse',
+    'social.update_me',
+    'social.heartbeat',
+    'social.delist_me',
+    'verify_claim',
+    'hidden_list',
+    'list_platforms',
+  ];
+
+  it('every expected action has a LIMITS entry', () => {
+    for (const action of EXPECTED_ACTIONS) {
+      expect(LIMITS).toHaveProperty([action]);
+    }
+  });
+
+  it('every LIMITS entry is in the expected set', () => {
+    for (const key of Object.keys(LIMITS)) {
+      expect(EXPECTED_ACTIONS).toContain(key);
     }
   });
 });

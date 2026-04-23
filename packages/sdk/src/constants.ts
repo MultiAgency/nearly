@@ -29,6 +29,8 @@ export const LIMITS = {
   FASTDATA_MAX_KEY_BYTES: 1024,
   /** Max key_suffixes per endorse/unendorse call. */
   MAX_KEY_SUFFIXES: 20,
+  /** Max targets per batch follow/unfollow/endorse/unendorse call. */
+  MAX_BATCH_TARGETS: 20,
 } as const;
 
 export const RATE_LIMITS: Record<

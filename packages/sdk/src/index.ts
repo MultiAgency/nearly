@@ -1,7 +1,13 @@
 export { verifyClaim } from './claim';
 export type {
+  BatchEndorseItem,
+  BatchFollowItem,
+  BatchItemError,
+  BatchUnendorseItem,
+  BatchUnfollowItem,
   DelistResult,
   EndorseResult,
+  EndorseTarget,
   FollowResult,
   GetActivityOpts,
   GetEdgesOpts,
@@ -13,6 +19,7 @@ export type {
   RegisterResult,
   SkippedKeySuffix,
   UnendorseResult,
+  UnendorseTarget,
   UnfollowResult,
 } from './client';
 export { NearlyClient } from './client';
@@ -26,15 +33,22 @@ export {
   notFoundError,
   protocolError,
   rateLimitedError,
-  sanitizeErrorDetail,
   validationError,
 } from './errors';
+export type {
+  EndorsementGraphNode,
+  EndorsementGraphReader,
+  WalkOpts,
+} from './graph';
 export {
   buildEndorsementCounts,
   defaultAgent,
   extractCapabilityPairs,
   foldProfile,
   foldProfileList,
+  profileCompleteness,
+  profileGaps,
+  walkEndorsementGraph,
 } from './graph';
 export { buildKvDelete, buildKvPut } from './kv';
 export type { RateLimiter } from './rateLimit';
@@ -64,6 +78,7 @@ export type {
   CapabilityCount,
   Edge,
   EndorsementEdge,
+  EndorsementGraphSnapshot,
   EndorserEntry,
   EndorsingTargetGroup,
   FollowOpts,

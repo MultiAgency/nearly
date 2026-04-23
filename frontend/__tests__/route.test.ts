@@ -301,12 +301,13 @@ describe('query params', () => {
     expect(body.tag).toBe('ai');
   });
 
-  it('drops non-parseable integer params', async () => {
+  it('rejects non-parseable integer params with 400', async () => {
     const [req, params] = makeRequest('GET', 'agents?limit=abc');
-    await GET(req, params);
-
-    const body = mockDispatchFastData.mock.calls[0][1];
-    expect(body.limit).toBeUndefined();
+    const res = await GET(req, params);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('VALIDATION_ERROR');
+    expect(mockDispatchFastData).not.toHaveBeenCalled();
   });
 
   it('rejects unsupported sort values with 400', async () => {
@@ -316,6 +317,29 @@ describe('query params', () => {
     const body = await res.json();
     expect(body.code).toBe('VALIDATION_ERROR');
     expect(body.error).toContain('Invalid sort');
+    expect(mockDispatchFastData).not.toHaveBeenCalled();
+  });
+
+  it('rejects tag values that fail the regex with 400', async () => {
+    const [req, params] = makeRequest('GET', 'agents?tag=FOO!');
+    const res = await GET(req, params);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('VALIDATION_ERROR');
+    expect(mockDispatchFastData).not.toHaveBeenCalled();
+  });
+
+  it('rejects cursor values that fail the format check with 400', async () => {
+    const [req, params] = makeRequest(
+      'GET',
+      'agents/me/activity?cursor=not%20a%20cursor',
+      undefined,
+      { authorization: 'Bearer wk_test' },
+    );
+    const res = await GET(req, params);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('VALIDATION_ERROR');
     expect(mockDispatchFastData).not.toHaveBeenCalled();
   });
 });
@@ -839,6 +863,64 @@ describe('admin /admin/hidden', () => {
       const res = await POST(req, params);
       expect(res.status).toBe(403);
       expect(mockWriteToFastData).not.toHaveBeenCalled();
+    });
+
+    // Regression: near: admin auth must round-trip through resolveAccountId
+    // (OutLayer verifies signature + ±30s timestamp) rather than trusting
+    // the decoded payload. A forged token with OUTLAYER_ADMIN_ACCOUNT in
+    // the payload but no valid signature would pass a local-decode check
+    // and let Nearly re-sign the write with its own admin key.
+    it('rejects forged near: admin tokens (resolveAccountId returns null)', async () => {
+      mockResolveAccountId.mockResolvedValueOnce(null);
+      const forgedPayload = Buffer.from(
+        JSON.stringify({ account_id: 'admin.near', seed: 'forged' }),
+      ).toString('base64url');
+      const [req, params] = makeRequest(
+        'POST',
+        'admin/hidden/spam.near',
+        undefined,
+        { authorization: `Bearer near:${forgedPayload}` },
+      );
+      const res = await POST(req, params);
+      expect(res.status).toBe(403);
+      expect(mockWriteToFastData).not.toHaveBeenCalled();
+      // Pin: the near: path must go through resolveAccountId, not a
+      // local decode. If someone reverts this, the mock is never called
+      // with the forged token and this assertion fails.
+      expect(mockResolveAccountId).toHaveBeenCalledWith(
+        `near:${forgedPayload}`,
+      );
+    });
+
+    // Happy-path companion to the forged-token rejection above: when
+    // OutLayer accepts the near: token and resolves it to the admin
+    // account, the write must execute. Pins that nearMatch actually
+    // routes through to writeToFastData, not just that the branch
+    // rejects forgeries. The walletKey handed to writeToFastData is
+    // Nearly's own server-signed admin token (`buildAdminNearToken()`,
+    // mocked to 'near:mock_admin_token'), not the caller's token.
+    it('hides an agent when a valid near: admin token resolves to OUTLAYER_ADMIN_ACCOUNT', async () => {
+      const validPayload = Buffer.from(
+        JSON.stringify({ account_id: 'admin.near', seed: 'valid' }),
+      ).toString('base64url');
+      const [req, params] = makeRequest(
+        'POST',
+        'admin/hidden/spam.near',
+        undefined,
+        { authorization: `Bearer near:${validPayload}` },
+      );
+      const res = await POST(req, params);
+      expect(res.status).toBe(200);
+      const body = await json(res);
+      expect(body.data.action).toBe('hidden');
+      expect(body.data.account_id).toBe('spam.near');
+      expect(mockResolveAccountId).toHaveBeenCalledWith(`near:${validPayload}`);
+      expect(mockWriteToFastData).toHaveBeenCalledWith(
+        'near:mock_admin_token',
+        expect.objectContaining({
+          'hidden/spam.near': true,
+        }),
+      );
     });
   });
 

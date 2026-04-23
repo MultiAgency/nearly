@@ -1,4 +1,5 @@
 import { useAgentStore } from '@/store/agentStore';
+import type { HeartbeatResponse } from '@/types';
 
 beforeEach(() => {
   useAgentStore.getState().reset();
@@ -16,13 +17,12 @@ describe('useAgentStore', () => {
       const state = useAgentStore.getState();
       expect(state.apiKey).toBe('wk_new_key');
       expect(state.accountId).toBe('user.near');
-      expect(state.currentStep).toBe(2);
       expect(state.stepStatus[1]).toBe('success');
     });
   });
 
-  describe('step 3: heartbeat', () => {
-    it('completes step 3', () => {
+  describe('heartbeat lifecycle', () => {
+    it('tracks heartbeat status independently of steps', () => {
       useAgentStore.getState().completeStep1({
         api_key: 'wk_secret',
         near_account_id: 'user.near',
@@ -30,10 +30,28 @@ describe('useAgentStore', () => {
       });
       useAgentStore.getState().completeStep2();
 
-      useAgentStore.getState().completeStep3();
+      useAgentStore.getState().setHeartbeatLoading();
+      expect(useAgentStore.getState().heartbeatStatus).toBe('loading');
+
+      // Reference-only assertion below; HeartbeatResponse shape is irrelevant here.
+      const mockData = {
+        profile_completeness: 40,
+        actions: [],
+      } as unknown as HeartbeatResponse;
+      useAgentStore.getState().setHeartbeatSuccess(mockData);
 
       const state = useAgentStore.getState();
-      expect(state.stepStatus[3]).toBe('success');
+      expect(state.heartbeatStatus).toBe('success');
+      expect(state.heartbeatData).toBe(mockData);
+    });
+
+    it('tracks heartbeat errors', () => {
+      useAgentStore.getState().setHeartbeatLoading();
+      useAgentStore.getState().setHeartbeatError('Network error');
+
+      const state = useAgentStore.getState();
+      expect(state.heartbeatStatus).toBe('error');
+      expect(state.heartbeatError).toBe('Network error');
     });
   });
 
@@ -50,12 +68,60 @@ describe('useAgentStore', () => {
       const state = useAgentStore.getState();
       expect(state.apiKey).toBeNull();
       expect(state.accountId).toBeNull();
-      expect(state.currentStep).toBe(1);
+      expect(state.path).toBeNull();
       expect(state.stepStatus).toEqual({
         1: 'idle',
         2: 'idle',
-        3: 'idle',
       });
+      expect(state.heartbeatStatus).toBe('idle');
+      expect(state.heartbeatData).toBeNull();
+      expect(state.byoStatus).toBe('idle');
+      expect(state.byoError).toBeNull();
+      expect(state.skippedHeartbeat).toBe(false);
+    });
+  });
+
+  describe('path selection', () => {
+    it('starts with null path', () => {
+      expect(useAgentStore.getState().path).toBeNull();
+    });
+
+    it('sets path', () => {
+      useAgentStore.getState().choosePath('byo');
+      expect(useAgentStore.getState().path).toBe('byo');
+    });
+  });
+
+  describe('BYO wallet', () => {
+    it('completes BYO verification', () => {
+      useAgentStore.getState().completeByo('wk_existing', 'alice.near');
+
+      const state = useAgentStore.getState();
+      expect(state.byoStatus).toBe('success');
+      expect(state.apiKey).toBe('wk_existing');
+      expect(state.accountId).toBe('alice.near');
+    });
+
+    it('tracks BYO errors', () => {
+      useAgentStore.getState().setByoLoading();
+      expect(useAgentStore.getState().byoStatus).toBe('loading');
+
+      useAgentStore.getState().setByoError('Invalid key');
+      expect(useAgentStore.getState().byoStatus).toBe('error');
+      expect(useAgentStore.getState().byoError).toBe('Invalid key');
+    });
+  });
+
+  describe('skip heartbeat', () => {
+    it('marks heartbeat as skipped', () => {
+      useAgentStore.getState().skipHeartbeat();
+      expect(useAgentStore.getState().skippedHeartbeat).toBe(true);
+    });
+
+    it('resets skippedHeartbeat on reset', () => {
+      useAgentStore.getState().skipHeartbeat();
+      useAgentStore.getState().reset();
+      expect(useAgentStore.getState().skippedHeartbeat).toBe(false);
     });
   });
 

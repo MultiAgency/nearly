@@ -331,7 +331,10 @@ async function accountIdFromBalance(walletKey: string): Promise<string | null> {
     return null;
   }
   if (!resp.ok) return null;
-  const body = (await resp.json().catch(() => null)) as {
+  const body = (await resp.json().catch((e: unknown) => {
+    console.error('[resolveAccountIdFromBalance] json parse failed', e);
+    return null;
+  })) as {
     account_id?: unknown;
   } | null;
   if (body && typeof body.account_id === 'string' && body.account_id) {

@@ -56,6 +56,15 @@ function decodeNearToken(
   }
 }
 
+// Read-path caller resolution. Intentionally trusts the decoded `near:`
+// identity without an OutLayer round-trip — `caller_account_id` here
+// only drives personalization (is_following, my_endorsements,
+// suggestion exclusions), never access control, and all underlying
+// data is already public via /agents/{id}/edges et al. Spoofing an
+// identity just shows a different view of public data. If a future
+// read gates on caller identity, switch this call to `resolveAccountId`
+// (see `assertAdminAuth`) rather than layering an auth check on top
+// of an unverified id.
 async function resolveCallerAccountId(
   walletKey: string,
 ): Promise<string | null> {
@@ -194,35 +203,106 @@ function agentActions(agent: Record<string, unknown>): AgentAction[] {
   return actions;
 }
 
-function extractQueryParams(
+// Validate every allowed query param. Fail loud on *invalid* input rather
+// than silently dropping — a silent-drop default masks bugs in caller
+// code (e.g. `?tag=FOO!` would return an unfiltered list instead of
+// erroring). Empty-string values are treated as "omitted" and skipped,
+// matching the convention of `routeFor` callers that send blank filter
+// inputs as `?tag=` rather than omitting the key. Any field listed in a
+// route's queryFields must have an explicit branch here; there is no
+// catch-all.
+function validateQueryParams(
   url: URL,
   allowedFields: readonly string[],
-): Record<string, unknown> {
+):
+  | { ok: true; params: Record<string, unknown> }
+  | { ok: false; response: NextResponse } {
   const allowed = new Set(allowedFields);
   const params: Record<string, unknown> = {};
   for (const [key, value] of url.searchParams) {
     if (!allowed.has(key)) continue;
+    if (value === '') continue;
     if (INT_FIELDS.has(key)) {
-      if (/^\d+$/.test(value)) params[key] = parseInt(value, 10);
-    } else if (key === 'include_history') {
-      params[key] = value === 'true';
+      if (!/^\d+$/.test(value)) {
+        return {
+          ok: false,
+          response: errJson(
+            'VALIDATION_ERROR',
+            `Invalid '${key}': must be a non-negative integer`,
+            400,
+          ),
+        };
+      }
+      params[key] = parseInt(value, 10);
     } else if (key === 'sort') {
-      if (VALID_SORTS.has(value)) params[key] = value;
+      if (!VALID_SORTS.has(value)) {
+        return {
+          ok: false,
+          response: errJson(
+            'VALIDATION_ERROR',
+            `Invalid sort '${value}'. Valid values: ${[...VALID_SORTS].join(', ')}`,
+            400,
+          ),
+        };
+      }
+      params[key] = value;
     } else if (key === 'cursor') {
-      if (value === '' || CURSOR_RE.test(value)) params[key] = value;
+      if (!CURSOR_RE.test(value)) {
+        return {
+          ok: false,
+          response: errJson(
+            'VALIDATION_ERROR',
+            `Invalid cursor '${value}'`,
+            400,
+          ),
+        };
+      }
+      params[key] = value;
     } else if (key === 'direction') {
-      if (VALID_DIRECTIONS.has(value)) params[key] = value;
+      if (!VALID_DIRECTIONS.has(value)) {
+        return {
+          ok: false,
+          response: errJson(
+            'VALIDATION_ERROR',
+            `Invalid direction '${value}'. Valid values: ${[...VALID_DIRECTIONS].join(', ')}`,
+            400,
+          ),
+        };
+      }
+      params[key] = value;
     } else if (key === 'tag') {
-      if (value.length <= 30 && /^[a-z0-9-]+$/.test(value)) params[key] = value;
+      if (value.length > 30 || !/^[a-z0-9-]+$/.test(value)) {
+        return {
+          ok: false,
+          response: errJson('VALIDATION_ERROR', `Invalid tag '${value}'`, 400),
+        };
+      }
+      params[key] = value;
     } else if (key === 'capability') {
       // Format: ns/value (e.g. "skills/testing") — lowercase alphanumeric + dots, slashes, hyphens.
-      if (value.length <= 60 && /^[a-z0-9._/-]+$/.test(value))
-        params[key] = value;
-    } else {
+      if (value.length > 60 || !/^[a-z0-9._/-]+$/.test(value)) {
+        return {
+          ok: false,
+          response: errJson(
+            'VALIDATION_ERROR',
+            `Invalid capability '${value}'`,
+            400,
+          ),
+        };
+      }
       params[key] = value;
+    } else {
+      return {
+        ok: false,
+        response: errJson(
+          'VALIDATION_ERROR',
+          `Unsupported query parameter '${key}'`,
+          400,
+        ),
+      };
     }
   }
-  return params;
+  return { ok: true, params };
 }
 
 function tooLargeResponse(): NextResponse {
@@ -260,18 +340,10 @@ async function dispatch(
 
   if (request.method === 'GET') {
     const url = new URL(request.url);
-    if (route.queryFields.includes('sort')) {
-      const sortParam = url.searchParams.get('sort');
-      if (sortParam !== null && !VALID_SORTS.has(sortParam)) {
-        return errJson(
-          'VALIDATION_ERROR',
-          `Invalid sort '${sortParam}'. Valid values: ${[...VALID_SORTS].join(', ')}`,
-          400,
-        );
-      }
-    }
+    const queryResult = validateQueryParams(url, route.queryFields);
+    if (!queryResult.ok) return queryResult.response;
     wasmBody = {
-      ...extractQueryParams(url, route.queryFields),
+      ...queryResult.params,
       ...route.pathParams,
       action: route.action,
     };
@@ -352,9 +424,18 @@ async function assertAdminAuth(
       401,
     );
   }
-  const callerAccountId = wkMatch
-    ? await resolveAccountId(wkMatch)
-    : (decodeNearToken(nearMatch!)?.account_id ?? null);
+  // Round-trip both auth types through OutLayer so the claimed identity
+  // is actually verified upstream. `resolveAccountId` uses balance for
+  // `wk_` and sign-message for `near:`. OutLayer enforces the Bearer
+  // auth contract on `near:` tokens — ±30s signed-timestamp window
+  // (documented as `timestamp_expired` in the agent-custody skill) over
+  // `auth:<seed>:<ts>` — so a token failing its checks surfaces as null
+  // here rather than resolving to the claimed account_id. Decoding the
+  // payload locally (no verification) would accept any forgery naming
+  // OUTLAYER_ADMIN_ACCOUNT, since we'd then fall through to
+  // `buildAdminNearToken()` and execute the write with Nearly's own
+  // admin key — a confused-deputy bypass.
+  const callerAccountId = await resolveAccountId(wkMatch ?? nearMatch!);
   if (callerAccountId !== OUTLAYER_ADMIN_ACCOUNT) {
     return errJson('AUTH_FAILED', 'Not authorized', 403);
   }

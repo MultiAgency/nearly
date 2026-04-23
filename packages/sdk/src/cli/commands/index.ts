@@ -20,31 +20,44 @@ import { unendorse } from './unendorse';
 import { unfollow } from './unfollow';
 import { update } from './update';
 
+// Every registered command returns an exit code. Batch commands can resolve
+// with `EXIT_PARTIAL_BATCH` on a throwless partial-failure path; all other
+// commands resolve with `0`. The existing `Promise<void>` handlers are
+// wrapped via `asExitCode` at registration so they stay pristine.
 export type CommandHandler = (
   parsed: ParsedArgv,
   streams: CliStreams,
-) => Promise<void>;
+) => Promise<number>;
+
+type VoidHandler = (parsed: ParsedArgv, streams: CliStreams) => Promise<void>;
+
+function asExitCode(h: VoidHandler): CommandHandler {
+  return async (parsed, streams) => {
+    await h(parsed, streams);
+    return 0;
+  };
+}
 
 export const COMMANDS: Record<string, CommandHandler> = {
-  activity,
-  agent,
-  agents,
-  balance,
-  capabilities,
-  delist,
+  activity: asExitCode(activity),
+  agent: asExitCode(agent),
+  agents: asExitCode(agents),
+  balance: asExitCode(balance),
+  capabilities: asExitCode(capabilities),
+  delist: asExitCode(delist),
   endorse,
   follow,
-  followers,
-  following,
-  heartbeat,
-  me,
-  network,
-  register,
-  suggest,
-  tags,
+  followers: asExitCode(followers),
+  following: asExitCode(following),
+  heartbeat: asExitCode(heartbeat),
+  me: asExitCode(me),
+  network: asExitCode(network),
+  register: asExitCode(register),
+  suggest: asExitCode(suggest),
+  tags: asExitCode(tags),
   unendorse,
   unfollow,
-  update,
+  update: asExitCode(update),
 };
 
 export function commandList(): string[] {

@@ -312,6 +312,12 @@ describe('buildUnendorse', () => {
   it('rejects empty keySuffixes', () => {
     expect(() => buildUnendorse('alice.near', 'bob.near', [])).toThrow(/empty/);
   });
+
+  it('rejects self-unendorse', () => {
+    expect(() =>
+      buildUnendorse('alice.near', 'alice.near', ['tags/rust']),
+    ).toThrow(/yourself/);
+  });
 });
 
 describe('buildUnfollow', () => {

@@ -2,11 +2,7 @@ import type { FetchLike } from '../src/read';
 import { createReadTransport, kvGetKey, kvListAgent } from '../src/read';
 import type { KvEntry } from '../src/types';
 import { entry } from './fixtures/entries';
-
-interface Call {
-  url: string;
-  init?: RequestInit;
-}
+import { type Call, jsonResponse } from './fixtures/http';
 
 function mockFetch(responses: Response[]): { fetch: FetchLike; calls: Call[] } {
   const calls: Call[] = [];
@@ -18,13 +14,6 @@ function mockFetch(responses: Response[]): { fetch: FetchLike; calls: Call[] } {
     return res;
   };
   return { fetch, calls };
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
 
 function mkEntry(key: string, value: unknown, pred = 'alice.near'): KvEntry {

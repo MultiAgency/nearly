@@ -344,6 +344,12 @@ export function buildUnendorse(
       message: 'Validation failed for target: empty account_id',
     });
   }
+  if (target === callerAccountId) {
+    throw new NearlyError({
+      code: 'SELF_UNENDORSE',
+      message: 'Cannot unendorse yourself',
+    });
+  }
   if (!Array.isArray(keySuffixes) || keySuffixes.length === 0) {
     throw new NearlyError({
       code: 'VALIDATION_ERROR',

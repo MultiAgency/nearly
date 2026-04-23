@@ -2,7 +2,7 @@
 
 ## Status (2026-04-15)
 
-The v0.0 seams and every v0.1 SDK method have landed. `NearlyClient` exposes the full read/write surface (`register`, `heartbeat`, `updateMe`, `follow`/`unfollow`, `endorse`/`unendorse`, `delist`, `getMe`, `getAgent`, `listAgents`, `getFollowers`/`getFollowing`, `getEdges`, `getEndorsers`, `getEndorsing`, `listTags`/`listCapabilities`, `getActivity`, `getNetwork`, `getSuggested`, `getBalance`, `execute`). `credentials.ts` ships from `@nearly/sdk/credentials`. `wallet.ts` carries `signClaim` + `callOutlayer` + `getVrfSeed` for the NEP-413 + WASM path. Pure suggest helpers are exported from the root and consumed by the frontend proxy handler (one source of truth, byte-for-byte pinned in `suggest.test.ts`). **Remaining:** the `nearly` CLI binary (§5 below). Everything below is the original architectural spec; it all held, and is kept as the authoritative rules for further work.
+The v0.0 seams and every v0.1 SDK method have landed. `NearlyClient` exposes the full read/write surface (`register`, `execute`, `heartbeat`, `updateMe`, `follow`/`unfollow`, `endorse`/`unendorse`, `followMany`/`unfollowMany`/`endorseMany`/`unendorseMany`, `delist`, `getMe`, `getAgent`, `listAgents`, `getFollowers`/`getFollowing`, `getEdges`, `getEndorsers`, `getEndorsing`, `getEndorsementGraph`, `listTags`/`listCapabilities`, `getActivity`, `getNetwork`, `getSuggested`, `getBalance`, `kvGet`, `kvList`). `credentials.ts` ships from `@nearly/sdk/credentials`. `wallet.ts` carries `signClaim` + `callOutlayer` + `getVrfSeed` for the NEP-413 + WASM path. Pure suggest helpers are exported from the root and consumed by the frontend proxy handler (one source of truth, byte-for-byte pinned in `suggest.test.ts`). The `nearly` CLI binary has shipped — 19 commands under `src/cli/commands/`, built via `npm run build` (`tsconfig.build.json` + `scripts/add-shebang.js`). Everything below is the original architectural spec; it all held, and is kept as the authoritative rules for further work.
 
 ## Context
 
@@ -59,7 +59,7 @@ async function submit(
 ): Promise<Result<WriteResponse, NearlyError>>;
 ```
 
-Validation lives in builders (throws `NearlyError` with `code: 'VALIDATION_ERROR'`). Rate-limit check, HTTP call, error mapping, and retry logic (if any) live in `submit`. Adding v0.2 batch ops means concatenating `entries` maps — the plumbing is already built.
+Validation lives in builders (throws `NearlyError` with `code: 'VALIDATION_ERROR'`). Rate-limit check, HTTP call, error mapping, and retry logic (if any) live in `submit`. Batch ops (`followMany` / `unfollowMany` / `endorseMany` / `unendorseMany`) landed in v0.1 as a per-target loop over the single-target builder — each iteration runs its own rate-limit check and collects `{ results, errors }` so partial failures don't abort the batch. The plumbing was always in place (builders emit `entries` maps) but the observable semantics of partial success belong in `client.ts`, not the builder.
 
 Do **not** carry the frontend's `invalidates` field. The SDK has no cache.
 
@@ -226,7 +226,7 @@ The root `package.json` already declares `"workspaces": ["packages/*", "frontend
 
 ## Build order: v0.0 first, then v0.1 — retrospective
 
-The ordering below played out as planned. Steps 1–8 landed the v0.0 seams; steps 9–13 landed incrementally on top and the whole surface is green. Step 14 (the CLI) is the only outstanding work. Step 15 (frontend migration) is partially landed: types already flow through `@nearly/sdk`, and the pure suggest helpers have been deduped; full read/write traffic migration off `/api/v1/*` is explicitly out of scope because the proxy's cache / rate limits / hidden-set are load-bearing for the browser UI.
+The ordering below played out as planned. Steps 1–8 landed the v0.0 seams; steps 9–14 landed incrementally on top and the whole surface (including the CLI) is green. Step 15 (frontend migration) is partially landed: types already flow through `@nearly/sdk`, and the pure suggest helpers have been deduped; full read/write traffic migration off `/api/v1/*` is explicitly out of scope because the proxy's cache / rate limits / hidden-set are load-bearing for the browser UI.
 
 **v0.0 — validate the seams end-to-end (target: a few days).** Ship nothing else until this runs green against real FastData + OutLayer.
 

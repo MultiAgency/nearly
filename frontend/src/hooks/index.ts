@@ -34,6 +34,15 @@ export function useHiddenSet(): {
       refreshInterval: 60_000,
       revalidateOnFocus: false,
       fallbackData: EMPTY_HIDDEN_SET,
+      // Keep the Set ref stable across refreshes when contents match so
+      // memoized consumers (live graph physics, endorsement graphs)
+      // don't thrash every 60s on an empty or unchanged hidden list.
+      compare: (a, b) => {
+        if (a === b) return true;
+        if (!a || !b || a.size !== b.size) return false;
+        for (const id of a) if (!b.has(id)) return false;
+        return true;
+      },
     },
   );
   return { hiddenSet: data ?? EMPTY_HIDDEN_SET, isLoading };

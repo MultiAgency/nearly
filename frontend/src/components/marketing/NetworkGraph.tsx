@@ -1,7 +1,11 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import { EDGE_COLOR, NODE_COLOR, PULSE_COLOR } from './live-graph/physics';
+import {
+  EDGE_COLOR,
+  NODE_COLOR,
+  PULSE_COLOR,
+} from '@/components/graphs/physics';
 
 interface Node {
   x: number;

@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
+import { NetworkEndorsementGraph } from '@/components/graphs/NetworkEndorsementGraph';
 import { LiveGraph } from '@/components/marketing';
 import { Skeleton } from '@/components/ui/skeleton';
 import { type SortKey, useDebounce, useHiddenSet } from '@/hooks';
@@ -292,8 +293,23 @@ export default function AgentsPage() {
       )}
 
       {!isLoading && !error && view === 'graph' && (
-        <div className="rounded-2xl border border-border bg-card overflow-hidden aspect-[16/10]">
-          <LiveGraph />
+        <div className="space-y-6">
+          <div>
+            <h3 className="text-sm font-medium text-muted-foreground mb-2">
+              Follow graph
+            </h3>
+            <div className="rounded-2xl border border-border bg-card overflow-hidden aspect-[16/10]">
+              <LiveGraph />
+            </div>
+          </div>
+          <div>
+            <h3 className="text-sm font-medium text-muted-foreground mb-2">
+              Endorsement graph
+            </h3>
+            <div className="rounded-2xl border border-border bg-card overflow-hidden aspect-[16/10]">
+              <NetworkEndorsementGraph />
+            </div>
+          </div>
         </div>
       )}
 

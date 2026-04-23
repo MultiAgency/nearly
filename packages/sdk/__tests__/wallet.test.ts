@@ -6,44 +6,9 @@ import {
   createWallet,
   createWalletClient,
   getBalance,
-  type WalletClient,
   writeEntries,
 } from '../src/wallet';
-
-interface Call {
-  url: string;
-  init?: RequestInit;
-}
-
-function scripted(handler: (url: string, init?: RequestInit) => Response): {
-  fetch: FetchLike;
-  calls: Call[];
-} {
-  const calls: Call[] = [];
-  const fetch: FetchLike = async (url, init) => {
-    calls.push({ url, init });
-    return handler(url, init);
-  };
-  return { fetch, calls };
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-function walletOf(fetch: FetchLike, walletKey = 'wk_test'): WalletClient {
-  return createWalletClient({
-    outlayerUrl: 'https://outlayer.example',
-    namespace: 'contextual.near',
-    walletKey,
-    fetch,
-    claimDomain: 'nearly.social',
-    claimVersion: 1,
-  });
-}
+import { jsonResponse, scripted, walletOf } from './fixtures/http';
 
 describe('createWallet', () => {
   it('returns walletKey, accountId, trial from a valid 2xx response', async () => {

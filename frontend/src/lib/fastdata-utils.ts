@@ -8,8 +8,8 @@
  */
 
 import {
-  extractCapabilityPairs,
   foldProfile,
+  foldProfileList,
   buildEndorsementCounts as sdkBuildEndorsementCounts,
 } from '@nearly/sdk';
 import type { Agent } from '@/types';
@@ -121,12 +121,7 @@ export async function fetchProfiles(
 
 export async function fetchAllProfiles(): Promise<Agent[]> {
   const entries = await kvGetAll('profile');
-  const out: Agent[] = [];
-  for (const e of entries) {
-    const agent = foldProfile(e);
-    if (agent) out.push(agent);
-  }
-  return out;
+  return foldProfileList(entries);
 }
 
 export function buildEndorsementCounts(
@@ -185,88 +180,6 @@ export function endorsePrefix(accountId: string): string {
   return `endorsing/${accountId}/`;
 }
 
-/** Profile fields that are missing or insufficient. Single source of truth
- *  for presence detection: `profileCompleteness()` scores from this, and
- *  `agentActions()` in `route.ts` maps each returned field name to its
- *  onboarding action via `GAP_ACTION`. Fulfilling an emitted action always
- *  moves `profile_completeness`. */
-export function profileGaps(agent: {
-  name?: string | null | unknown;
-  description?: string | unknown;
-  image?: string | null | unknown;
-  tags?: string[] | unknown;
-  capabilities?: Record<string, unknown> | unknown;
-}): string[] {
-  const gaps: string[] = [];
-  if (!agent.name || typeof agent.name !== 'string') gaps.push('name');
-  if (
-    !agent.description ||
-    typeof agent.description !== 'string' ||
-    agent.description.length <= 10
-  )
-    gaps.push('description');
-  if (!Array.isArray(agent.tags) || agent.tags.length === 0) gaps.push('tags');
-  if (
-    !agent.capabilities ||
-    typeof agent.capabilities !== 'object' ||
-    Object.keys(agent.capabilities as object).length === 0
-  )
-    gaps.push('capabilities');
-  if (!agent.image || typeof agent.image !== 'string') gaps.push('image');
-  return gaps;
-}
-
-/** Per-field weights summing to 100. `capabilities` carries the most
- *  weight (30) because it's the richest discovery signal — structured
- *  skills/languages/etc. beat flat tags for fine-grained routing. `name`
- *  carries the least (10) because it's identity polish, not discovery
- *  mechanics. Tags and capabilities are continuous — see per-item constants
- *  below. If weights are ever re-balanced, update `agentActions()`
- *  priorities in route.ts to match. */
-const GAP_SCORE = {
-  name: 10,
-  description: 20,
-  tags: 20,
-  capabilities: 30,
-  image: 20,
-} as const;
-
-/** Tags: 2 points per tag, capped at 10 items (matches MAX_TAGS in
- *  validate.ts). `2 * 10 = 20` equals the `tags` weight. */
-const TAG_POINTS_PER_ITEM = 2;
-const TAG_MAX_ITEMS = 10;
-
-/** Capabilities: 10 points per leaf pair, capped at 3 pairs.
- *  `10 * 3 = 30` equals the `capabilities` weight. */
-const CAP_POINTS_PER_PAIR = 10;
-const CAP_MAX_PAIRS = 3;
-
-/**
- * `profileGaps()` stays binary so each `agentActions()` entry fires on
- * first absence and disappears on first engagement — any drift between
- * the gap detector and this scorer breaks the onboarding action loop.
- *
- * A score of 100 means "richly populated" (every field + ≥10 tags + ≥3
- * capability pairs), not "minimally filled."
- */
-export function profileCompleteness(
-  agent: Parameters<typeof profileGaps>[0],
-): number {
-  const gaps = new Set(profileGaps(agent));
-
-  let score = 0;
-  if (!gaps.has('name')) score += GAP_SCORE.name;
-  if (!gaps.has('description')) score += GAP_SCORE.description;
-  if (!gaps.has('image')) score += GAP_SCORE.image;
-
-  const tagCount = Array.isArray(agent.tags) ? agent.tags.length : 0;
-  score += Math.min(tagCount, TAG_MAX_ITEMS) * TAG_POINTS_PER_ITEM;
-
-  const capPairs =
-    agent.capabilities && typeof agent.capabilities === 'object'
-      ? extractCapabilityPairs(agent.capabilities).length
-      : 0;
-  score += Math.min(capPairs, CAP_MAX_PAIRS) * CAP_POINTS_PER_PAIR;
-
-  return score;
-}
+// profileGaps and profileCompleteness are authoritative in @nearly/sdk —
+// re-exported here so existing frontend callers don't need import changes.
+export { profileCompleteness, profileGaps } from '@nearly/sdk';

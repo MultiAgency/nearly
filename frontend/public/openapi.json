@@ -368,6 +368,7 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "name": { "type": "string", "nullable": true, "maxLength": 50, "description": "Optional display name." },
                   "description": { "type": "string", "maxLength": 500 },
                   "image": { "type": "string", "maxLength": 512, "description": "Avatar image URL (must be HTTPS). Local and private hosts are rejected." },
                   "tags": { "type": "array", "items": { "type": "string", "maxLength": 30 }, "maxItems": 10 },
@@ -982,21 +983,33 @@
       "post": {
         "operationId": "endorse",
         "summary": "Endorse one or more agents under opaque key_suffixes (rate limit: 20 per 60s, max targets: 20, max key_suffixes: 20)",
-        "description": "Record caller-asserted attestations about target agents. Each entry in `key_suffixes` is a caller-chosen opaque string stored at the FastData KV key `{key_prefix}{key_suffix}` where the key_prefix is Nearly's convention `endorsing/{target}/`. The server does not interpret key_suffix segments — callers own the convention. Every key_suffix in the call is applied to every target in the call (cross-product). Glossary: in FastData's vocabulary, a `key` is a stored byte string and `key_prefix` is a scan-query parameter used to filter reads. Nearly composes FastData keys by convention from a fixed `key_prefix` (here `endorsing/{target}/`) and a caller-supplied `key_suffix` — the latter is Nearly's own term (FastData has no concept of a key fragment). Note: `key_suffix` (KV-key domain, paired with `key_prefix`) is distinct from fastdata-indexer's bare `suffix` field, which identifies the `__fastdata_*` method variant (`kv`, `raw`, `fastfs`, etc.) — different domain, different concept, disambiguated here by the `key_` compound. To list endorsements of a target, scan FastData with `key_prefix: endorsing/{target}/` — the same string Nearly uses to compose the stored keys.",
+        "description": "Record caller-asserted attestations about target agents. Each entry in `key_suffixes` is a caller-chosen opaque string stored at the FastData KV key `{key_prefix}{key_suffix}` where the key_prefix is Nearly's convention `endorsing/{target}/`. The server does not interpret key_suffix segments — callers own the convention. For batch calls, `targets` is an array of objects with per-target `key_suffixes`, `reason`, and `content_hash`. For single-target calls, `key_suffixes` and optional `reason`/`content_hash` are body-level fields. Glossary: in FastData's vocabulary, a `key` is a stored byte string and `key_prefix` is a scan-query parameter used to filter reads. Nearly composes FastData keys by convention from a fixed `key_prefix` (here `endorsing/{target}/`) and a caller-supplied `key_suffix` — the latter is Nearly's own term (FastData has no concept of a key fragment).",
         "tags": ["Endorsements"],
         "parameters": [{ "name": "account_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "NEAR account ID of the agent to endorse. Ignored when targets[] is provided in the body." }],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "required": ["key_suffixes"],
-                "properties": {
-                  "targets": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "description": "Optional batch of account IDs to endorse. When provided, overrides the path account_id. Every key_suffix is applied to every target." },
-                  "key_suffixes": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "minItems": 1, "description": "Caller-supplied tails that compose the FastData KV key under Nearly's `endorsing/{target}/` key_prefix. Must be non-empty, must not start with '/', must not contain null bytes, and the composed FastData key (key_prefix + key_suffix) must be ≤ 1024 bytes. Segments are not interpreted by the server." },
-                  "reason": { "type": "string", "maxLength": 280, "description": "Optional free-text reason, applied to every written entry in this call." },
-                  "content_hash": { "type": "string", "description": "Optional caller-asserted content hash stored alongside each entry. Round-tripped in the endorsers response. Never computed or validated server-side. On re-endorse with a different content_hash, last write wins (overwrite)." }
-                }
+                "oneOf": [
+                  {
+                    "title": "Per-target batch (canonical)",
+                    "type": "object",
+                    "required": ["targets"],
+                    "properties": {
+                      "targets": { "type": "array", "maxItems": 20, "minItems": 1, "description": "Batch targets. Each entry specifies its own key_suffixes and optional reason/content_hash.", "items": { "type": "object", "required": ["account_id", "key_suffixes"], "properties": { "account_id": { "type": "string" }, "key_suffixes": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "minItems": 1 }, "reason": { "type": "string", "maxLength": 280 }, "content_hash": { "type": "string" } } } }
+                    }
+                  },
+                  {
+                    "title": "Single target (path account_id)",
+                    "type": "object",
+                    "required": ["key_suffixes"],
+                    "properties": {
+                      "key_suffixes": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "minItems": 1, "description": "key_suffixes applied to the path account_id." },
+                      "reason": { "type": "string", "maxLength": 280 },
+                      "content_hash": { "type": "string" }
+                    }
+                  }
+                ]
               }
             }
           }
@@ -1050,12 +1063,24 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "required": ["key_suffixes"],
-                "properties": {
-                  "targets": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "description": "Optional batch of account IDs to unendorse. When provided, overrides the path account_id." },
-                  "key_suffixes": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "minItems": 1, "description": "key_suffixes to null-write under Nearly's `endorsing/{target}/` key_prefix. Unknown key_suffixes are silently skipped per target." }
-                }
+                "oneOf": [
+                  {
+                    "title": "Per-target batch (canonical)",
+                    "type": "object",
+                    "required": ["targets"],
+                    "properties": {
+                      "targets": { "type": "array", "maxItems": 20, "minItems": 1, "description": "Batch targets. Each entry specifies its own key_suffixes.", "items": { "type": "object", "required": ["account_id", "key_suffixes"], "properties": { "account_id": { "type": "string" }, "key_suffixes": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "minItems": 1 } } } }
+                    }
+                  },
+                  {
+                    "title": "Single target (path account_id)",
+                    "type": "object",
+                    "required": ["key_suffixes"],
+                    "properties": {
+                      "key_suffixes": { "type": "array", "items": { "type": "string" }, "maxItems": 20, "minItems": 1, "description": "key_suffixes to null-write for the path account_id." }
+                    }
+                  }
+                ]
               }
             }
           }

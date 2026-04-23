@@ -9,9 +9,6 @@ jobs:
   frontend:
     timeout-minutes: 10
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -20,11 +17,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npx biome check
-      - run: npx tsc --noEmit
-      - run: npm test -- --ci
+      - run: npm exec -w frontend -- biome check
+      - run: npm exec -w frontend -- tsc --noEmit
+      - run: npm run -w frontend test -- --ci
       # Shared `.next/cache` with the `frontend-e2e` job (same cache
       # key). First run to populate, subsequent runs get near-instant
       # incremental builds. See the matching block in `frontend-e2e`
@@ -32,11 +29,11 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: frontend/.next/cache
-          key: nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**/*.ts', 'frontend/src/**/*.tsx', 'frontend/src/**/*.js', 'frontend/src/**/*.jsx', 'frontend/src/**/*.json', 'frontend/src/**/*.css', 'frontend/next.config.js', 'frontend/postcss.config.mjs', 'frontend/tsconfig.json') }}
+          key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('frontend/src/**/*.ts', 'frontend/src/**/*.tsx', 'frontend/src/**/*.js', 'frontend/src/**/*.jsx', 'frontend/src/**/*.json', 'frontend/src/**/*.css', 'frontend/next.config.js', 'frontend/postcss.config.mjs', 'frontend/tsconfig.json') }}
           restore-keys: |
-            nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-
+            nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
             nextjs-${{ runner.os }}-
-      - run: npm run build
+      - run: npm run -w frontend build
 
   frontend-e2e:
     # Public-API smoke against a Playwright-managed Next production
@@ -45,9 +42,6 @@ jobs:
     # excluded (requires WALLET_KEY_A/B secrets).
     timeout-minutes: 15
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -56,9 +50,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npx playwright install chromium
+      - run: npm exec -w frontend -- playwright install chromium
       # Cache Next's incremental build output. `.next/cache/` contains
       # the webpack/turbopack compile results keyed on source hashes,
       # so a rebuild on the same SHA is ~instant and unrelated SHAs
@@ -70,16 +64,16 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: frontend/.next/cache
-          key: nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**/*.ts', 'frontend/src/**/*.tsx', 'frontend/src/**/*.js', 'frontend/src/**/*.jsx', 'frontend/src/**/*.json', 'frontend/src/**/*.css', 'frontend/next.config.js', 'frontend/postcss.config.mjs', 'frontend/tsconfig.json') }}
+          key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('frontend/src/**/*.ts', 'frontend/src/**/*.tsx', 'frontend/src/**/*.js', 'frontend/src/**/*.jsx', 'frontend/src/**/*.json', 'frontend/src/**/*.css', 'frontend/next.config.js', 'frontend/postcss.config.mjs', 'frontend/tsconfig.json') }}
           restore-keys: |
-            nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-
+            nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
             nextjs-${{ runner.os }}-
       # Playwright's webServer command for CI is `npm run start` (gated
       # on process.env.CI in playwright.config.ts), which assumes the
       # production bundle already exists. Build it here as a separate
       # step so failures are clearly attributed.
-      - run: npm run build
-      - run: npx playwright test --project=ci-smoke --reporter=list,github
+      - run: npm run -w frontend build
+      - run: npm exec -w frontend -- playwright test --project=ci-smoke --reporter=list,github
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -99,9 +93,6 @@ jobs:
     # frontend/.env to run it with the same creds smoke.sh uses.
     timeout-minutes: 10
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/sdk
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -110,19 +101,18 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: packages/sdk/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npx biome check
-      - run: npx tsc --noEmit
-      - run: npx jest --ci
-      # Build the `nearly` CLI bin and smoke-test its entry points. Catches
-      # tsconfig.cli.json regressions (emit path, shebang, chmod) that the
-      # unit suite doesn't see — the bin is built from the same source but
-      # through a different compiler config.
-      - run: npm run build:cli
-      - run: node dist/cli/index.js help
+      - run: npm exec -w packages/sdk -- biome check
+      - run: npm exec -w packages/sdk -- tsc --noEmit
+      - run: npm exec -w packages/sdk -- jest --ci
+      # Build the full dist/ (library + CLI bin) and smoke-test entry points.
+      # Catches tsconfig.build.json regressions (emit path, declarations,
+      # shebang, chmod) that the unit suite doesn't see.
+      - run: npm run -w packages/sdk build
+      - run: node packages/sdk/dist/cli/index.js help
       - run: |
-          if node dist/cli/index.js heartbeat wk_fake_token_for_guard_check; then
+          if node packages/sdk/dist/cli/index.js heartbeat wk_fake_token_for_guard_check; then
             echo "ERROR: wk_ argv guard did not reject" >&2
             exit 1
           fi

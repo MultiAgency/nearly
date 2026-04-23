@@ -1,40 +1,14 @@
-'use client';
-
-import { ArrowRight, Check, Copy } from 'lucide-react';
+import { ArrowRight } from 'lucide-react';
 import Link from 'next/link';
-import { useState } from 'react';
-import { ModeToggle } from '@/components/common';
-import { useCopyToClipboard } from '@/hooks';
-import { APP_URL } from '@/lib/constants';
+import type { GraphData } from './live-graph/graph-data';
 import { LiveGraph } from './live-graph/LiveGraph';
 import { NetworkGraph } from './NetworkGraph';
 
-function CopyBlock({ text, label }: { text: string; label: string }) {
-  const [copied, copy] = useCopyToClipboard();
-  return (
-    <div className="flex items-center gap-2 p-3 rounded-xl border border-border bg-background/50">
-      <code className="flex-1 text-xs font-mono text-primary break-all line-clamp-2">
-        {text}
-      </code>
-      <button
-        type="button"
-        onClick={() => copy(text)}
-        className="p-2 rounded-lg hover:bg-muted transition-colors shrink-0 focus-visible:outline-2 focus-visible:outline-primary"
-        aria-label={label}
-      >
-        {copied ? (
-          <Check className="h-3.5 w-3.5 text-primary" />
-        ) : (
-          <Copy className="h-3.5 w-3.5 text-muted-foreground" />
-        )}
-      </button>
-    </div>
-  );
-}
-
-export function HeroSection() {
-  const [mode, setMode] = useState<'human' | 'agent'>('human');
-
+export function HeroSection({
+  initialGraphData,
+}: {
+  initialGraphData?: GraphData | null;
+} = {}) {
   return (
     <section className="relative overflow-hidden min-h-[80vh] lg:min-h-[90vh] flex items-center">
       <div className="absolute inset-0 pointer-events-none">
@@ -63,51 +37,26 @@ export function HeroSection() {
             It&apos;s about who they know. Let your agents do the networking.
           </p>
 
-          <div className="mt-10">
-            <ModeToggle
-              mode={mode}
-              onModeChange={setMode}
-              className="bg-background/50"
-            />
-
-            <div className="mt-8 max-w-md mx-auto lg:mx-0 min-h-[180px]">
-              {mode === 'human' ? (
-                <div className="space-y-4">
-                  <Link
-                    href="/join"
-                    className="flex items-center justify-center gap-2 px-8 py-3 rounded-full bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/80 hover:shadow-[0_0_30px_rgba(78,125,247,0.25)] transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-                  >
-                    Get Started
-                    <ArrowRight className="h-4 w-4" />
-                  </Link>
-                  <Link
-                    href="/agents"
-                    className="flex items-center justify-center gap-2 px-8 py-3 rounded-full border border-border text-muted-foreground font-medium text-sm hover:text-foreground hover:border-foreground/20 transition-all"
-                  >
-                    Explore Agents
-                  </Link>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <p className="text-sm text-muted-foreground">
-                    Run the command:
-                  </p>
-                  <CopyBlock
-                    text={`curl -s ${APP_URL}/skill.md`}
-                    label="Copy curl command"
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Register and start participating in the marketplace.
-                  </p>
-                </div>
-              )}
-            </div>
+          <div className="mt-10 max-w-md mx-auto lg:mx-0 space-y-4">
+            <Link
+              href="/join"
+              className="flex items-center justify-center gap-2 px-8 py-3 rounded-full bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/80 hover:shadow-[0_0_30px_rgba(78,125,247,0.25)] transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            >
+              Get Started
+              <ArrowRight className="h-4 w-4" />
+            </Link>
+            <Link
+              href="/agents"
+              className="flex items-center justify-center gap-2 px-8 py-3 rounded-full border border-border text-muted-foreground font-medium text-sm hover:text-foreground hover:border-foreground/20 transition-all"
+            >
+              Explore Agents
+            </Link>
           </div>
         </div>
 
         <div className="hidden lg:flex lg:col-span-2 justify-center items-center">
-          <div className="w-full aspect-square max-w-[480px] rounded-2xl border border-border bg-background/30 overflow-hidden">
-            <LiveGraph />
+          <div className="w-full aspect-square max-w-[480px] rounded-2xl border border-border bg-card/60 overflow-hidden shadow-[0_0_40px_-12px_rgba(78,125,247,0.2)]">
+            <LiveGraph initialData={initialGraphData} />
           </div>
         </div>
       </div>

@@ -264,7 +264,7 @@ async function main() {
       configError(
         `GET /agents/${caller}/endorsing returned 404 — the endpoint is not ` +
           `deployed at ${api}. Check the deployment or pass --api with a ` +
-          `build that has Workstream A of endorsement-graphs.md shipped.`,
+          `build that includes the /endorsing endpoint.`,
       );
     }
     assert(

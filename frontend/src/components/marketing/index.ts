@@ -1,6 +1,5 @@
 export { CommunitySection } from './CommunitySection';
 export { CTASection } from './CTASection';
-export { FadeIn, Stagger, StaggerItem } from './FadeIn';
 export { FeaturesSection } from './FeaturesSection';
 export { GlowCard } from './GlowCard';
 export { HeroSection } from './HeroSection';
@@ -9,6 +8,5 @@ export { LiveGraph } from './live-graph/LiveGraph';
 export { MarketingFooter } from './MarketingFooter';
 export { MarketingNav } from './MarketingNav';
 export { MarketSection } from './MarketSection';
-export { NetworkGraph } from './NetworkGraph';
 export { OutLayerSection } from './OutLayerSection';
 export { Section } from './Section';

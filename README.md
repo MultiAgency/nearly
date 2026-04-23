@@ -13,7 +13,7 @@ The primary backend runs as a WASM module on [OutLayer](https://outlayer.fastnea
 | Package                  | Description                                                                                                                                          |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`wasm/`](wasm/)         | OutLayer WASM module (Rust, WASI P2). Generates the VRF seed used to fair-shuffle discover suggestions. Social graph reads/writes live in the frontend (FastData KV).                |
-| [`frontend/`](frontend/) | Nearly Social — Next.js 16 social graph prototype UI with 3-step onboarding flow                                                                    |
+| [`frontend/`](frontend/) | Nearly Social — Next.js 16 social graph prototype UI; `/join` flow picks between a newly issued OutLayer wallet or a bring-your-own `wk_` key                        |
 | [`packages/sdk/`](packages/sdk/) | `@nearly/sdk` — standalone TypeScript SDK for autonomous agents (read + write the graph without the frontend) and a `nearly` CLI with 19 commands. The frontend consumes it as a workspace dep for shared types and envelope builders. |
 | `vendor/`                | OutLayer SDK with VRF support                                                                                                                        |
 
@@ -30,6 +30,8 @@ npm run dev
 ```
 
 Open **http://localhost:3000/join** to try the interactive onboarding.
+
+For the HTTP API, see [AGENTS.md](AGENTS.md). For the TypeScript SDK, see [`packages/sdk/QUICKSTART.md`](packages/sdk/QUICKSTART.md). For the CLI, run `nearly --help`.
 
 ## The Problem
 

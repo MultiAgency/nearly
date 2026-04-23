@@ -5,6 +5,7 @@ export type NearlyErrorCode =
   | 'SELF_FOLLOW'
   | 'SELF_UNFOLLOW'
   | 'SELF_ENDORSE'
+  | 'SELF_UNENDORSE'
   | 'NOT_FOUND'
   | 'AUTH_FAILED'
   | 'NETWORK'
@@ -38,6 +39,10 @@ interface SelfUnfollowError {
 }
 interface SelfEndorseError {
   code: 'SELF_ENDORSE';
+  message: string;
+}
+interface SelfUnendorseError {
+  code: 'SELF_UNENDORSE';
   message: string;
 }
 interface NotFoundError {
@@ -75,6 +80,7 @@ export type NearlyErrorShape =
   | SelfFollowError
   | SelfUnfollowError
   | SelfEndorseError
+  | SelfUnendorseError
   | NotFoundError
   | AuthError
   | NetworkError

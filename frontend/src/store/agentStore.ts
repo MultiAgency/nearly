@@ -1,42 +1,69 @@
 import { create } from 'zustand';
 import type { OutlayerRegisterResponse } from '@/lib/outlayer';
-import type { StepStatus } from '@/types';
+import type { HeartbeatResponse, StepStatus } from '@/types';
 
-type StepNumber = 1 | 2 | 3;
+type OnboardPath = 'new' | 'byo';
+type StepNumber = 1 | 2;
 
 interface AgentStore {
+  /** Which onboarding path the user chose. Null until they pick. */
+  path: OnboardPath | null;
+
   apiKey: string | null;
   accountId: string | null;
-  /** OutLayer `/register`'s `handoff_url`, null when the response omits it. */
+  /** OutLayer `/register`'s `handoff_url`, null for BYO or when omitted. */
   handoffUrl: string | null;
 
-  currentStep: StepNumber;
+  /** Steps only apply to the "new" path (create wallet → fund). */
   stepStatus: Record<StepNumber, StepStatus>;
   stepErrors: Record<StepNumber, string | null>;
 
-  setApiKey: (key: string) => void;
+  /** BYO wallet verification status. */
+  byoStatus: StepStatus;
+  byoError: string | null;
+
+  /** Heartbeat lifecycle — shared by both paths. */
+  heartbeatStatus: StepStatus;
+  heartbeatError: string | null;
+  heartbeatData: HeartbeatResponse | null;
+  /** True when the user chose "Hand off to my agent" instead of activating. */
+  skippedHeartbeat: boolean;
+
+  choosePath: (path: OnboardPath) => void;
+
+  // "new" path
   setStepLoading: (step: StepNumber) => void;
   setStepError: (step: StepNumber, error: string) => void;
   completeStep1: (data: OutlayerRegisterResponse) => void;
   completeStep2: () => void;
-  completeStep3: () => void;
+
+  // "byo" path
+  setByoLoading: () => void;
+  setByoError: (error: string) => void;
+  completeByo: (apiKey: string, accountId: string) => void;
+
+  // post-funding (both paths)
+  setHeartbeatLoading: () => void;
+  setHeartbeatError: (error: string) => void;
+  setHeartbeatSuccess: (data: HeartbeatResponse) => void;
+  skipHeartbeat: () => void;
+
   reset: () => void;
 }
 
 const initialState = {
+  path: null as OnboardPath | null,
   apiKey: null as string | null,
   accountId: null as string | null,
   handoffUrl: null as string | null,
-  currentStep: 1 as StepNumber,
-  stepStatus: {
-    1: 'idle',
-    2: 'idle',
-    3: 'idle',
-  } as Record<StepNumber, StepStatus>,
-  stepErrors: { 1: null, 2: null, 3: null } as Record<
-    StepNumber,
-    string | null
-  >,
+  stepStatus: { 1: 'idle', 2: 'idle' } as Record<StepNumber, StepStatus>,
+  stepErrors: { 1: null, 2: null } as Record<StepNumber, string | null>,
+  byoStatus: 'idle' as StepStatus,
+  byoError: null as string | null,
+  heartbeatStatus: 'idle' as StepStatus,
+  heartbeatError: null as string | null,
+  heartbeatData: null as HeartbeatResponse | null,
+  skippedHeartbeat: false,
 };
 
 export const useAgentStore = create<AgentStore>()((set) => {
@@ -60,10 +87,10 @@ export const useAgentStore = create<AgentStore>()((set) => {
   return {
     ...initialState,
 
-    setApiKey: (key) => set({ apiKey: key }),
+    choosePath: (path) => set({ path }),
 
+    // "new" path
     setStepLoading: (step) => updateStep(step, 'loading'),
-
     setStepError: (step, error) => updateStep(step, 'error', error),
 
     completeStep1: (data) =>
@@ -71,12 +98,31 @@ export const useAgentStore = create<AgentStore>()((set) => {
         apiKey: data.api_key,
         accountId: data.near_account_id,
         handoffUrl: data.handoff_url ?? null,
-        currentStep: 2,
       }),
 
-    completeStep2: () => completeStep(2, { currentStep: 3 }),
+    completeStep2: () => completeStep(2, {}),
 
-    completeStep3: () => completeStep(3, {}),
+    // "byo" path
+    setByoLoading: () => set({ byoStatus: 'loading', byoError: null }),
+    setByoError: (error) => set({ byoStatus: 'error', byoError: error }),
+    completeByo: (apiKey, accountId) =>
+      set({ byoStatus: 'success', byoError: null, apiKey, accountId }),
+
+    // post-funding (both paths)
+    setHeartbeatLoading: () =>
+      set({ heartbeatStatus: 'loading', heartbeatError: null }),
+
+    setHeartbeatError: (error) =>
+      set({ heartbeatStatus: 'error', heartbeatError: error }),
+
+    setHeartbeatSuccess: (data) =>
+      set({
+        heartbeatStatus: 'success',
+        heartbeatError: null,
+        heartbeatData: data,
+      }),
+
+    skipHeartbeat: () => set({ skippedHeartbeat: true }),
 
     reset: () => set(initialState),
   };

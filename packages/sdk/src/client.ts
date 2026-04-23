@@ -3,6 +3,7 @@ import {
   DEFAULT_NAMESPACE,
   DEFAULT_OUTLAYER_URL,
   DEFAULT_TIMEOUT_MS,
+  LIMITS,
 } from './constants';
 import { NearlyError, rateLimitedError } from './errors';
 import { buildEndorsementCounts, foldProfile, foldProfileList } from './graph';
@@ -45,6 +46,7 @@ import type {
   AgentSummary,
   CapabilityCount,
   Edge,
+  EndorsementGraphSnapshot,
   EndorserEntry,
   EndorsingTargetGroup,
   FollowOpts,
@@ -177,6 +179,44 @@ export interface DelistResult {
   account_id: string;
 }
 
+export interface BatchItemError {
+  account_id: string;
+  action: 'error';
+  code: string;
+  error: string;
+  skipped?: SkippedKeySuffix[];
+}
+
+export type BatchFollowItem =
+  | (FollowResult & { account_id: string })
+  | BatchItemError;
+
+export type BatchUnfollowItem =
+  | (UnfollowResult & { account_id: string })
+  | BatchItemError;
+
+export type BatchEndorseItem =
+  | (EndorseResult & { account_id: string })
+  | BatchItemError;
+
+export type BatchUnendorseItem =
+  | (UnendorseResult & { account_id: string })
+  | BatchItemError;
+
+/** Per-target options for `endorseMany`. */
+export interface EndorseTarget {
+  account_id: string;
+  keySuffixes: readonly string[];
+  reason?: string;
+  contentHash?: string;
+}
+
+/** Per-target options for `unendorseMany`. */
+export interface UnendorseTarget {
+  account_id: string;
+  keySuffixes: readonly string[];
+}
+
 /**
  * Options for `NearlyClient.register`. Mirrors `NearlyClientConfig` minus
  * `walletKey` / `accountId` — the static factory provisions those via
@@ -220,8 +260,22 @@ export class NearlyClient {
   private readonly rateLimiter: RateLimiter;
 
   constructor(config: NearlyClientConfig) {
-    if (!config.walletKey) throw new Error('NearlyClient: walletKey required');
-    if (!config.accountId) throw new Error('NearlyClient: accountId required');
+    if (!config.walletKey) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'walletKey',
+        reason: 'empty walletKey',
+        message: 'NearlyClient: walletKey required',
+      });
+    }
+    if (!config.accountId) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'accountId',
+        reason: 'empty accountId',
+        message: 'NearlyClient: accountId required',
+      });
+    }
 
     const namespace = config.namespace ?? DEFAULT_NAMESPACE;
     const fetch = config.fetch;
@@ -409,24 +463,10 @@ export class NearlyClient {
     // handles self-endorse / empty-array / over-limit rejections as
     // synchronous throws before any network work.
     const keyPrefix = `endorsing/${target}/`;
-    const valid: string[] = [];
-    const skipped: SkippedKeySuffix[] = [];
-    const seen = new Set<string>();
-    for (const ks of opts.keySuffixes) {
-      if (typeof ks !== 'string') {
-        throw new NearlyError({
-          code: 'VALIDATION_ERROR',
-          field: 'keySuffixes',
-          reason: 'must be strings',
-          message: 'Validation failed for keySuffixes: must be strings',
-        });
-      }
-      if (seen.has(ks)) continue;
-      seen.add(ks);
-      const e = validateKeySuffix(ks, keyPrefix);
-      if (e) skipped.push({ key_suffix: ks, reason: e.shape.message });
-      else valid.push(ks);
-    }
+    const { valid, skipped } = partitionKeySuffixes(
+      opts.keySuffixes,
+      keyPrefix,
+    );
 
     if (valid.length === 0) {
       throw new NearlyError({
@@ -473,28 +513,8 @@ export class NearlyClient {
     target: string,
     keySuffixes: readonly string[],
   ): Promise<UnendorseResult> {
-    // Same partition pattern as `endorse`: dedup first-wins, validate
-    // each suffix, partition into valid/skipped. Symmetric with the
-    // frontend's `handleUnendorse` post-UE1 fix.
     const keyPrefix = `endorsing/${target}/`;
-    const valid: string[] = [];
-    const skipped: SkippedKeySuffix[] = [];
-    const seen = new Set<string>();
-    for (const ks of keySuffixes) {
-      if (typeof ks !== 'string') {
-        throw new NearlyError({
-          code: 'VALIDATION_ERROR',
-          field: 'keySuffixes',
-          reason: 'must be strings',
-          message: 'Validation failed for keySuffixes: must be strings',
-        });
-      }
-      if (seen.has(ks)) continue;
-      seen.add(ks);
-      const e = validateKeySuffix(ks, keyPrefix);
-      if (e) skipped.push({ key_suffix: ks, reason: e.shape.message });
-      else valid.push(ks);
-    }
+    const { valid, skipped } = partitionKeySuffixes(keySuffixes, keyPrefix);
 
     if (valid.length === 0) {
       throw new NearlyError({
@@ -515,6 +535,333 @@ export class NearlyClient {
       ),
       ...(skipped.length > 0 && { skipped }),
     };
+  }
+
+  // -----------------------------------------------------------------------
+  // Batch methods — partial-success loops matching the frontend's runBatch
+  // -----------------------------------------------------------------------
+
+  /**
+   * Follow multiple targets in one call. Per-target failures (self-follow,
+   * rate-limit, storage error) appear as `{ action: 'error' }` items in
+   * the returned array — the batch continues. INSUFFICIENT_BALANCE on any
+   * write aborts the batch and throws.
+   */
+  async followMany(
+    targets: readonly string[],
+    opts: FollowOpts = {},
+  ): Promise<BatchFollowItem[]> {
+    if (targets.length === 0) return [];
+    if (targets.length > LIMITS.MAX_BATCH_TARGETS) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'targets',
+        reason: `max ${LIMITS.MAX_BATCH_TARGETS}`,
+        message: `Too many targets (max ${LIMITS.MAX_BATCH_TARGETS})`,
+      });
+    }
+
+    const results: BatchFollowItem[] = [];
+    for (const target of targets) {
+      const guard = batchTargetError(
+        target,
+        this.accountId,
+        'SELF_FOLLOW',
+        'follow',
+      );
+      if (guard) {
+        results.push(guard);
+        continue;
+      }
+
+      const rl = this.rateLimiter.check('social.follow', this.accountId);
+      if (!rl.ok) {
+        results.push(
+          batchError(target, 'RATE_LIMITED', 'rate limit reached within batch'),
+        );
+        continue;
+      }
+
+      try {
+        const existing = await kvGetKey(
+          this.read,
+          this.accountId,
+          `graph/follow/${target}`,
+        );
+        if (existing) {
+          results.push({
+            account_id: target,
+            action: 'already_following',
+            target,
+          });
+          continue;
+        }
+      } catch {
+        results.push(batchError(target, 'STORAGE_ERROR', 'read failed'));
+        continue;
+      }
+
+      try {
+        const mutation = buildFollow(this.accountId, target, opts);
+        await writeEntries(this.wallet, mutation.entries);
+      } catch (err) {
+        results.push(categorizeBatchWriteError(err, target));
+        continue;
+      }
+      this.rateLimiter.record('social.follow', this.accountId);
+      results.push({ account_id: target, action: 'followed', target });
+    }
+    return results;
+  }
+
+  /**
+   * Unfollow multiple targets. Same partial-success contract as
+   * `followMany`. INSUFFICIENT_BALANCE aborts; all else is per-item.
+   */
+  async unfollowMany(targets: readonly string[]): Promise<BatchUnfollowItem[]> {
+    if (targets.length === 0) return [];
+    if (targets.length > LIMITS.MAX_BATCH_TARGETS) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'targets',
+        reason: `max ${LIMITS.MAX_BATCH_TARGETS}`,
+        message: `Too many targets (max ${LIMITS.MAX_BATCH_TARGETS})`,
+      });
+    }
+
+    const results: BatchUnfollowItem[] = [];
+    for (const target of targets) {
+      const guard = batchTargetError(
+        target,
+        this.accountId,
+        'SELF_UNFOLLOW',
+        'unfollow',
+      );
+      if (guard) {
+        results.push(guard);
+        continue;
+      }
+
+      const rl = this.rateLimiter.check('social.unfollow', this.accountId);
+      if (!rl.ok) {
+        results.push(
+          batchError(target, 'RATE_LIMITED', 'rate limit reached within batch'),
+        );
+        continue;
+      }
+
+      try {
+        const existing = await kvGetKey(
+          this.read,
+          this.accountId,
+          `graph/follow/${target}`,
+        );
+        if (!existing) {
+          results.push({
+            account_id: target,
+            action: 'not_following',
+            target,
+          });
+          continue;
+        }
+      } catch {
+        results.push(batchError(target, 'STORAGE_ERROR', 'read failed'));
+        continue;
+      }
+
+      try {
+        const mutation = buildUnfollow(this.accountId, target);
+        await writeEntries(this.wallet, mutation.entries);
+      } catch (err) {
+        results.push(categorizeBatchWriteError(err, target));
+        continue;
+      }
+      this.rateLimiter.record('social.unfollow', this.accountId);
+      results.push({ account_id: target, action: 'unfollowed', target });
+    }
+    return results;
+  }
+
+  /**
+   * Endorse multiple targets with per-target `keySuffixes`. Per-target:
+   * suffix partitioning (valid/skipped), target-existence check, write.
+   * INSUFFICIENT_BALANCE aborts; all else is per-item.
+   *
+   * Note: a non-string entry in `keySuffixes` throws `VALIDATION_ERROR`
+   * mid-loop rather than surfacing as a per-item error — the throw is
+   * unreachable from TypeScript callers (`EndorseTarget.keySuffixes`
+   * is `string[]`) and the asymmetry is intentional: it fails loud for
+   * raw-JS misuse. Prior targets in the batch may have already been
+   * written when this throws.
+   */
+  async endorseMany(
+    targets: readonly EndorseTarget[],
+  ): Promise<BatchEndorseItem[]> {
+    if (targets.length === 0) return [];
+    if (targets.length > LIMITS.MAX_BATCH_TARGETS) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'targets',
+        reason: `max ${LIMITS.MAX_BATCH_TARGETS}`,
+        message: `Too many targets (max ${LIMITS.MAX_BATCH_TARGETS})`,
+      });
+    }
+
+    const results: BatchEndorseItem[] = [];
+    for (const entry of targets) {
+      const target = entry.account_id;
+      const guard = batchTargetError(
+        target,
+        this.accountId,
+        'SELF_ENDORSE',
+        'endorse',
+      );
+      if (guard) {
+        results.push(guard);
+        continue;
+      }
+
+      const keyPrefix = `endorsing/${target}/`;
+      const { valid, skipped } = partitionKeySuffixes(
+        entry.keySuffixes,
+        keyPrefix,
+      );
+      if (valid.length === 0) {
+        results.push(
+          batchError(
+            target,
+            'VALIDATION_ERROR',
+            'no valid key_suffixes',
+            skipped,
+          ),
+        );
+        continue;
+      }
+
+      const rl = this.rateLimiter.check('social.endorse', this.accountId);
+      if (!rl.ok) {
+        results.push(
+          batchError(target, 'RATE_LIMITED', 'rate limit reached within batch'),
+        );
+        continue;
+      }
+
+      try {
+        const targetProfile = await kvGetKey(this.read, target, 'profile');
+        if (!targetProfile) {
+          results.push(
+            batchError(target, 'NOT_FOUND', `agent not found: ${target}`),
+          );
+          continue;
+        }
+      } catch {
+        results.push(batchError(target, 'STORAGE_ERROR', 'read failed'));
+        continue;
+      }
+
+      let mutation: ReturnType<typeof buildEndorse>;
+      try {
+        mutation = buildEndorse(this.accountId, target, {
+          keySuffixes: valid,
+          ...(entry.reason != null && { reason: entry.reason }),
+          ...(entry.contentHash != null && { contentHash: entry.contentHash }),
+        });
+        await writeEntries(this.wallet, mutation.entries);
+      } catch (err) {
+        results.push(categorizeBatchWriteError(err, target));
+        continue;
+      }
+      this.rateLimiter.record('social.endorse', this.accountId);
+      results.push({
+        account_id: target,
+        action: 'endorsed',
+        target,
+        key_suffixes: Object.keys(mutation.entries).map((k) =>
+          k.slice(keyPrefix.length),
+        ),
+        ...(skipped.length > 0 && { skipped }),
+      });
+    }
+    return results;
+  }
+
+  /**
+   * Retract endorsements on multiple targets. Each target specifies its
+   * own `keySuffixes`. No target-existence check (FastData tolerates
+   * null-writes on absent keys). INSUFFICIENT_BALANCE aborts.
+   */
+  async unendorseMany(
+    targets: readonly UnendorseTarget[],
+  ): Promise<BatchUnendorseItem[]> {
+    if (targets.length === 0) return [];
+    if (targets.length > LIMITS.MAX_BATCH_TARGETS) {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'targets',
+        reason: `max ${LIMITS.MAX_BATCH_TARGETS}`,
+        message: `Too many targets (max ${LIMITS.MAX_BATCH_TARGETS})`,
+      });
+    }
+
+    const results: BatchUnendorseItem[] = [];
+    for (const entry of targets) {
+      const target = entry.account_id;
+      const guard = batchTargetError(
+        target,
+        this.accountId,
+        'SELF_UNENDORSE',
+        'unendorse',
+      );
+      if (guard) {
+        results.push(guard);
+        continue;
+      }
+
+      const keyPrefix = `endorsing/${target}/`;
+      const { valid, skipped } = partitionKeySuffixes(
+        entry.keySuffixes,
+        keyPrefix,
+      );
+      if (valid.length === 0) {
+        results.push(
+          batchError(
+            target,
+            'VALIDATION_ERROR',
+            'no valid key_suffixes',
+            skipped,
+          ),
+        );
+        continue;
+      }
+
+      const rl = this.rateLimiter.check('social.unendorse', this.accountId);
+      if (!rl.ok) {
+        results.push(
+          batchError(target, 'RATE_LIMITED', 'rate limit reached within batch'),
+        );
+        continue;
+      }
+
+      let mutation: ReturnType<typeof buildUnendorse>;
+      try {
+        mutation = buildUnendorse(this.accountId, target, valid);
+        await writeEntries(this.wallet, mutation.entries);
+      } catch (err) {
+        results.push(categorizeBatchWriteError(err, target));
+        continue;
+      }
+      this.rateLimiter.record('social.unendorse', this.accountId);
+      results.push({
+        account_id: target,
+        action: 'unendorsed',
+        target,
+        key_suffixes: Object.keys(mutation.entries).map((k) =>
+          k.slice(keyPrefix.length),
+        ),
+        ...(skipped.length > 0 && { skipped }),
+      });
+    }
+    return results;
   }
 
   /**
@@ -928,6 +1275,37 @@ export class NearlyClient {
   }
 
   /**
+   * 1-hop endorsement snapshot: both incoming endorsers and outgoing
+   * endorsements for `accountId`, fetched in parallel, plus degree
+   * counts. `degree.incoming` deduplicates endorsers that appear under
+   * multiple key_suffixes. For multi-hop traversal use
+   * `walkEndorsementGraph` from `graph.ts`.
+   */
+  async getEndorsementGraph(
+    accountId: string,
+  ): Promise<EndorsementGraphSnapshot> {
+    const [incoming, outgoing] = await Promise.all([
+      this.getEndorsers(accountId),
+      this.getEndorsing(accountId),
+    ]);
+
+    const incomingIds = new Set<string>();
+    for (const entries of Object.values(incoming)) {
+      for (const entry of entries) incomingIds.add(entry.account_id);
+    }
+
+    return {
+      account_id: accountId,
+      incoming,
+      outgoing,
+      degree: {
+        incoming: incomingIds.size,
+        outgoing: Object.keys(outgoing).length,
+      },
+    };
+  }
+
+  /**
    * All tags with agent counts, sorted by count descending. Tags are
    * derived from the `tag/{tag}` existence index written by each agent,
    * not from profile blobs — so a tag on an agent that hasn't heartbeat
@@ -1146,15 +1524,17 @@ export class NearlyClient {
     // VRF seed is best-effort. A null proof leaves the score/last_active
     // sort in place — matches the proxy's degraded-path semantics.
     let vrf: Awaited<ReturnType<typeof getVrfSeed>> = null;
+    let vrfError: { code: string; message: string } | undefined;
     try {
       vrf = await getVrfSeed(this.wallet, this.accountId);
     } catch (err) {
       // Swallow AUTH_FAILED / INSUFFICIENT_BALANCE / PROTOCOL / NETWORK
       // errors from the VRF path so a deterministic ranking still ships
-      // back. A caller who wants to know the VRF failed can inspect
-      // `response.vrf === null`. Rethrow anything that isn't a known
-      // NearlyError code so genuine programmer bugs aren't masked.
+      // back. Capture the error shape so callers can diagnose why VRF
+      // failed. Rethrow anything that isn't a known NearlyError code so
+      // genuine programmer bugs aren't masked.
       if (!(err instanceof NearlyError)) throw err;
+      vrfError = { code: err.shape.code, message: err.shape.message };
     }
 
     const rng = vrf ? makeRng(vrf.output_hex) : null;
@@ -1168,7 +1548,7 @@ export class NearlyClient {
           : 'New on the network',
     }));
 
-    return { agents, vrf };
+    return { agents, vrf, vrfError };
   }
 
   // -------------------------------------------------------------------------
@@ -1230,6 +1610,80 @@ function aggregateBySuffix(
 
 function followTarget(key: string): string {
   return key.slice('graph/follow/'.length);
+}
+
+// Build a batch per-item error. `skipped` applies to endorse/unendorse
+// all-invalid-suffix cases; omitted otherwise.
+function batchError(
+  target: string,
+  code: string,
+  error: string,
+  skipped?: SkippedKeySuffix[],
+): BatchItemError {
+  return {
+    account_id: target,
+    action: 'error',
+    code,
+    error,
+    ...(skipped && skipped.length > 0 && { skipped }),
+  };
+}
+
+// Gate shared by the four batch methods — self-target or empty target.
+function batchTargetError(
+  target: string,
+  callerAccountId: string,
+  selfCode: string,
+  verb: string,
+): BatchItemError | null {
+  if (target === callerAccountId) {
+    return batchError(target, selfCode, `cannot ${verb} yourself`);
+  }
+  if (!target) {
+    return batchError(target, 'VALIDATION_ERROR', 'account_id is required');
+  }
+  return null;
+}
+
+// Rethrows INSUFFICIENT_BALANCE so the caller aborts the whole batch;
+// all other write errors map to a per-item error.
+function categorizeBatchWriteError(
+  err: unknown,
+  target: string,
+): BatchItemError {
+  if (err instanceof NearlyError && err.shape.code === 'INSUFFICIENT_BALANCE') {
+    throw err;
+  }
+  return batchError(
+    target,
+    err instanceof NearlyError ? err.shape.code : 'STORAGE_ERROR',
+    err instanceof NearlyError ? err.shape.message : 'write failed',
+  );
+}
+
+function partitionKeySuffixes(
+  raw: readonly unknown[],
+  prefix: string,
+): { valid: string[]; skipped: SkippedKeySuffix[] } {
+  const valid: string[] = [];
+  const skipped: SkippedKeySuffix[] = [];
+  const seen = new Set<string>();
+  for (const ks of raw) {
+    if (typeof ks !== 'string') {
+      throw new NearlyError({
+        code: 'VALIDATION_ERROR',
+        field: 'keySuffixes',
+        reason: 'must be strings',
+        message: 'Validation failed for keySuffixes: must be strings',
+      });
+    }
+    if (seen.has(ks)) continue;
+    seen.add(ks);
+    const e = validateKeySuffix(ks, prefix);
+    if (e) skipped.push({ key_suffix: ks, reason: e.shape.message });
+    else valid.push(ks);
+  }
+  return { valid, skipped };
 }
 
 async function drain<T>(iter: AsyncIterable<T>): Promise<T[]> {

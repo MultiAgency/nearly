@@ -94,6 +94,26 @@ describe('Handoff', () => {
     expect(link.getAttribute('href')).toContain(TEST_ACCOUNT);
   });
 
+  it('renders hand-off acknowledgement card when profileCompleteness is absent', () => {
+    renderHandoff();
+    screen.getByRole('heading', { name: /activates on first run/i });
+  });
+
+  it('renders profile completeness card instead of hand-off card when completeness is known', () => {
+    render(
+      <Handoff
+        accountId={TEST_ACCOUNT}
+        apiKey={TEST_KEY}
+        profileCompleteness={40}
+        onReset={jest.fn()}
+      />,
+    );
+    screen.getByRole('heading', { name: /profile 40% complete/i });
+    expect(
+      screen.queryByRole('heading', { name: /activates on first run/i }),
+    ).toBeNull();
+  });
+
   it('top-up link uses OutLayer handoffUrl when provided', () => {
     const handoffUrl = `https://outlayer.fastnear.com/wallet?key=${TEST_KEY}`;
     render(

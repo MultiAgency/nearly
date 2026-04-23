@@ -1,51 +1,25 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import type { GraphEdge, GraphNode, Pulse } from './physics';
+import type { GraphEdge, GraphNode, Pulse } from '@/components/graphs/physics';
 import {
   applyForces,
+  buildAdjacency,
   EDGE_COLOR,
+  hitTestNode,
   NODE_COLOR,
   PULSE_COLOR,
+  rgba,
   updatePulses,
-} from './physics';
+} from '@/components/graphs/physics';
+import type { GraphData } from './graph-data';
 import { useGraphData } from './use-graph-data';
 
 const LABEL_COLOR = [160, 160, 170];
 
-function buildAdjacency(edges: GraphEdge[]): Map<string, Set<string>> {
-  const adjacency = new Map<string, Set<string>>();
-  for (const e of edges) {
-    if (!adjacency.has(e.from)) adjacency.set(e.from, new Set());
-    if (!adjacency.has(e.to)) adjacency.set(e.to, new Set());
-    adjacency.get(e.from)!.add(e.to);
-    adjacency.get(e.to)!.add(e.from);
-  }
-  return adjacency;
-}
-
-function hitTestNode(
-  nodes: GraphNode[],
-  mx: number,
-  my: number,
-): string | null {
-  for (const node of nodes) {
-    const dx = mx - node.x;
-    const dy = my - node.y;
-    if (dx * dx + dy * dy < (node.radius + 8) * (node.radius + 8)) {
-      return node.id;
-    }
-  }
-  return null;
-}
-
 interface HoverState {
   id: string | null;
   neighbors: Set<string> | null;
-}
-
-function rgba(color: number[], alpha: number): string {
-  return `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
 }
 
 function drawEdges(
@@ -157,11 +131,15 @@ function drawGraph(
   drawNodes(ctx, nodes, hover);
 }
 
-export function LiveGraph() {
+export function LiveGraph({
+  initialData,
+}: {
+  initialData?: GraphData | null;
+} = {}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
   const hoverRef = useRef<string | null>(null);
-  const graphData = useGraphData();
+  const graphData = useGraphData(initialData);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -188,6 +166,14 @@ export function LiveGraph() {
     const pulses: Pulse[] = [];
     const pulseTimer = { value: 0 };
     let initialized = false;
+    // Freeze physics once nodes stop moving. Pulses keep running so the
+    // graph still feels alive; force calculations (the O(n²) repulsion
+    // loop) are the cost we're cutting. Hover only affects display, not
+    // physics, so there's no reason to wake the simulation on hover.
+    const VELOCITY_THRESHOLD_SQ = 0.02;
+    const SETTLE_FRAMES = 60;
+    let settledFrames = 0;
+    let physicsSettled = false;
 
     function resize() {
       const rect = canvas!.getBoundingClientRect();
@@ -227,7 +213,19 @@ export function LiveGraph() {
     resize();
 
     function tick() {
-      applyForces(nodes, edges, nodeMap, w, h);
+      if (!physicsSettled) {
+        applyForces(nodes, edges, nodeMap, w, h);
+        let kineticEnergy = 0;
+        for (const node of nodes) {
+          kineticEnergy += node.vx * node.vx + node.vy * node.vy;
+        }
+        if (kineticEnergy < VELOCITY_THRESHOLD_SQ) {
+          settledFrames++;
+          if (settledFrames >= SETTLE_FRAMES) physicsSettled = true;
+        } else {
+          settledFrames = 0;
+        }
+      }
       updatePulses(pulses, edges, pulseTimer);
     }
 

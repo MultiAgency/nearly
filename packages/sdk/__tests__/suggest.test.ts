@@ -49,16 +49,11 @@ describe('makeRng', () => {
     expect(rng.pick(0)).toBeNull();
   });
 
-  it('output matches frontend makeRng byte-for-byte', () => {
-    // This test pins the xorshift32 state transition — if the SDK and
-    // frontend implementations ever drift, the two shuffles would
-    // surface different orderings for the same VRF proof. The expected
-    // sequence below was computed from the frontend's `makeRng` in
-    // `fastdata-dispatch.ts` using seed "deadbeef" and n=1000.
+  it('pins the xorshift32 output sequence for seed "deadbeef"', () => {
+    // Regenerate via node one-liner if the (13, 17, 5) constants or the
+    // first-4-bytes-pack seeding formula ever change. A drift here means
+    // every VRF-shuffled suggestion ordering silently moves.
     const rng = makeRng('deadbeef');
-    // First 5 picks with n=1000 — regenerate from the frontend if the
-    // xorshift constants ever change. Stable as long as (13, 17, 5)
-    // and the first-4-bytes-pack seeding formula stay.
     const seq = [
       rng.pick(1000),
       rng.pick(1000),
@@ -66,12 +61,7 @@ describe('makeRng', () => {
       rng.pick(1000),
       rng.pick(1000),
     ];
-    expect(seq).toHaveLength(5);
-    seq.forEach((v) => {
-      expect(v).not.toBeNull();
-      expect(v).toBeGreaterThanOrEqual(0);
-      expect(v).toBeLessThan(1000);
-    });
+    expect(seq).toEqual([492, 836, 529, 320, 865]);
   });
 });
 

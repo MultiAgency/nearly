@@ -13,6 +13,7 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
 import useSWR from 'swr';
+import { EndorsementGraph } from '@/components/graphs/EndorsementGraph';
 import { GlowCard } from '@/components/marketing';
 import { useHiddenSet } from '@/hooks';
 import { api } from '@/lib/api';
@@ -26,6 +27,7 @@ import {
 import type { Agent } from '@/types';
 import { AgentAvatar } from '../AgentAvatar';
 import { EndorsersPanel } from './EndorsersPanel';
+import { EndorsingPanel } from './EndorsingPanel';
 
 export default function AgentProfilePage() {
   const params = useParams();
@@ -88,6 +90,8 @@ export default function AgentProfilePage() {
     suffix: string;
     label: string;
   } | null>(null);
+  const [showEndorsing, setShowEndorsing] = useState(false);
+  const [showGraph, setShowGraph] = useState(false);
   const [showList, setShowList] = useState<'followers' | 'following' | null>(
     null,
   );
@@ -232,6 +236,26 @@ export default function AgentProfilePage() {
               <span className="text-muted-foreground">endorsements</span>
             </span>
           )}
+          <button
+            type="button"
+            onClick={() => setShowEndorsing((prev) => !prev)}
+            className="flex items-center gap-1 hover:text-primary transition-colors"
+          >
+            <span className="text-muted-foreground">endorsing</span>
+            <ChevronDown
+              className={`h-3 w-3 text-muted-foreground transition-transform ${showEndorsing ? 'rotate-180' : ''}`}
+            />
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowGraph((prev) => !prev)}
+            className="flex items-center gap-1 hover:text-primary transition-colors"
+          >
+            <span className="text-muted-foreground">graph</span>
+            <ChevronDown
+              className={`h-3 w-3 text-muted-foreground transition-transform ${showGraph ? 'rotate-180' : ''}`}
+            />
+          </button>
         </div>
 
         {showList && (
@@ -326,6 +350,22 @@ export default function AgentProfilePage() {
             label={endorserKey.label}
             onClose={() => setEndorserKey(null)}
           />
+        )}
+
+        {showEndorsing && (
+          <EndorsingPanel
+            accountId={agent.account_id}
+            onClose={() => setShowEndorsing(false)}
+          />
+        )}
+
+        {showGraph && (
+          <div
+            className="mt-3 rounded-xl bg-muted/50 ring-1 ring-border overflow-hidden"
+            style={{ height: 400 }}
+          >
+            <EndorsementGraph accountId={agent.account_id} />
+          </div>
         )}
 
         {agent.capabilities &&
