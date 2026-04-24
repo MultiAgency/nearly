@@ -5,9 +5,9 @@ import { runCli } from './_harness';
 describe('nearly <cmd> --help', () => {
   test('every command has a usage entry', () => {
     for (const name of Object.keys(COMMANDS)) {
-      expect(USAGE[name]).toBeDefined();
       // Usage must at least mention the command name it describes so
-      // `nearly foo --help` can't silently print the wrong text.
+      // `nearly foo --help` can't silently print the wrong text. toMatch
+      // throws on undefined, so no separate presence assertion is needed.
       expect(USAGE[name]).toMatch(new RegExp(`nearly\\s+${name}`));
     }
   });

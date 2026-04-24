@@ -1,7 +1,6 @@
 import { clearCache } from '@/lib/cache';
 import * as fastdata from '@/lib/fastdata';
 import { dispatchFastData } from '@/lib/fastdata-dispatch';
-import { profileCompleteness, profileGaps } from '@/lib/fastdata-utils';
 
 const AGENT_ALICE = {
   name: null,
@@ -90,112 +89,6 @@ function expectError(result: unknown): string {
   expect(result).toHaveProperty('error');
   return (result as { error: string }).error;
 }
-
-describe('profileCompleteness', () => {
-  // 100 is "richly populated" (every field, ≥10 tags, ≥3 capability
-  // pairs), not "minimally filled" — agents read the score as a
-  // progress signal across heartbeats.
-  const COMPLETE_AGENT = {
-    name: 'Alice',
-    description: 'A description longer than 10 chars',
-    image: 'https://example.com/avatar.png',
-    // 10 tags hits the tag cap (10 × 2 = 20).
-    tags: ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10'],
-    // 3 leaf pairs hits the capability cap (3 × 10 = 30).
-    capabilities: { skills: ['s1', 's2', 's3'] },
-  };
-
-  it('returns 100 when all fields are richly populated', () => {
-    expect(profileGaps(COMPLETE_AGENT)).toEqual([]);
-    expect(profileCompleteness(COMPLETE_AGENT)).toBe(100);
-  });
-
-  it('penalizes missing name', () => {
-    expect(profileGaps({ ...COMPLETE_AGENT, name: null })).toContain('name');
-  });
-
-  it('penalizes missing description', () => {
-    expect(profileGaps({ ...COMPLETE_AGENT, description: '' })).toContain(
-      'description',
-    );
-  });
-
-  it('penalizes description <= 10 chars', () => {
-    expect(
-      profileGaps({ ...COMPLETE_AGENT, description: '0123456789' }),
-    ).toContain('description');
-  });
-
-  it('accepts description > 10 chars', () => {
-    expect(
-      profileGaps({ ...COMPLETE_AGENT, description: '01234567890' }),
-    ).not.toContain('description');
-  });
-
-  it('penalizes empty tags', () => {
-    expect(profileGaps({ ...COMPLETE_AGENT, tags: [] })).toContain('tags');
-  });
-
-  it('penalizes empty capabilities', () => {
-    expect(profileGaps({ ...COMPLETE_AGENT, capabilities: {} })).toContain(
-      'capabilities',
-    );
-  });
-
-  it('penalizes missing image', () => {
-    expect(profileGaps({ ...COMPLETE_AGENT, image: null })).toContain('image');
-  });
-
-  it('scores tags continuously (2 points per tag, cap 10)', () => {
-    // 1 tag: 10 (name) + 20 (desc) + 20 (image) + 2 (tags) + 30 (caps) = 82
-    expect(profileCompleteness({ ...COMPLETE_AGENT, tags: ['t1'] })).toBe(82);
-    // 5 tags: ... + 10 (tags) ... = 90
-    expect(
-      profileCompleteness({
-        ...COMPLETE_AGENT,
-        tags: ['t1', 't2', 't3', 't4', 't5'],
-      }),
-    ).toBe(90);
-    // 15 tags: capped at 10 → 20 (tags) → 100 total
-    expect(
-      profileCompleteness({
-        ...COMPLETE_AGENT,
-        tags: Array.from({ length: 15 }, (_, i) => `t${i}`),
-      }),
-    ).toBe(100);
-  });
-
-  it('scores capabilities continuously (10 points per leaf pair, cap 3)', () => {
-    // 1 pair: 10 (name) + 20 (desc) + 20 (image) + 20 (tags) + 10 (caps) = 80
-    expect(
-      profileCompleteness({
-        ...COMPLETE_AGENT,
-        capabilities: { skills: ['s1'] },
-      }),
-    ).toBe(80);
-    // 5 pairs: capped at 3 → 30 (caps) → 100 total
-    expect(
-      profileCompleteness({
-        ...COMPLETE_AGENT,
-        capabilities: {
-          skills: ['s1', 's2', 's3'],
-          languages: ['l1', 'l2'],
-        },
-      }),
-    ).toBe(100);
-  });
-
-  it('scores AGENT_ALICE at 24 (description 20 + tags 4; name, capabilities, image missing)', () => {
-    // AGENT_ALICE: name: null (0), description: "Test agent Alice" (20),
-    // image: null (0), tags: ['ai','defi'] → 2 × 2 = 4, capabilities: {} (0).
-    // Total = 20 + 4 = 24.
-    expect(
-      profileCompleteness(
-        AGENT_ALICE as Parameters<typeof profileCompleteness>[0],
-      ),
-    ).toBe(24);
-  });
-});
 
 describe('dispatchFastData', () => {
   describe('unsupported actions', () => {

@@ -239,7 +239,7 @@ describe('no-profile caller (gate dropped)', () => {
 
     const result = await handleEndorse(
       WK,
-      { targets: ['bob.near'], key_suffixes: ['tags/ai'] },
+      { account_id: 'bob.near', key_suffixes: ['tags/ai'] },
       resolveAccountId,
     );
 
@@ -298,7 +298,7 @@ describe('self-action prevention', () => {
   it('handleEndorse rejects self-endorse', async () => {
     const result = await handleEndorse(
       WK,
-      { targets: ['alice.near'], key_suffixes: ['tags/test'] },
+      { account_id: 'alice.near', key_suffixes: ['tags/test'] },
       resolveAccountId,
     );
     expect(result).toMatchObject({
@@ -314,7 +314,7 @@ describe('self-action prevention', () => {
   it('handleUnendorse rejects self-unendorse', async () => {
     const result = await handleUnendorse(
       WK,
-      { targets: ['alice.near'], key_suffixes: ['tags/test'] },
+      { account_id: 'alice.near', key_suffixes: ['tags/test'] },
       resolveAccountId,
     );
     expect(result).toMatchObject({
@@ -371,7 +371,7 @@ describe('idempotency', () => {
 
     const result = await handleEndorse(
       WK,
-      { targets: ['bob.near'], key_suffixes: ['tags/ai'] },
+      { account_id: 'bob.near', key_suffixes: ['tags/ai'] },
       resolveAccountId,
     );
     expect(result).toMatchObject({
@@ -755,7 +755,10 @@ describe('heartbeat delta', () => {
 // ---------------------------------------------------------------------------
 
 describe('social.delist_me', () => {
-  it('null-writes agent keys, follow edges, endorsement edges, and capability keys', async () => {
+  // Envelope byte-shape (profile/tag/cap/follow/endorse nulls) is pinned in
+  // write-entries-parity.test.ts. This test only asserts the handler's
+  // response contract on the happy path.
+  it('returns a success response with action="delisted"', async () => {
     mockKvGetAgent.mockImplementation(async (id: string, key: string) => {
       if (key === 'profile' && id === 'alice.near') {
         return profileEntry('alice.near', {
@@ -784,16 +787,6 @@ describe('social.delist_me', () => {
       success: true,
       data: { action: 'delisted', account_id: 'alice.near' },
     });
-
-    const writeCall = mockFetchWithTimeout.mock.calls[0];
-    const body = JSON.parse(writeCall[1]!.body as string);
-    const args = body.args;
-    expect(args.profile).toBeNull();
-    expect(args['graph/follow/bob']).toBeNull();
-    expect(args['graph/follow/charlie']).toBeNull();
-    expect(args['endorsing/bob/tags/ai']).toBeNull();
-    expect(args['tag/test']).toBeNull();
-    expect(args['cap/skills/testing']).toBeNull();
   });
 
   it('returns STORAGE_ERROR when write fails', async () => {
@@ -997,7 +990,7 @@ describe('handleEndorse key_suffixes', () => {
   it('rejects when key_suffixes missing or empty', async () => {
     const result = await dispatchWrite(
       'social.endorse',
-      { targets: ['bob.near'] },
+      { account_id: 'bob.near' },
       WK,
       resolveAccountId,
     );
@@ -1005,7 +998,7 @@ describe('handleEndorse key_suffixes', () => {
 
     const result2 = await dispatchWrite(
       'social.endorse',
-      { targets: ['bob.near'], key_suffixes: [] },
+      { account_id: 'bob.near', key_suffixes: [] },
       WK,
       resolveAccountId,
     );
@@ -1016,7 +1009,7 @@ describe('handleEndorse key_suffixes', () => {
     const tooMany = Array.from({ length: 21 }, (_, i) => `tags/k${i}`);
     const result = await dispatchWrite(
       'social.endorse',
-      { targets: ['bob.near'], key_suffixes: tooMany },
+      { account_id: 'bob.near', key_suffixes: tooMany },
       WK,
       resolveAccountId,
     );
@@ -1033,7 +1026,7 @@ describe('handleEndorse key_suffixes', () => {
 
     const result = await dispatchWrite(
       'social.endorse',
-      { targets: ['bob.near'], key_suffixes: ['task_completion/job_123'] },
+      { account_id: 'bob.near', key_suffixes: ['task_completion/job_123'] },
       WK,
       resolveAccountId,
     );
@@ -1064,7 +1057,7 @@ describe('handleEndorse key_suffixes', () => {
     const result = await dispatchWrite(
       'social.endorse',
       {
-        targets: ['bob.near'],
+        account_id: 'bob.near',
         key_suffixes: ['/absolute/path', 'has\u0000null'],
       },
       WK,
@@ -1095,7 +1088,7 @@ describe('handleEndorse key_suffixes', () => {
 
     const result = await dispatchWrite(
       'social.endorse',
-      { targets: ['bob.near'], key_suffixes: [huge] },
+      { account_id: 'bob.near', key_suffixes: [huge] },
       WK,
       resolveAccountId,
     );
@@ -1115,7 +1108,7 @@ describe('handleEndorse key_suffixes', () => {
   it('rejects endorsement when the target does not exist', async () => {
     const result = await dispatchWrite(
       'social.endorse',
-      { targets: ['nobody.near'], key_suffixes: ['tags/ai'] },
+      { account_id: 'nobody.near', key_suffixes: ['tags/ai'] },
       WK,
       resolveAccountId,
     );
@@ -1140,7 +1133,7 @@ describe('handleEndorse key_suffixes', () => {
     const result = await dispatchWrite(
       'social.endorse',
       {
-        targets: ['bob.near'],
+        account_id: 'bob.near',
         key_suffixes: ['tags/rust', 'tags/security', 'skills/audit'],
       },
       WK,
@@ -1176,7 +1169,7 @@ describe('handleEndorse key_suffixes', () => {
     await dispatchWrite(
       'social.endorse',
       {
-        targets: ['bob.near'],
+        account_id: 'bob.near',
         key_suffixes: ['task/job_42'],
         content_hash: 'sha256:abc',
       },
@@ -1204,7 +1197,7 @@ describe('handleEndorse key_suffixes', () => {
     const result = await dispatchWrite(
       'social.endorse',
       {
-        targets: ['bob.near'],
+        account_id: 'bob.near',
         key_suffixes: ['task/job_42'],
         content_hash: 'sha256:new',
       },
@@ -1242,7 +1235,7 @@ describe('handleEndorse key_suffixes', () => {
     const result = await dispatchWrite(
       'social.endorse',
       {
-        targets: ['bob.near'],
+        account_id: 'bob.near',
         key_suffixes: ['task/job_42'],
         content_hash: 'sha256:same',
       },
@@ -1267,7 +1260,7 @@ describe('handleEndorse key_suffixes', () => {
   it('skips self-endorse with per-item error', async () => {
     const result = await dispatchWrite(
       'social.endorse',
-      { targets: ['alice.near'], key_suffixes: ['tags/ai'] },
+      { account_id: 'alice.near', key_suffixes: ['tags/ai'] },
       WK,
       resolveAccountId,
     );
@@ -1287,7 +1280,17 @@ describe('handleEndorse key_suffixes', () => {
 });
 
 describe('handleUnendorse key_suffixes', () => {
-  it('null-writes existing keys for the caller', async () => {
+  // This test intentionally uses the deprecated flat-string `{targets: [string]}` form to pin
+  // the `resolveEndorseTargets` legacy branch — the only test keeping that code path covered.
+  // The format is discouraged per openapi.json; every other endorse/unendorse test now uses the
+  // supported single-target (`{account_id, key_suffixes}`) form.
+  //
+  // Mechanical coupling: the assertion on the deprecation console.warn below fires only when
+  // the legacy branch in resolveEndorseTargets actually sets `usedFlatForm = true`. If that
+  // branch is ever removed from production, this test fails loudly — signaling that both this
+  // test and the legacy branch can be deleted together.
+  it('null-writes existing keys for the caller (deprecated flat-string form)', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     mockProfile('bob.near');
     mockKvMultiAgent.mockImplementation(async (queries) => {
       return queries.map((q) => {
@@ -1325,6 +1328,16 @@ describe('handleUnendorse key_suffixes', () => {
     expect(args['endorsing/bob.near/tags/ai']).toBeNull();
     expect(args['endorsing/bob.near/task/job_1']).toBeNull();
     expect(args['endorsing/bob.near/task/not_there']).toBeUndefined();
+
+    // The mechanical pin: if the legacy branch is removed from
+    // resolveEndorseTargets, usedFlatForm can never be true and this warn
+    // never fires. Deletion of the production branch then forces deletion
+    // of this test — the two stay in lockstep.
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[unendorse] deprecated flat-string targets form',
+      expect.any(Object),
+    );
+    warnSpy.mockRestore();
   });
 });
 

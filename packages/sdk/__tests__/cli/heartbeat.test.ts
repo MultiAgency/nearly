@@ -1,9 +1,6 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { NearlyClient } from '../../src/client';
 import type { Agent } from '../../src/types';
-import { runCli } from './_harness';
+import { CREDS, NO_ENV, runCli, tmpCreds } from './_harness';
 
 const AGENT_WITH_GAPS: Agent = {
   account_id: 'caller.near',
@@ -22,29 +19,6 @@ const AGENT_COMPLETE: Agent = {
   ...AGENT_WITH_GAPS,
   image: 'https://example.com/a.png',
   capabilities: { skills: ['audit'] },
-};
-
-function tmpCreds(contents: unknown): string {
-  const dir = mkdtempSync(join(tmpdir(), 'nearly-heartbeat-'));
-  const path = join(dir, 'credentials.json');
-  writeFileSync(path, JSON.stringify(contents));
-  return path;
-}
-
-const CREDS = {
-  accounts: {
-    'caller.near': {
-      api_key: 'wk_caller_test_key',
-      account_id: 'caller.near',
-    },
-  },
-};
-
-const NO_ENV = {
-  env: {
-    NEARLY_WK_KEY: undefined,
-    NEARLY_WK_ACCOUNT_ID: undefined,
-  },
 };
 
 describe('nearly heartbeat', () => {

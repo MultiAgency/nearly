@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { OutlayerRegisterResponse } from '@/lib/outlayer';
 import type { HeartbeatResponse, StepStatus } from '@/types';
 
-type OnboardPath = 'new' | 'byo';
+type OnboardPath = 'new' | 'byo' | 'external-near';
 type StepNumber = 1 | 2;
 
 interface AgentStore {
@@ -21,6 +21,29 @@ interface AgentStore {
   /** BYO wallet verification status. */
   byoStatus: StepStatus;
   byoError: string | null;
+
+  /**
+   * External-NEAR (deterministic) path. Caller supplies their own NEAR
+   * account + ed25519 key; signing happens in the browser; OutLayer
+   * returns a derived wallet (`walletId` + hex64 `nearAccountId`).
+   *
+   * When the user opts into delegate-key minting (default), the flow
+   * also mints a session-scoped `wk_` via `PUT /wallet/v1/api-key` and
+   * activates it on the `ApiClient` singleton — the user gets a working
+   * agent in one step. The `wk_` is never persisted to browser storage;
+   * page reload re-derives it by re-running the flow with the same
+   * inputs.
+   *
+   * When the user opts out (`--no-mint-key` equivalent), only
+   * provisioning runs and `externalNearWalletKey` stays null — matches
+   * the second-reopen "manage externally" shape.
+   */
+  externalNearStatus: StepStatus;
+  externalNearError: string | null;
+  externalNearWalletId: string | null;
+  externalNearNearAccountId: string | null;
+  /** Minted delegate `wk_`, session-scoped. Null in provisioning-only mode. */
+  externalNearWalletKey: string | null;
 
   /** Heartbeat lifecycle — shared by both paths. */
   heartbeatStatus: StepStatus;
@@ -42,6 +65,15 @@ interface AgentStore {
   setByoError: (error: string) => void;
   completeByo: (apiKey: string, accountId: string) => void;
 
+  // "external-near" path
+  setExternalNearLoading: () => void;
+  setExternalNearError: (error: string) => void;
+  completeExternalNear: (
+    walletId: string,
+    nearAccountId: string,
+    walletKey?: string | null,
+  ) => void;
+
   // post-funding (both paths)
   setHeartbeatLoading: () => void;
   setHeartbeatError: (error: string) => void;
@@ -60,6 +92,11 @@ const initialState = {
   stepErrors: { 1: null, 2: null } as Record<StepNumber, string | null>,
   byoStatus: 'idle' as StepStatus,
   byoError: null as string | null,
+  externalNearStatus: 'idle' as StepStatus,
+  externalNearError: null as string | null,
+  externalNearWalletId: null as string | null,
+  externalNearNearAccountId: null as string | null,
+  externalNearWalletKey: null as string | null,
   heartbeatStatus: 'idle' as StepStatus,
   heartbeatError: null as string | null,
   heartbeatData: null as HeartbeatResponse | null,
@@ -107,6 +144,24 @@ export const useAgentStore = create<AgentStore>()((set) => {
     setByoError: (error) => set({ byoStatus: 'error', byoError: error }),
     completeByo: (apiKey, accountId) =>
       set({ byoStatus: 'success', byoError: null, apiKey, accountId }),
+
+    // "external-near" path
+    setExternalNearLoading: () =>
+      set({ externalNearStatus: 'loading', externalNearError: null }),
+    setExternalNearError: (error) =>
+      set({ externalNearStatus: 'error', externalNearError: error }),
+    completeExternalNear: (walletId, nearAccountId, walletKey = null) =>
+      set({
+        externalNearStatus: 'success',
+        externalNearError: null,
+        externalNearWalletId: walletId,
+        externalNearNearAccountId: nearAccountId,
+        externalNearWalletKey: walletKey,
+        // When a delegate wk_ was minted, also populate the shared
+        // apiKey/accountId fields so the post-funding heartbeat flow
+        // (shared with new/byo paths) can use the same credentials.
+        ...(walletKey ? { apiKey: walletKey, accountId: nearAccountId } : {}),
+      }),
 
     // post-funding (both paths)
     setHeartbeatLoading: () =>

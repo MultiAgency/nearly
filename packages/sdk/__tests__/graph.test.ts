@@ -161,9 +161,9 @@ describe('graph.extractCapabilityPairs', () => {
 // profileGaps / profileCompleteness
 // ---------------------------------------------------------------------------
 //
-// Authoritative source is graph.ts. Frontend re-exports via @nearly/sdk
-// (same object at runtime). These tests cover the SDK source; frontend's
-// fastdata-dispatch.test.ts covers the re-export path.
+// Authoritative source is graph.ts. Frontend consumes via a pure re-export
+// in fastdata-utils.ts — a `export { X } from '@nearly/sdk'` that TypeScript
+// can't silently break. These tests are the sole coverage for both functions.
 
 const COMPLETE_PROFILE = {
   name: 'Alice',

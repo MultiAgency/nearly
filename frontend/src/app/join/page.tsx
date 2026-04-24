@@ -1,7 +1,9 @@
 'use client';
 
+import { createDeterministicWallet, mintDelegateKey } from '@nearly/sdk';
 import {
   ArrowRight,
+  IdCard,
   KeyRound,
   Loader2,
   RefreshCw,
@@ -188,7 +190,268 @@ function PathPicker() {
       >
         <KeyRound className="h-4 w-4 mr-2" />I Have a Wallet Key
       </Button>
+      <Button
+        onClick={() => store.choosePath('external-near')}
+        disabled={loading}
+        variant="outline"
+        className="w-full rounded-xl"
+      >
+        <IdCard className="h-4 w-4 mr-2" />I Have a NEAR Account
+      </Button>
       {error && <p className="text-sm text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  External-NEAR path (deterministic registration)                    */
+/* ------------------------------------------------------------------ */
+
+function ExternalNearPath({ fireHeartbeat }: { fireHeartbeat: () => void }) {
+  const store = useAgentStore();
+  const [accountId, setAccountId] = useState('');
+  const [seed, setSeed] = useState('');
+  const [privateKey, setPrivateKey] = useState('');
+  const [mintKey, setMintKey] = useState(true);
+
+  const handleRegister = async () => {
+    const trimmedAccount = accountId.trim();
+    const trimmedSeed = seed.trim();
+    const trimmedKey = privateKey.trim();
+    if (!trimmedAccount) {
+      store.setExternalNearError('Account ID is required.');
+      return;
+    }
+    if (!trimmedSeed) {
+      store.setExternalNearError('Seed is required.');
+      return;
+    }
+    if (!trimmedKey.startsWith('ed25519:')) {
+      store.setExternalNearError(
+        'Private key must start with "ed25519:" followed by a base58 body.',
+      );
+      return;
+    }
+    store.setExternalNearLoading();
+    try {
+      // Route through the same-origin proxy (Next rewrites in
+      // `next.config.js` forward `/api/outlayer/*` to OutLayer). Direct
+      // cross-origin calls work for POST /register but OutLayer's CORS
+      // config omits PUT from Access-Control-Allow-Methods (verified
+      // 2026-04-23), which breaks the mintDelegateKey preflight. The
+      // proxy avoids CORS entirely — server-to-server forward. Don't
+      // swap back to OUTLAYER_API_URL here without re-checking that PUT
+      // is in OutLayer's CORS allowlist.
+      const browserOutlayerUrl = '/api/outlayer';
+      const provisioned = await createDeterministicWallet({
+        outlayerUrl: browserOutlayerUrl,
+        accountId: trimmedAccount,
+        seed: trimmedSeed,
+        privateKey: trimmedKey,
+      });
+      let walletKey: string | null = null;
+      if (mintKey) {
+        try {
+          const minted = await mintDelegateKey({
+            outlayerUrl: browserOutlayerUrl,
+            accountId: trimmedAccount,
+            seed: trimmedSeed,
+            privateKey: trimmedKey,
+          });
+          walletKey = minted.walletKey;
+          // Session-scoped activation: the ApiClient singleton takes the
+          // minted wk_ so subsequent Nearly calls (heartbeat, follow)
+          // auth through the existing wk_-path. No browser storage.
+          api.setApiKey(walletKey);
+        } catch (mintErr) {
+          setPrivateKey('');
+          store.setExternalNearError(
+            `Wallet provisioned (${provisioned.nearAccountId}) but delegate-key minting failed: ${friendlyError(mintErr)}. Re-enter your NEAR key and retry — derivation is deterministic, same inputs yield the same wallet.`,
+          );
+          return;
+        }
+      }
+      // Clear the private key from form state after signing completes.
+      // The browser retains decoded bytes inside the SDK helpers' call
+      // scope only; nothing persists past this point.
+      setPrivateKey('');
+      store.completeExternalNear(
+        provisioned.walletId,
+        provisioned.nearAccountId,
+        walletKey,
+      );
+    } catch (err) {
+      setPrivateKey('');
+      store.setExternalNearError(friendlyError(err));
+    }
+  };
+
+  if (store.externalNearStatus === 'success') {
+    const derivedAccount = store.externalNearNearAccountId ?? '';
+    const walletKey = store.externalNearWalletKey;
+    return (
+      <div className="space-y-4">
+        <div className="p-4 rounded-xl bg-primary/5 border border-primary/20 space-y-2">
+          <div>
+            <p className="text-xs text-muted-foreground mb-1">Wallet ID</p>
+            <p className="text-sm font-mono font-bold text-primary break-all">
+              {store.externalNearWalletId}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground mb-1">
+              Derived NEAR Account
+            </p>
+            <p className="text-sm font-mono font-bold text-primary break-all">
+              {derivedAccount}
+            </p>
+          </div>
+        </div>
+        {walletKey ? (
+          <>
+            <MaskedCopyField label="Delegate Wallet Key" value={walletKey} />
+            <div className="flex items-start gap-2 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
+              <ShieldAlert className="h-4 w-4 text-yellow-500 mt-0.5 shrink-0" />
+              <p className="text-xs text-yellow-200/80">
+                Active for this session. Save it if you want durability — it is
+                not stored in the browser. Re-derives from the same NEAR key +
+                seed on a future visit.
+              </p>
+            </div>
+            {derivedAccount && (
+              <a
+                href={EXTERNAL_URLS.OUTLAYER_FUND(derivedAccount)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/80 transition-colors"
+              >
+                <ArrowRight className="h-4 w-4" />
+                Fund with {FUND_AMOUNT_NEAR} NEAR
+              </a>
+            )}
+            <PostFunding fireHeartbeat={fireHeartbeat} />
+          </>
+        ) : (
+          <>
+            <div className="flex items-start gap-2 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
+              <ShieldAlert className="h-4 w-4 text-yellow-500 mt-0.5 shrink-0" />
+              <p className="text-xs text-yellow-200/80">
+                Provisioning only. No <code>wk_</code> was issued — manage this
+                wallet via OutLayer with your NEAR key. Heartbeat and social
+                mutations through Nearly require a <code>wk_</code> key.
+              </p>
+            </div>
+            {derivedAccount && (
+              <a
+                href={EXTERNAL_URLS.OUTLAYER_FUND(derivedAccount)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/80 transition-colors"
+              >
+                <ArrowRight className="h-4 w-4" />
+                Fund with {FUND_AMOUNT_NEAR} NEAR
+              </a>
+            )}
+          </>
+        )}
+      </div>
+    );
+  }
+
+  const loading = store.externalNearStatus === 'loading';
+  return (
+    <div className="space-y-3">
+      <div>
+        <label
+          htmlFor="ext-account-id"
+          className="text-xs text-muted-foreground block mb-1"
+        >
+          NEAR Account ID
+        </label>
+        <input
+          id="ext-account-id"
+          type="text"
+          value={accountId}
+          onChange={(e) => setAccountId(e.target.value)}
+          placeholder="alice.near"
+          className="w-full rounded-lg border border-border bg-muted px-3 py-2 text-sm font-mono placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+          autoComplete="off"
+          disabled={loading}
+        />
+      </div>
+      <div>
+        <label
+          htmlFor="ext-seed"
+          className="text-xs text-muted-foreground block mb-1"
+        >
+          Seed
+          <span className="text-muted-foreground/70 ml-1">
+            (same inputs = same wallet)
+          </span>
+        </label>
+        <input
+          id="ext-seed"
+          type="text"
+          value={seed}
+          onChange={(e) => setSeed(e.target.value)}
+          placeholder="task-42"
+          className="w-full rounded-lg border border-border bg-muted px-3 py-2 text-sm font-mono placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+          autoComplete="off"
+          disabled={loading}
+        />
+      </div>
+      <div>
+        <label
+          htmlFor="ext-private-key"
+          className="text-xs text-muted-foreground block mb-1"
+        >
+          NEAR Private Key
+          <span className="text-muted-foreground/70 ml-1">
+            (signed in-browser, never sent to Nearly)
+          </span>
+        </label>
+        <input
+          id="ext-private-key"
+          type="password"
+          value={privateKey}
+          onChange={(e) => setPrivateKey(e.target.value)}
+          placeholder="ed25519:..."
+          className="w-full rounded-lg border border-border bg-muted px-3 py-2 text-sm font-mono placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+          autoComplete="off"
+          disabled={loading}
+        />
+      </div>
+      <label className="flex items-start gap-2 text-xs text-muted-foreground cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={mintKey}
+          onChange={(e) => setMintKey(e.target.checked)}
+          disabled={loading}
+          className="mt-0.5"
+        />
+        <span>
+          Also mint a delegate <code>wk_</code> so I can use this wallet in
+          Nearly this session. Uncheck to provision the wallet only and manage
+          it externally.
+        </span>
+      </label>
+      {store.externalNearError && (
+        <p className="text-sm text-destructive">{store.externalNearError}</p>
+      )}
+      <Button
+        onClick={handleRegister}
+        disabled={
+          loading || !accountId.trim() || !seed.trim() || !privateKey.trim()
+        }
+        className="w-full rounded-xl bg-primary text-primary-foreground hover:bg-primary/80"
+      >
+        {loading ? (
+          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+        ) : (
+          <IdCard className="h-4 w-4 mr-2" />
+        )}
+        {mintKey ? 'Provision + Activate Wallet' : 'Provision Derived Wallet'}
+      </Button>
     </div>
   );
 }
@@ -576,9 +839,12 @@ export default function JoinPage() {
           Create Your Agent
         </h1>
         <p className="text-muted-foreground mt-2 max-w-md mx-auto">
-          {store.path === null && 'New wallet or bring your own.'}
+          {store.path === null &&
+            'New wallet, bring your own, or use a NEAR key.'}
           {store.path === 'new' && 'Two steps, under a minute.'}
           {store.path === 'byo' && 'Paste your wallet key to get started.'}
+          {store.path === 'external-near' &&
+            'Sign in-browser with your NEAR key to provision a derived wallet.'}
         </p>
       </div>
 
@@ -586,7 +852,9 @@ export default function JoinPage() {
       {store.path !== null &&
         !done &&
         store.heartbeatStatus !== 'loading' &&
-        (store.path === 'byo' || store.stepStatus[1] !== 'success') && (
+        (store.path === 'byo' ||
+          store.path === 'external-near' ||
+          store.stepStatus[1] !== 'success') && (
           <button
             type="button"
             onClick={() => store.reset()}
@@ -597,6 +865,9 @@ export default function JoinPage() {
         )}
       {store.path === 'new' && <NewWalletPath fireHeartbeat={fireHeartbeat} />}
       {store.path === 'byo' && <ByoPath fireHeartbeat={fireHeartbeat} />}
+      {store.path === 'external-near' && (
+        <ExternalNearPath fireHeartbeat={fireHeartbeat} />
+      )}
 
       {done && store.accountId && store.apiKey && (
         <Handoff

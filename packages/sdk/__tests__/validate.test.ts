@@ -146,6 +146,54 @@ describe('validateImageUrl', () => {
       'VALIDATION_ERROR',
     );
   });
+
+  it('rejects 0.0.0.0', () => {
+    expect(validateImageUrl('https://0.0.0.0/img.png')?.code).toBe(
+      'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects cloud metadata IP (169.254.169.254)', () => {
+    expect(validateImageUrl('https://169.254.169.254/img.png')?.code).toBe(
+      'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects octal IP obfuscation', () => {
+    expect(validateImageUrl('https://0177.0.0.01/img.png')?.code).toBe(
+      'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects IPv4-mapped IPv6 for private ranges', () => {
+    expect(
+      validateImageUrl('https://[::ffff:10.0.0.1]/img.png')?.code,
+    ).toBe('VALIDATION_ERROR');
+    expect(
+      validateImageUrl('https://[::ffff:192.168.1.1]/img.png')?.code,
+    ).toBe('VALIDATION_ERROR');
+    expect(
+      validateImageUrl('https://[::ffff:169.254.169.254]/img.png')?.code,
+    ).toBe('VALIDATION_ERROR');
+  });
+
+  it('rejects IPv6 private (fd00:)', () => {
+    expect(validateImageUrl('https://[fd00::1]/img.png')?.code).toBe(
+      'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects .internal TLD', () => {
+    expect(validateImageUrl('https://host.internal/img.png')?.code).toBe(
+      'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects URL with zero-width chars', () => {
+    expect(
+      validateImageUrl('https://exam​ple.com/img.png')?.code,
+    ).toBe('VALIDATION_ERROR');
+  });
 });
 
 describe('validateTags', () => {
@@ -188,6 +236,12 @@ describe('validateTags', () => {
     const result = validateTags(['code-review']);
     expect(result.error).toBeNull();
     expect(result.validated).toEqual(['code-review']);
+  });
+
+  it('rejects tag with invalid characters', () => {
+    expect(validateTags(['has space']).error?.code).toBe('VALIDATION_ERROR');
+    expect(validateTags(['bang!']).error?.code).toBe('VALIDATION_ERROR');
+    expect(validateTags(['under_score']).error?.code).toBe('VALIDATION_ERROR');
   });
 });
 
@@ -233,6 +287,21 @@ describe('validateCapabilities', () => {
     expect(validateCapabilities(nested as Record<string, unknown>)?.code).toBe(
       'VALIDATION_ERROR',
     );
+  });
+
+  it('validates nested arrays', () => {
+    expect(
+      validateCapabilities({ skills: ['rust', 'go', 'typescript'] }),
+    ).toBeNull();
+    expect(validateCapabilities({ skills: ['bad:value'] })?.code).toBe(
+      'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects unsafe unicode in nested array values', () => {
+    expect(
+      validateCapabilities({ skills: ['ok', 'bad​value'] })?.code,
+    ).toBe('VALIDATION_ERROR');
   });
 
   it('rejects unsafe unicode in keys', () => {

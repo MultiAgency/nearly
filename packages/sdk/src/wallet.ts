@@ -6,10 +6,18 @@ import {
   WRITE_GAS,
 } from './constants';
 import {
+  encodeEd25519PublicKey,
+  encodeSignatureBase58,
+  parseEd25519SecretKey,
+  signRegisterMessage,
+} from './ed25519';
+import { bytesToHex, hmacSha256, sha256 } from './hashes';
+import {
   authError,
   insufficientBalanceError,
   networkError,
   protocolError,
+  validationError,
 } from './errors';
 import type { FetchLike } from './read';
 import type { VerifiableClaim } from './types';
@@ -239,6 +247,333 @@ export async function createWallet(opts: {
         : {}),
     },
   };
+}
+
+/**
+ * Response from OutLayer `POST /register` when the request carries a
+ * NEAR-signature body — the "deterministic wallet" flow. The returned
+ * `nearAccountId` is the **derived hex64 implicit account** for the
+ * wallet keyed on (caller's `accountId`, `seed`); it is NOT the caller's
+ * named NEAR account. No `walletKey` is issued: the caller is expected
+ * to continue authenticating via `Bearer near:` tokens they sign with
+ * the same NEAR key, or to manage the wallet out-of-band. Nearly itself
+ * does not retain either the derived wallet or the caller's NEAR key.
+ */
+export interface DeterministicRegisterResponse {
+  walletId: string;
+  nearAccountId: string;
+  handoffUrl?: string;
+  /**
+   * Trial quota. Optional — OutLayer omits it on the idempotent
+   * re-registration response for an already-derived wallet.
+   */
+  trial?: {
+    calls_remaining: number;
+    expires_at?: string;
+  };
+}
+
+/**
+ * Provision a deterministic custody wallet via `POST /register` with a
+ * NEAR-signature body. The caller holds their own NEAR ed25519 private
+ * key; this helper signs `register:<seed>:<unix_ts>` locally, posts the
+ * `{account_id, seed, pubkey, message, signature}` body, and returns the
+ * derived wallet identity OutLayer settles on.
+ *
+ * `accountId` is the caller's named NEAR account (e.g. `alice.near`);
+ * the derived wallet's on-chain identity returned as `nearAccountId` is
+ * a hex64 implicit account keyed on `(accountId, seed)`. Same inputs →
+ * same wallet (OutLayer's idempotency contract). Different identities;
+ * callers who need the named account as the on-chain writer cannot get
+ * that through this path — OutLayer's derivation layer owns that
+ * semantic.
+ *
+ * The SDK never persists the caller's `privateKey`. It lives in memory
+ * for the duration of the call, is used to compute the signature, and
+ * is not logged or surfaced in any error. Callers are responsible for
+ * sourcing the key safely (file, env, KMS) and for passing it in opts
+ * rather than through credentials storage.
+ *
+ * Errors:
+ * - Invalid `privateKey` format → `validationError` from
+ *   `parseEd25519SecretKey`.
+ * - Empty / missing `accountId`, `seed` → `validationError`.
+ * - Network / timeout → `networkError`.
+ * - 401/403 → `authError` (deterministic register is authenticated by
+ *   the signature body — rejections mean the signature did not verify).
+ * - Other non-2xx → `protocolError` with truncated body.
+ * - Non-JSON 2xx / missing fields → `protocolError`.
+ */
+export async function createDeterministicWallet(opts: {
+  outlayerUrl: string;
+  accountId: string;
+  seed: string;
+  privateKey: string;
+  fetch?: FetchLike;
+  timeoutMs?: number;
+  now?: () => number;
+}): Promise<DeterministicRegisterResponse> {
+  if (typeof opts.accountId !== 'string' || !opts.accountId) {
+    throw validationError('accountId', 'accountId is required');
+  }
+  if (typeof opts.seed !== 'string' || !opts.seed) {
+    throw validationError('seed', 'seed is required');
+  }
+
+  const parsed = parseEd25519SecretKey(opts.privateKey);
+  const unixSeconds = Math.floor((opts.now ?? Date.now)() / 1000);
+  const message = `register:${opts.seed}:${unixSeconds}`;
+  const signature = signRegisterMessage(message, parsed.secretKey);
+
+  const fetch = opts.fetch ?? (globalThis.fetch as FetchLike);
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const url = `${opts.outlayerUrl}/register`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        account_id: opts.accountId,
+        seed: opts.seed,
+        pubkey: encodeEd25519PublicKey(parsed.publicKey),
+        message,
+        signature: encodeSignatureBase58(signature),
+      }),
+      signal: ctrl.signal,
+    });
+  } catch (err) {
+    throw networkError(err);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw authError(
+        `OutLayer rejected deterministic register (${res.status})`,
+      );
+    }
+    const detail = await res.text().catch(() => '');
+    throw protocolError(
+      `deterministic register ${res.status}: ${detail.slice(0, 200) || 'no body'}`,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw protocolError(
+      'deterministic register: malformed JSON in 2xx response',
+    );
+  }
+  if (!body || typeof body !== 'object') {
+    throw protocolError(
+      'deterministic register: response body is not an object',
+    );
+  }
+  const b = body as Record<string, unknown>;
+  const walletId = b.wallet_id;
+  const nearAccountId = b.near_account_id;
+  const trial = b.trial;
+  const handoffUrl = b.handoff_url;
+
+  if (typeof walletId !== 'string' || !walletId) {
+    throw protocolError('deterministic register: response missing wallet_id');
+  }
+  if (typeof nearAccountId !== 'string' || !nearAccountId) {
+    throw protocolError(
+      'deterministic register: response missing near_account_id',
+    );
+  }
+  let normalizedTrial: DeterministicRegisterResponse['trial'];
+  if (trial !== undefined && trial !== null) {
+    if (
+      typeof trial !== 'object' ||
+      typeof (trial as { calls_remaining?: unknown }).calls_remaining !==
+        'number'
+    ) {
+      throw protocolError(
+        'deterministic register: trial present but missing calls_remaining',
+      );
+    }
+    const trialExpiresAt = (trial as { expires_at?: unknown }).expires_at;
+    normalizedTrial = {
+      calls_remaining: (trial as { calls_remaining: number }).calls_remaining,
+      ...(typeof trialExpiresAt === 'string' && trialExpiresAt
+        ? { expires_at: trialExpiresAt }
+        : {}),
+    };
+  }
+
+  return {
+    walletId,
+    nearAccountId,
+    ...(typeof handoffUrl === 'string' && handoffUrl ? { handoffUrl } : {}),
+    ...(normalizedTrial ? { trial: normalizedTrial } : {}),
+  };
+}
+
+/**
+ * Response from OutLayer `PUT /wallet/v1/api-key` when the request carries
+ * a NEAR-signature body — the "delegate key for a deterministic wallet"
+ * flow. The returned `walletKey` is the client-derived `wk_` (its hash was
+ * sent to OutLayer, never the key itself), and the returned `nearAccountId`
+ * is the derived hex64 implicit account — the same one `createDeterministicWallet`
+ * produces for `(accountId, seed)`.
+ */
+export interface MintDelegateKeyResponse {
+  walletId: string;
+  nearAccountId: string;
+  /**
+   * The client-derived `wk_` key. OutLayer never sees this value directly —
+   * only its SHA-256 hash travels on the wire. Save it or hand it to an
+   * `ApiClient`; it is the caller's only mutable credential for the derived
+   * wallet.
+   */
+  walletKey: string;
+}
+
+/**
+ * Mint a delegate `wk_` key for a deterministic wallet via
+ * `PUT /wallet/v1/api-key` with a NEAR-signature body. Same shape as
+ * `createDeterministicWallet` at the auth layer (the caller's NEAR key
+ * signs the request); different outcome — this produces a `wk_` usable
+ * against OutLayer's `Bearer wk_...` endpoints, which is what the
+ * existing Nearly write path expects.
+ *
+ * **Derivation.** The `wk_` is computed locally as
+ * `"wk_" + hex(HMAC-SHA256(seed_bytes, "<seed>:<keyIndex>"))`, where
+ * `seed_bytes` is the 32-byte ed25519 seed (first half of tweetnacl's
+ * 64-byte secretKey). OutLayer only learns `sha256(wk_...)` — the key
+ * itself stays client-side. See agent-custody SKILL.md §"Register delegate
+ * key for sub-agents".
+ *
+ * **Idempotency.** Same inputs produce the same `wk_`; `PUT` semantics
+ * mean calling twice with the same `(accountId, seed, keyIndex)` registers
+ * the same hash twice (OutLayer returns the same wallet identity). Useful
+ * for recovery — a caller who lost the `wk_` but kept their NEAR key can
+ * re-derive it without re-registering.
+ *
+ * **Async divergence flag.** Unlike `ed25519.ts`'s sync signing primitives,
+ * this function's internal hash operations (HMAC-SHA256 + SHA-256) are
+ * async — `SubtleCrypto` in the browser is promise-returning, and the
+ * shim in `./hashes.ts` harmonizes Node and browser to the same async
+ * shape. Callers must `await` accordingly; no sync entry point is provided.
+ *
+ * Errors:
+ * - Invalid `privateKey` format → `validationError` from
+ *   `parseEd25519SecretKey`.
+ * - Empty / missing `accountId`, `seed` → `validationError`.
+ * - Network / timeout → `networkError`.
+ * - 401/403 → `authError` (signature verification failure).
+ * - 409 → `protocolError` (OutLayer reports if the last active key for
+ *   the wallet would be revoked — not expected on creation, handled
+ *   defensively).
+ * - Other non-2xx → `protocolError` with truncated body.
+ * - Non-JSON 2xx / missing fields → `protocolError`.
+ */
+export async function mintDelegateKey(opts: {
+  outlayerUrl: string;
+  accountId: string;
+  seed: string;
+  privateKey: string;
+  keyIndex?: number;
+  fetch?: FetchLike;
+  timeoutMs?: number;
+  now?: () => number;
+}): Promise<MintDelegateKeyResponse> {
+  if (typeof opts.accountId !== 'string' || !opts.accountId) {
+    throw validationError('accountId', 'accountId is required');
+  }
+  if (typeof opts.seed !== 'string' || !opts.seed) {
+    throw validationError('seed', 'seed is required');
+  }
+
+  const parsed = parseEd25519SecretKey(opts.privateKey);
+  // tweetnacl's secretKey is 64-byte concat(seed || publicKey); the first
+  // 32 bytes are the ed25519 seed, which is what the SKILL doc's example
+  // names as "near_private_key" for the HMAC derivation.
+  const seedBytes = parsed.secretKey.slice(0, 32);
+  const keyIndex = opts.keyIndex ?? 0;
+  const derivationInput = new TextEncoder().encode(
+    `${opts.seed}:${keyIndex}`,
+  );
+  const derivedHmac = await hmacSha256(seedBytes, derivationInput);
+  const walletKey = `wk_${bytesToHex(derivedHmac)}`;
+  const keyHashBytes = await sha256(new TextEncoder().encode(walletKey));
+  const keyHash = bytesToHex(keyHashBytes);
+
+  const unixSeconds = Math.floor((opts.now ?? Date.now)() / 1000);
+  const message = `api-key:${opts.seed}:${unixSeconds}`;
+  const signature = signRegisterMessage(message, parsed.secretKey);
+
+  const fetch = opts.fetch ?? (globalThis.fetch as FetchLike);
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const url = `${opts.outlayerUrl}/wallet/v1/api-key`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        account_id: opts.accountId,
+        seed: opts.seed,
+        key_hash: keyHash,
+        pubkey: encodeEd25519PublicKey(parsed.publicKey),
+        message,
+        signature: encodeSignatureBase58(signature),
+      }),
+      signal: ctrl.signal,
+    });
+  } catch (err) {
+    throw networkError(err);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw authError(`OutLayer rejected mint-delegate-key (${res.status})`);
+    }
+    const detail = await res.text().catch(() => '');
+    throw protocolError(
+      `mint-delegate-key ${res.status}: ${detail.slice(0, 200) || 'no body'}`,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw protocolError(
+      'mint-delegate-key: malformed JSON in 2xx response',
+    );
+  }
+  if (!body || typeof body !== 'object') {
+    throw protocolError(
+      'mint-delegate-key: response body is not an object',
+    );
+  }
+  const b = body as Record<string, unknown>;
+  const walletId = b.wallet_id;
+  const nearAccountId = b.near_account_id;
+
+  if (typeof walletId !== 'string' || !walletId) {
+    throw protocolError('mint-delegate-key: response missing wallet_id');
+  }
+  if (typeof nearAccountId !== 'string' || !nearAccountId) {
+    throw protocolError(
+      'mint-delegate-key: response missing near_account_id',
+    );
+  }
+
+  return { walletId, nearAccountId, walletKey };
 }
 
 /**

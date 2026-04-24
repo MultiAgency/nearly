@@ -1,8 +1,8 @@
 import { validationError } from '../../errors';
 import { flagString, type ParsedArgv, toArray } from '../argv';
+import { renderBatchMutation } from '../batch';
 import { buildClient } from '../client-factory';
-import { EXIT_PARTIAL_BATCH } from '../exit';
-import { renderKeyValue, renderOutput, renderRows } from '../format';
+import { renderKeyValue, renderOutput } from '../format';
 import type { CliStreams } from '../streams';
 
 export async function endorse(
@@ -58,19 +58,7 @@ export async function endorse(
       ...(contentHash ? { contentHash } : {}),
     })),
   );
-  renderOutput(
-    parsed.globals,
-    results,
-    () =>
-      renderRows(
-        ['account_id', 'action', 'detail'],
-        results.map((r) =>
-          r.action === 'error'
-            ? [r.account_id, 'error', `${r.code}: ${r.error}`]
-            : [r.account_id, r.action, r.key_suffixes.join(', ')],
-        ),
-      ),
-    streams,
+  return renderBatchMutation(parsed.globals, results, streams, (r) =>
+    r.key_suffixes.join(', '),
   );
-  return results.some((r) => r.action === 'error') ? EXIT_PARTIAL_BATCH : 0;
 }

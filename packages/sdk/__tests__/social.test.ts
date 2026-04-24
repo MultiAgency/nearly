@@ -109,6 +109,7 @@ describe('buildFollow', () => {
     const entry = m.entries['graph/follow/bob.near'] as Record<string, unknown>;
     expect('reason' in entry).toBe(false);
   });
+
 });
 
 describe('buildUpdateMe', () => {

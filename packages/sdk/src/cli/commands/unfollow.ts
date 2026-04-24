@@ -1,8 +1,8 @@
 import { validationError } from '../../errors';
 import type { ParsedArgv } from '../argv';
+import { renderBatchMutation } from '../batch';
 import { buildClient } from '../client-factory';
-import { EXIT_PARTIAL_BATCH } from '../exit';
-import { renderKeyValue, renderOutput, renderRows } from '../format';
+import { renderKeyValue, renderOutput } from '../format';
 import type { CliStreams } from '../streams';
 
 export async function unfollow(
@@ -35,19 +35,5 @@ export async function unfollow(
   }
 
   const results = await client.unfollowMany(targets);
-  renderOutput(
-    parsed.globals,
-    results,
-    () =>
-      renderRows(
-        ['account_id', 'action', 'detail'],
-        results.map((r) =>
-          r.action === 'error'
-            ? [r.account_id, 'error', `${r.code}: ${r.error}`]
-            : [r.account_id, r.action, ''],
-        ),
-      ),
-    streams,
-  );
-  return results.some((r) => r.action === 'error') ? EXIT_PARTIAL_BATCH : 0;
+  return renderBatchMutation(parsed.globals, results, streams, () => '');
 }

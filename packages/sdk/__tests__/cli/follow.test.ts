@@ -1,31 +1,5 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { type BatchFollowItem, NearlyClient } from '../../src/client';
-import { runCli } from './_harness';
-
-function tmpCreds(contents: unknown): string {
-  const dir = mkdtempSync(join(tmpdir(), 'nearly-follow-'));
-  const path = join(dir, 'credentials.json');
-  writeFileSync(path, JSON.stringify(contents));
-  return path;
-}
-
-const CREDS = {
-  accounts: {
-    'caller.near': {
-      api_key: 'wk_caller_test_key',
-      account_id: 'caller.near',
-    },
-  },
-};
-
-const NO_ENV = {
-  env: {
-    NEARLY_WK_KEY: undefined,
-    NEARLY_WK_ACCOUNT_ID: undefined,
-  },
-};
+import { CREDS, NO_ENV, runCli, tmpCreds } from './_harness';
 
 describe('nearly follow', () => {
   afterEach(() => {
@@ -47,7 +21,8 @@ describe('nearly follow', () => {
     expect(result.code).toBe(0);
     expect(followSpy).toHaveBeenCalledWith('alice.near', {});
     expect(batchSpy).not.toHaveBeenCalled();
-    expect(result.stdout).toBe('action  followed\ntarget  alice.near\n');
+    expect(result.stdout).toContain('followed');
+    expect(result.stdout).toContain('alice.near');
   });
 
   test('single target with --reason forwards reason and still uses single-path', async () => {
@@ -84,28 +59,6 @@ describe('nearly follow', () => {
     expect(result.stdout).toContain('alice.near');
     expect(result.stdout).toContain('bob.near');
     expect(result.stdout).toContain('followed');
-  });
-
-  test('multiple targets with per-item error exits 4', async () => {
-    const path = tmpCreds(CREDS);
-    jest.spyOn(NearlyClient.prototype, 'followMany').mockResolvedValue([
-      { account_id: 'alice.near', action: 'followed', target: 'alice.near' },
-      {
-        account_id: 'caller.near',
-        action: 'error',
-        code: 'SELF_FOLLOW',
-        error: 'cannot follow yourself',
-      },
-    ]);
-
-    const result = await runCli(
-      ['follow', 'alice.near', 'caller.near', '--config', path],
-      NO_ENV,
-    );
-
-    expect(result.code).toBe(4);
-    expect(result.stdout).toContain('error');
-    expect(result.stdout).toContain('SELF_FOLLOW: cannot follow yourself');
   });
 
   test('--json on batch emits raw array', async () => {

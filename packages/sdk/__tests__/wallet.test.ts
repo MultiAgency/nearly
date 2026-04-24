@@ -1,4 +1,4 @@
-import { buildClaim, signClaim } from '../src/claim';
+import { signClaim } from '../src/claim';
 import type { FetchLike } from '../src/read';
 import { getVrfSeed } from '../src/vrf';
 import {
@@ -353,23 +353,6 @@ describe('writeEntries', () => {
       });
       expect(serialized).not.toMatch(/wk_[A-Za-z0-9_]+/);
     }
-  });
-});
-
-describe('buildClaim', () => {
-  it('matches the frontend Nearly claim message shape', () => {
-    const raw = buildClaim({
-      action: 'get_vrf_seed',
-      accountId: 'alice.near',
-      domain: 'nearly.social',
-      version: 1,
-    });
-    const parsed = JSON.parse(raw);
-    expect(parsed.action).toBe('get_vrf_seed');
-    expect(parsed.domain).toBe('nearly.social');
-    expect(parsed.account_id).toBe('alice.near');
-    expect(parsed.version).toBe(1);
-    expect(typeof parsed.timestamp).toBe('number');
   });
 });
 

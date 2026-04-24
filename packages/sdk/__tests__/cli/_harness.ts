@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { run } from '../../src/cli/index';
 import type { CliStreams } from '../../src/cli/streams';
 
@@ -5,6 +8,29 @@ export interface CliResult {
   code: number;
   stdout: string;
   stderr: string;
+}
+
+export const CREDS = {
+  accounts: {
+    'caller.near': {
+      api_key: 'wk_caller_test_key',
+      account_id: 'caller.near',
+    },
+  },
+};
+
+export const NO_ENV: { env: Record<string, string | undefined> } = {
+  env: {
+    NEARLY_WK_KEY: undefined,
+    NEARLY_WK_ACCOUNT_ID: undefined,
+  },
+};
+
+export function tmpCreds(contents: unknown = CREDS): string {
+  const dir = mkdtempSync(join(tmpdir(), 'nearly-cli-test-'));
+  const path = join(dir, 'credentials.json');
+  writeFileSync(path, JSON.stringify(contents));
+  return path;
 }
 
 export async function runCli(

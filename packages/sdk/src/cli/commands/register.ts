@@ -1,10 +1,83 @@
+import { readFileSync } from 'node:fs';
 import { NearlyClient } from '../../client';
+import { DEFAULT_OUTLAYER_URL } from '../../constants';
 import { saveCredentials } from '../../credentials';
+import { validationError } from '../../errors';
+import { createDeterministicWallet, mintDelegateKey } from '../../wallet';
 import type { ParsedArgv } from '../argv';
+import { flagString } from '../argv';
 import { renderJson, renderKeyValue } from '../format';
 import type { CliStreams } from '../streams';
 
+/**
+ * `nearly register` — provision an OutLayer custody wallet.
+ *
+ * Two modes against the same endpoint (`POST /register`), disambiguated
+ * by the flag shape (no `--mode` switch):
+ *
+ *   `nearly register`
+ *       Anonymous. Empty body, receives a `wk_` key, saves
+ *       `{account_id, api_key}` to the credentials file.
+ *
+ *   `nearly register --deterministic --account-id <name> \\
+ *                   --seed <str> --key-file <path>`
+ *       Deterministic. Reads the caller's `ed25519:<base58>` NEAR
+ *       private key from `--key-file`, signs `register:<seed>:<ts>`
+ *       locally, POSTs the signed body. **By default also mints a
+ *       delegate `wk_`** via `PUT /wallet/v1/api-key` so the caller
+ *       gets a usable credential for subsequent Nearly operations.
+ *       Prints `{wallet_id, near_account_id, wallet_key}`.
+ *       Credentials are NOT persisted to the credentials file — the
+ *       caller owns key management, but the `wk_` is surfaced so it
+ *       can be fed to `nearly` / `ApiClient` / an env var immediately.
+ *
+ *       `--no-mint-key` skips the delegate-key mint step; output is
+ *       provisioning-only `{wallet_id, near_account_id}` matching the
+ *       pre-minting behavior. Use for externally-managed wallets.
+ *
+ * The private key is never accepted via argv (`--private-key` / `--key`
+ * are explicit errors, not just undocumented) because shell history and
+ * `ps`-visible args are a common leak path. `--key-file` is the only
+ * supported source.
+ */
 export async function register(
+  parsed: ParsedArgv,
+  streams: CliStreams,
+): Promise<void> {
+  if (
+    parsed.flags['private-key'] !== undefined ||
+    parsed.flags.key !== undefined
+  ) {
+    throw validationError(
+      'privateKey',
+      '--private-key / --key via argv is a security risk (shell history, ps-visible). Use --key-file <path>.',
+    );
+  }
+
+  const deterministic = parsed.flags.deterministic === true;
+  if (deterministic) {
+    return runDeterministic(parsed, streams);
+  }
+
+  const detFlags = [
+    'account-id',
+    'seed',
+    'key-file',
+    'outlayer-url',
+    'no-mint-key',
+  ] as const;
+  const present = detFlags.filter((k) => parsed.flags[k] !== undefined);
+  if (present.length > 0) {
+    throw validationError(
+      'deterministic',
+      `--${present.join(', --')} requires --deterministic (anonymous mode takes no flags of its own)`,
+    );
+  }
+
+  return runAnonymous(parsed, streams);
+}
+
+async function runAnonymous(
   parsed: ParsedArgv,
   streams: CliStreams,
 ): Promise<void> {
@@ -42,4 +115,127 @@ export async function register(
   streams.stderr(
     'Credentials saved. Fund the wallet, then run `nearly heartbeat`.\n',
   );
+}
+
+async function runDeterministic(
+  parsed: ParsedArgv,
+  streams: CliStreams,
+): Promise<void> {
+  const accountId = flagString(parsed.flags['account-id']);
+  const seed = flagString(parsed.flags.seed);
+  const keyFile = flagString(parsed.flags['key-file']);
+
+  if (!accountId) {
+    throw validationError('accountId', '--deterministic requires --account-id');
+  }
+  if (!seed) {
+    throw validationError('seed', '--deterministic requires --seed');
+  }
+  if (!keyFile) {
+    throw validationError('keyFile', '--deterministic requires --key-file');
+  }
+
+  let privateKey: string;
+  try {
+    privateKey = readFileSync(keyFile, 'utf8').trim();
+  } catch (err) {
+    throw validationError(
+      'keyFile',
+      `cannot read key file: ${(err as { code?: string }).code ?? 'read error'}`,
+    );
+  }
+  if (!privateKey) {
+    throw validationError(
+      'keyFile',
+      'key file is empty after trimming whitespace',
+    );
+  }
+
+  const outlayerUrl =
+    flagString(parsed.flags['outlayer-url']) ?? DEFAULT_OUTLAYER_URL;
+  const skipMint = parsed.flags['no-mint-key'] === true;
+
+  const provisioned = await createDeterministicWallet({
+    outlayerUrl,
+    accountId,
+    seed,
+    privateKey,
+  });
+
+  // Default behavior: also mint a delegate `wk_`. `--no-mint-key` preserves
+  // the provisioning-only surface. If mint fails after provision succeeds,
+  // surface that asymmetry clearly — the caller has a wallet at OutLayer
+  // but no usable `wk_` yet, and a retry mints the same `wk_` (derivation
+  // is deterministic) without re-registering.
+  let minted: Awaited<ReturnType<typeof mintDelegateKey>> | null = null;
+  let mintError: unknown = null;
+  if (!skipMint) {
+    try {
+      minted = await mintDelegateKey({
+        outlayerUrl,
+        accountId,
+        seed,
+        privateKey,
+      });
+    } catch (err) {
+      mintError = err;
+    }
+  }
+
+  if (parsed.globals.quiet) {
+    if (mintError) throw mintError;
+    return;
+  }
+
+  if (parsed.globals.json) {
+    if (mintError) throw mintError;
+    streams.stdout(
+      renderJson({
+        walletId: provisioned.walletId,
+        nearAccountId: provisioned.nearAccountId,
+        trial: provisioned.trial,
+        ...(provisioned.handoffUrl
+          ? { handoffUrl: provisioned.handoffUrl }
+          : {}),
+        ...(minted ? { walletKey: minted.walletKey } : {}),
+      }),
+    );
+    return;
+  }
+
+  const rows: Array<[string, string]> = [
+    ['wallet_id', provisioned.walletId],
+    ['near_account_id', provisioned.nearAccountId],
+  ];
+  if (provisioned.trial) {
+    rows.push([
+      'trial_calls_remaining',
+      String(provisioned.trial.calls_remaining),
+    ]);
+    if (provisioned.trial.expires_at) {
+      rows.push(['trial_expires_at', provisioned.trial.expires_at]);
+    }
+  }
+  if (provisioned.handoffUrl) {
+    rows.push(['wallet_management', provisioned.handoffUrl]);
+  }
+  if (minted) {
+    rows.push(['wallet_key', minted.walletKey]);
+  }
+  streams.stdout(renderKeyValue(rows));
+
+  if (minted) {
+    streams.stderr(
+      'Deterministic wallet provisioned and delegate wk_ minted. Save the wallet_key securely — it is the only mutable credential for this derived wallet.\n',
+    );
+  } else if (mintError) {
+    streams.stderr(
+      'Deterministic wallet provisioned, but delegate-key minting failed. The wallet exists at OutLayer; retry `nearly register --deterministic` with the same inputs to mint.\n',
+    );
+    throw mintError;
+  } else {
+    streams.stderr(
+      'Deterministic wallet provisioned (--no-mint-key). No delegate wk_ issued — manage your NEAR key externally.\n',
+    );
+  }
 }

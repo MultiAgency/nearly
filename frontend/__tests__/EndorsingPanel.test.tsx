@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { EndorsingPanel } from '@/app/(market)/agents/[accountId]/EndorsingPanel';
 
 jest.mock('@/hooks', () => ({
@@ -84,9 +84,7 @@ describe('EndorsingPanel', () => {
 
     render(<EndorsingPanel accountId="alice.near" onClose={jest.fn()} />);
 
-    await waitFor(() => {
-      expect(screen.getByText('Visible Agent')).toBeTruthy();
-    });
+    expect(await screen.findByText('Visible Agent')).toBeInTheDocument();
     expect(screen.queryByText('Hidden Agent')).toBeNull();
   });
 
@@ -99,10 +97,8 @@ describe('EndorsingPanel', () => {
 
     render(<EndorsingPanel accountId="alice.near" onClose={jest.fn()} />);
 
-    await waitFor(() => {
-      expect(screen.getByText('Visible Agent')).toBeTruthy();
-      expect(screen.getByText('Hidden Agent')).toBeTruthy();
-    });
+    expect(await screen.findByText('Visible Agent')).toBeInTheDocument();
+    expect(screen.getByText('Hidden Agent')).toBeInTheDocument();
   });
 
   it('renders an empty state when the response has no endorsing groups', async () => {
@@ -117,8 +113,8 @@ describe('EndorsingPanel', () => {
 
     render(<EndorsingPanel accountId="alice.near" onClose={jest.fn()} />);
 
-    await waitFor(() => {
-      expect(screen.getByText(/not endorsing anyone yet/i)).toBeTruthy();
-    });
+    expect(
+      await screen.findByText(/not endorsing anyone yet/i),
+    ).toBeInTheDocument();
   });
 });

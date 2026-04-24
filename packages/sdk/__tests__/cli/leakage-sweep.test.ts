@@ -1,6 +1,11 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import bs58 from 'bs58';
 import { COMMANDS } from '../../src/cli/commands';
 import { type BatchItemError, NearlyClient } from '../../src/client';
 import { NearlyError, type NearlyErrorShape } from '../../src/errors';
+import * as walletModule from '../../src/wallet';
 import { runCli } from './_harness';
 
 const LEAKY_KEY = 'wk_sweep_secret_key_do_not_print_abc123';
@@ -119,6 +124,13 @@ const CASES: Case[] = [
 ];
 
 const WK_PATTERN = /wk_[A-Za-z0-9_]+/;
+// NEAR ed25519 private keys enter the `register --deterministic` path via
+// --key-file. The leakage guarantee for this path is symmetric with the wk_
+// guarantee: the raw key body must never appear in stdout/stderr, across
+// every `NearlyErrorShape`. A pattern match complements the exact-string
+// check below — the exact check catches the specific bytes of the fixture,
+// the pattern catches accidental interpolation of a different key.
+const ED25519_PATTERN = /ed25519:[1-9A-HJ-NP-Za-km-z]{30,}/;
 
 function isBatchMethod(
   m: BatchMethodName | SingleMethodName,
@@ -189,6 +201,65 @@ describe('wallet-key leakage sweep', () => {
       expect(combined).not.toMatch(WK_PATTERN);
       jest.restoreAllMocks();
     }
+  });
+});
+
+describe('ed25519-key leakage sweep (register --deterministic)', () => {
+  // Real key material routed through a real file — the `register` command
+  // reads via `readFileSync`, and the sweep exists to catch accidental
+  // interpolation of that content into any output path.
+  let tmpDir: string;
+  let keyFile: string;
+  let privBody: string;
+
+  beforeAll(() => {
+    const seed = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) seed[i] = (i * 23 + 17) & 0xff;
+    privBody = bs58.encode(seed);
+    tmpDir = mkdtempSync(join(tmpdir(), 'nearly-sweep-det-'));
+    keyFile = join(tmpDir, 'near.key');
+    writeFileSync(keyFile, `ed25519:${privBody}\n`, { mode: 0o600 });
+  });
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test.each(
+    ERROR_SHAPES,
+  )('never leaks NEAR private key across shape $code', async (shape) => {
+    const err = new NearlyError(shape);
+    jest
+      .spyOn(walletModule, 'createDeterministicWallet')
+      .mockRejectedValue(err);
+    const result = await runCli(
+      [
+        'register',
+        '--deterministic',
+        '--account-id',
+        'sweep.near',
+        '--seed',
+        'leakage-sweep',
+        '--key-file',
+        keyFile,
+      ],
+      { env: ENV },
+    );
+    const combined = `${result.stdout}\n${result.stderr}`;
+    // Exact-body check — the specific bytes of the fixture key must never
+    // appear in output.
+    expect(combined).not.toContain(privBody);
+    // Pattern check — catches accidental interpolation of ANY ed25519:<b58>
+    // string, so a future test that substitutes a different key can't
+    // silently pass.
+    expect(combined).not.toMatch(ED25519_PATTERN);
+    // The wk_ pattern also holds — the ENV seeds a wk_ that must not leak
+    // through the deterministic path either.
+    expect(combined).not.toMatch(WK_PATTERN);
   });
 });
 

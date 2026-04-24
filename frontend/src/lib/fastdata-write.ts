@@ -25,7 +25,15 @@ import {
   buildUnfollow,
   buildUpdateMe,
   LIMITS,
+  type NearlyError,
   type UpdateMePatch,
+  validateCapabilities,
+  validateDescription,
+  validateImageUrl,
+  validateKeySuffix,
+  validateName,
+  validateReason,
+  validateTags,
 } from '@nearly/sdk';
 import type { Agent } from '@/types';
 import {
@@ -58,16 +66,6 @@ import {
   checkRateLimitBudget,
   incrementRateLimit,
 } from './rate-limit';
-import {
-  type ValidationError,
-  validateCapabilities,
-  validateDescription,
-  validateImageUrl,
-  validateKeySuffix,
-  validateName,
-  validateReason,
-  validateTags,
-} from './validate';
 
 const BALANCE_CHECK_TIMEOUT_MS = 5_000;
 
@@ -75,7 +73,7 @@ const BALANCE_CHECK_TIMEOUT_MS = 5_000;
 // Response helpers
 // ---------------------------------------------------------------------------
 
-export type WriteResult =
+type WriteResult =
   | {
       success: true;
       data: Record<string, unknown>;
@@ -109,7 +107,7 @@ function rateLimited(retryAfter: number): WriteResult {
   };
 }
 
-function validationFail(e: ValidationError): WriteResult {
+function validationFail(e: NearlyError): WriteResult {
   return fail(e.code, e.message);
 }
 
@@ -185,7 +183,7 @@ function targetGuardError(
 // FastData KV write (awaitable — primary write path, not fire-and-forget)
 // ---------------------------------------------------------------------------
 
-export type WriteOutcome =
+type WriteOutcome =
   | { ok: true }
   | { ok: false; reason: 'insufficient_balance' | 'storage_error' };
 
@@ -1118,10 +1116,10 @@ export async function handleDelistMe(
 //
 // `WRITE_ACTIONS` below is the authoritative list of every mutation this
 // module dispatches, plus the admin mutations dispatched from `route.ts` via
-// `writeToFastData` + `invalidatesFor`. A test in `fastdata-write.test.ts`
-// asserts `WRITE_ACTIONS` and the `INVALIDATION_MAP` keys are the same set,
-// so a new action added in the dispatch switch or a renamed action either
-// fails CI or forces a deliberate map update.
+// `writeToFastData` and a direct `INVALIDATION_MAP` lookup. A test in
+// `fastdata-write.test.ts` asserts `WRITE_ACTIONS` and the `INVALIDATION_MAP`
+// keys are the same set, so a new action added in the dispatch switch or a
+// renamed action either fails CI or forces a deliberate map update.
 // ---------------------------------------------------------------------------
 
 export const WRITE_ACTIONS = [
@@ -1135,8 +1133,6 @@ export const WRITE_ACTIONS = [
   'social.update_me',
   'unhide_agent',
 ] as const;
-
-export type WriteAction = (typeof WRITE_ACTIONS)[number];
 
 export const INVALIDATION_MAP: Record<string, readonly string[]> = {
   'social.update_me': [
@@ -1171,11 +1167,6 @@ export const INVALIDATION_MAP: Record<string, readonly string[]> = {
   hide_agent: ['hidden'],
   unhide_agent: ['hidden'],
 };
-
-/** Cached reads that a given mutation stales. Null means "clear everything". */
-export function invalidatesFor(action: string): readonly string[] | null {
-  return INVALIDATION_MAP[action] ?? null;
-}
 
 // ---------------------------------------------------------------------------
 // Dispatcher

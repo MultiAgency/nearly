@@ -1,9 +1,6 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { NearlyClient } from '../../src/client';
 import type { Agent } from '../../src/types';
-import { runCli } from './_harness';
+import { CREDS, NO_ENV, runCli, tmpCreds } from './_harness';
 
 const FIXTURE_AGENT: Agent = {
   account_id: 'caller.near',
@@ -16,29 +13,6 @@ const FIXTURE_AGENT: Agent = {
   following_count: 0,
   endorsement_count: 0,
   last_active: 1700000000,
-};
-
-function tmpCreds(contents: unknown): string {
-  const dir = mkdtempSync(join(tmpdir(), 'nearly-update-'));
-  const path = join(dir, 'credentials.json');
-  writeFileSync(path, JSON.stringify(contents));
-  return path;
-}
-
-const CREDS = {
-  accounts: {
-    'caller.near': {
-      api_key: 'wk_caller_test_key',
-      account_id: 'caller.near',
-    },
-  },
-};
-
-const NO_ENV = {
-  env: {
-    NEARLY_WK_KEY: undefined,
-    NEARLY_WK_ACCOUNT_ID: undefined,
-  },
 };
 
 describe('nearly update', () => {

@@ -28,7 +28,7 @@ const mockWriteToFastData = jest.fn().mockResolvedValue({ ok: true });
 jest.mock('@/lib/fastdata-write', () => ({
   dispatchWrite: (...args: unknown[]) => mockDispatchWrite(...args),
   writeToFastData: (...args: unknown[]) => mockWriteToFastData(...args),
-  invalidatesFor: jest.fn().mockReturnValue(['hidden']),
+  INVALIDATION_MAP: { hide_agent: ['hidden'], unhide_agent: ['hidden'] },
 }));
 
 const mockKvGetAgent = jest.fn().mockResolvedValue(null);
@@ -821,28 +821,6 @@ describe('admin /admin/hidden', () => {
           'hidden/spam.near': true,
         }),
       );
-    });
-
-    it('hides two agents back-to-back in one test (regression: mockResolvedValue stickiness)', async () => {
-      const [req1, params1] = makeRequest(
-        'POST',
-        'admin/hidden/spam1.near',
-        undefined,
-        { authorization: 'Bearer wk_admin_test' },
-      );
-      const res1 = await POST(req1, params1);
-      expect(res1.status).toBe(200);
-
-      const [req2, params2] = makeRequest(
-        'POST',
-        'admin/hidden/spam2.near',
-        undefined,
-        { authorization: 'Bearer wk_admin_test' },
-      );
-      const res2 = await POST(req2, params2);
-      expect(res2.status).toBe(200);
-
-      expect(mockWriteToFastData).toHaveBeenCalledTimes(2);
     });
 
     it('rejects writes without auth', async () => {

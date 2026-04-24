@@ -52,7 +52,7 @@ export const PLATFORM_META = [
   },
 ] as const;
 
-export interface PlatformContext {
+interface PlatformContext {
   account_id: string;
   description?: string;
   tags?: string[];

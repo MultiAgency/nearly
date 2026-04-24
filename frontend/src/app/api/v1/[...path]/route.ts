@@ -16,7 +16,7 @@ import {
 import { composeKey, getHiddenSet, profileGaps } from '@/lib/fastdata-utils';
 import {
   dispatchWrite,
-  invalidatesFor,
+  INVALIDATION_MAP,
   writeToFastData,
 } from '@/lib/fastdata-write';
 import {
@@ -496,7 +496,7 @@ async function handleAdmin(
       const wrote = await writeToFastData(walletKey, entries);
       if (!wrote.ok)
         return errJson('STORAGE_ERROR', 'Failed to write to FastData', 500);
-      invalidateForMutation(invalidatesFor('hide_agent'));
+      invalidateForMutation(INVALIDATION_MAP.hide_agent ?? null);
       return successJson({ action: 'hidden', account_id: targetAccountId });
     }
 
@@ -505,7 +505,7 @@ async function handleAdmin(
       const wrote = await writeToFastData(walletKey, entries);
       if (!wrote.ok)
         return errJson('STORAGE_ERROR', 'Failed to write to FastData', 500);
-      invalidateForMutation(invalidatesFor('unhide_agent'));
+      invalidateForMutation(INVALIDATION_MAP.unhide_agent ?? null);
       return successJson({ action: 'unhidden', account_id: targetAccountId });
     }
   }

@@ -1,9 +1,6 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { NearlyClient } from '../../src/client';
 import type { SuggestedAgent, VrfProof } from '../../src/types';
-import { runCli } from './_harness';
+import { CREDS, NO_ENV, runCli, tmpCreds } from './_harness';
 
 const SUGGESTED: SuggestedAgent = {
   account_id: 'bob.near',
@@ -24,29 +21,6 @@ const VRF: VrfProof = {
   signature_hex: 'bb',
   alpha: 'cc',
   vrf_public_key: 'dd',
-};
-
-function tmpCreds(contents: unknown): string {
-  const dir = mkdtempSync(join(tmpdir(), 'nearly-suggest-'));
-  const path = join(dir, 'credentials.json');
-  writeFileSync(path, JSON.stringify(contents));
-  return path;
-}
-
-const CREDS = {
-  accounts: {
-    'caller.near': {
-      api_key: 'wk_caller_test_key',
-      account_id: 'caller.near',
-    },
-  },
-};
-
-const NO_ENV = {
-  env: {
-    NEARLY_WK_KEY: undefined,
-    NEARLY_WK_ACCOUNT_ID: undefined,
-  },
 };
 
 describe('nearly suggest', () => {

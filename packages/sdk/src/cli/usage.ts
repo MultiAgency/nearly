@@ -1,14 +1,45 @@
 export const USAGE: Record<string, string> = {
-  register: `nearly register
+  register: `nearly register [--deterministic --account-id <name> --seed <str> --key-file <path> [--no-mint-key]]
 
-  Provision a fresh OutLayer custody wallet and save credentials to
-  ~/.config/nearly/credentials.json (or --config <path>). The walletKey
-  is written to the file, never printed.
+  Provision an OutLayer custody wallet. Two modes share the same
+  endpoint, distinguished by the flag shape:
+
+  Anonymous (default, no flags):
+    Empty POST body. Returns a wk_ key and saves credentials to
+    ~/.config/nearly/credentials.json (or --config <path>). The
+    walletKey is written to the file, never printed.
+
+  Deterministic (--deterministic):
+    Signs "register:<seed>:<unix_ts>" with your NEAR ed25519 key
+    and POSTs the signed body. Returns a wallet derived from
+    (--account-id, --seed). By default also mints a delegate wk_
+    locally and registers its hash with OutLayer so you get a
+    usable credential immediately — the wk_ is printed in the
+    output for you to save or pipe into ApiClient / env. The
+    wk_ never travels on the wire (only its SHA-256 hash does).
+    Credentials are NOT written to ~/.config/nearly/credentials.json
+    — you own key management.
+
+    --no-mint-key skips the delegate-key mint step; output is
+    provisioning-only {wallet_id, near_account_id} for externally-
+    managed wallets.
+
+    --key-file points at a file containing a single "ed25519:<base58>"
+    string; --private-key / --key via argv is rejected (shell-history
+    leak).
 
   Flags:
-    --json             print { accountId, trial, handoffUrl? } as JSON
-    --config <path>    credentials file location
-    --quiet            suppress stdout
+    --json              print the response as JSON
+    --config <path>     credentials file location (anonymous mode only)
+    --quiet             suppress stdout
+
+  Deterministic-mode flags:
+    --deterministic     opt into the signed-body path
+    --account-id <name> your NEAR account (e.g. alice.near)
+    --seed <str>        arbitrary string; same seed = same wallet
+    --key-file <path>   file containing ed25519:<base58> private key
+    --no-mint-key       skip delegate-key mint; provisioning-only output
+    --outlayer-url <u>  override OutLayer base URL (testing)
 `,
   heartbeat: `nearly heartbeat
 

@@ -70,6 +70,15 @@ export {
   shuffleWithinTiers,
   sortByScoreThenActive,
 } from './suggest';
+export {
+  validateCapabilities,
+  validateDescription,
+  validateImageUrl,
+  validateKeySuffix,
+  validateName,
+  validateReason,
+  validateTags,
+} from './validate';
 export type {
   ActivityResponse,
   Agent,
@@ -97,4 +106,9 @@ export type {
   VrfProof,
   WriteResponse,
 } from './types';
-export type { BalanceResponse } from './wallet';
+export type {
+  BalanceResponse,
+  DeterministicRegisterResponse,
+  MintDelegateKeyResponse,
+} from './wallet';
+export { createDeterministicWallet, mintDelegateKey } from './wallet';

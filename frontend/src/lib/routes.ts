@@ -1,6 +1,6 @@
 type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
-export type RouteDef = readonly [
+type RouteDef = readonly [
   method: HttpMethod,
   pattern: string,
   action: string,
